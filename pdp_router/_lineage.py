@@ -1,4 +1,4 @@
-# Description: Maps Sibyl roster model IDs to their lineage (provider family).
+# Description: Maps roster model IDs to their lineage (provider family).
 # Description: Drives panel composition diversity -- one model per lineage.
 
 from __future__ import annotations

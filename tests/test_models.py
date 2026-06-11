@@ -1,5 +1,5 @@
 # Description: Tests for PDP model constants, canonicalization, and error types.
-# Description: Verifies all Sibyl model IDs, canonicalize/expand helpers, and CreditExhaustionError.
+# Description: Verifies roster model IDs, canonicalize/expand helpers, and CreditExhaustionError.
 
 from __future__ import annotations
 

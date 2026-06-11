@@ -1,4 +1,4 @@
-# Description: Thompson Sampling multi-armed bandit for Sibyl model routing.
+# Description: Thompson Sampling multi-armed bandit for PDP model routing.
 # Description: Pure algorithm module -- no DB, no side effects, stdlib only.
 
 from __future__ import annotations

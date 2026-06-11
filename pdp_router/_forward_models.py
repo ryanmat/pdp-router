@@ -1,4 +1,4 @@
-# Description: Forward-Evidence Registry skeleton for Sibyl router (Sprint 7 Phase 1).
+# Description: Forward-Evidence Registry skeleton for the router.
 # Description: Composes learned predictors into structured evidence; soft-injection, not Dyna-Q.
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 class ForwardEvidence:
     """Evidence emitted by a single forward model adapter.
 
-    Composed by the Sibyl router (or chair prompt builder) into a structured
+    Composed by the router (or chair prompt builder) into a structured
     "Routing Evidence" block. This is observability + soft-evidence injection,
     not a queryable forward simulator.
     """

@@ -14,7 +14,7 @@ trust earned from recorded outcomes rather than configured by hand.
 
 </div>
 
-This is the routing core of Sibyl, a personal multi-model system that routes
+This is the routing core of a personal multi-model system that routes
 production alert-enrichment and chat traffic across nine models from three
 providers. Every routing decision is logged; real outcomes flow back into
 per-model, per-domain trust weights and Thompson Sampling posteriors; the

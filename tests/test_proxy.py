@@ -71,16 +71,16 @@ class TestModelsEndpoint:
 
     def test_models_includes_pdp_auto(self, client) -> None:
         # `pdp-auto` is the cascade-routing virtual model -- the recommended
-        # default for any OpenAI-compat client that wants Sibyl's routing
-        # brain rather than forcing a specific model.
+        # default for any OpenAI-compat client that wants routed model selection
+        # rather than forcing a specific model.
         resp = client.get("/v1/models")
         ids = [m["id"] for m in resp.json()["data"]]
         assert "pdp-auto" in ids
 
-    def test_models_owned_by_sibyl_for_pdp_auto(self, client) -> None:
+    def test_models_owned_by_router_for_pdp_auto(self, client) -> None:
         resp = client.get("/v1/models")
         pdp_auto = next(m for m in resp.json()["data"] if m["id"] == "pdp-auto")
-        assert pdp_auto["owned_by"] == "sibyl"
+        assert pdp_auto["owned_by"] == "pdp-router"
         assert pdp_auto["object"] == "model"
         assert isinstance(pdp_auto["created"], int)
 
@@ -284,7 +284,7 @@ class TestChatCompletions:
 
 
 class TestExplicitModel:
-    """Sibyl panel composer pre-selects models then calls the proxy with
+    """The panel composer pre-selects models then calls the proxy with
     that ID. The proxy must honor the pick and skip classification --
     cascade is no longer mandatory, just the default for pdp-auto."""
 
@@ -1069,7 +1069,7 @@ class TestWebSearchGate:
             json={
                 "model": "pdp-auto",
                 "messages": [
-                    {"role": "system", "content": "You are Richard."},
+                    {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": "search for the latest on X"},
                 ],
             },
@@ -1079,7 +1079,7 @@ class TestWebSearchGate:
         kwargs = mock_llm.complete.call_args.kwargs
         assert kwargs.get("enable_web_search") is True
         assert "web_search tool" in kwargs.get("system", "")
-        assert "You are Richard." in kwargs.get("system", "")
+        assert "You are a helpful assistant." in kwargs.get("system", "")
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._streaming_enabled", return_value=True)

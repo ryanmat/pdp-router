@@ -1,4 +1,4 @@
-# Description: PDP routing intelligence shared package for the Sibyl System.
+# Description: PDP routing intelligence shared package for outcome-fed model routing.
 # Description: Re-exports the public API for model routing, LLM clients, and utilities.
 
 from __future__ import annotations

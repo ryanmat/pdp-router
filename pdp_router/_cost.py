@@ -1,5 +1,5 @@
 # Description: Per-provider token pricing and cost estimation.
-# Description: Prefix-match model name against pricing tables for all Sibyl providers.
+# Description: Prefix-match model name against pricing tables for all supported providers.
 
 from __future__ import annotations
 

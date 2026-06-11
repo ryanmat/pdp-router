@@ -1,4 +1,4 @@
-# Description: PDP Router Proxy -- OpenAI-compatible HTTP endpoint for Sibyl routing.
+# Description: PDP Router Proxy -- OpenAI-compatible HTTP endpoint for PDP routing.
 # Description: Classifies request complexity, routes to best model via confidence cascade.
 
 from __future__ import annotations
@@ -388,13 +388,13 @@ async def health() -> dict:
 @app.get("/v1/models")
 async def list_models() -> dict:
     """OpenAI-compat model list. Returns `pdp-auto` (the cascade-routing virtual
-    model that triggers Sibyl) plus every concrete model in `DEFAULT_REGISTRY`
+    model that triggers routing) plus every concrete model in `DEFAULT_REGISTRY`
     that is marked available. Clients like Open WebUI, Pal Chat, OpenCat, and
     any OpenAI-compat SDK hit this endpoint at config / refresh time to
     populate their model dropdowns. Without it those clients see "no models
     available" and refuse to send chat completions even though the
     /v1/chat/completions endpoint works fine. `pdp-auto` is the recommended
-    default -- it dispatches to whatever model the Sibyl cascade + bandit pick
+    default -- it dispatches to whatever model the cascade + bandit pick
     per request; the concrete IDs are surfaced so callers that want to force
     a specific model (post-cascade analysis, side-by-side experiments) can.
     """
@@ -407,7 +407,7 @@ async def list_models() -> dict:
             "id": "pdp-auto",
             "object": "model",
             "created": created,
-            "owned_by": "sibyl",
+            "owned_by": "pdp-router",
         }
     ]
     for model in DEFAULT_REGISTRY.available_models():
@@ -442,7 +442,7 @@ def _route_request(
     non_system = [m for m in request.messages if m.role != "system"]
 
     # Honor explicit model when caller has already done selection. This is
-    # the path used by sibyl_panel after its trust-weighted panel composer
+    # the path used by an external panel composer after trust-weighted selection
     # has picked N specific members. The cascade remains the default for
     # "pdp-auto" (or unset) so single delegations still feed the learning
     # system. -1.0 / 0 are log-distinguishability markers, not real values.
@@ -1011,7 +1011,7 @@ async def _iter_sse(
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
-    # First event: routing metadata so callers see which model Sibyl picked.
+    # First event: routing metadata so callers see which model the router picked.
     yield _sse_event(
         {
             "type": "route_info",
