@@ -136,13 +136,13 @@ response header. Drain those rows into your store, grade them against
 whatever outcome you care about, recompute posteriors, write them back.
 That loop -- not this code -- is where the value lives.
 
-## What is deliberately not here
+## What is deliberately not here - You’re gonna carry that weight.
 
 The upstream system's outcome store, judge ensemble and rubrics, drift
 watchdog, and months of earned posteriors are not in this repo. They are
 domain-specific by nature; publishing them would hand you the shape of my
 loop without the substance of yours. The schema contract above is the
-interface; closing the loop is the work. You’re gonna carry that weight.
+interface; closing the loop is the work.
 
 ## Further reading
 
@@ -156,4 +156,6 @@ interface; closing the loop is the work. You’re gonna carry that weight.
 ## License
 
 MIT. Use it, fork it, learn from it. If you close the loop on your own
-domain, that is the whole point. ARE YOU LIVING IN THE REAL WORLD?
+domain, that is the whole point. 
+
+ARE YOU LIVING IN THE REAL WORLD?
