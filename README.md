@@ -142,7 +142,7 @@ The upstream system's outcome store, judge ensemble and rubrics, drift
 watchdog, and months of earned posteriors are not in this repo. They are
 domain-specific by nature; publishing them would hand you the shape of my
 loop without the substance of yours. The schema contract above is the
-interface; closing the loop is the work.
+interface; closing the loop is the work. You’re gonna carry that weight.
 
 ## Further reading
 
@@ -156,4 +156,4 @@ interface; closing the loop is the work.
 ## License
 
 MIT. Use it, fork it, learn from it. If you close the loop on your own
-domain, that is the whole point.
+domain, that is the whole point. ARE YOU LIVING IN THE REAL WORLD?
