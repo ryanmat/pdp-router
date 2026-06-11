@@ -136,7 +136,7 @@ response header. Drain those rows into your store, grade them against
 whatever outcome you care about, recompute posteriors, write them back.
 That loop -- not this code -- is where the value lives.
 
-## What is deliberately not here - You’re gonna carry that weight.
+## What is deliberately not here [you’re gonna carry that weight]
 
 The upstream system's outcome store, judge ensemble and rubrics, drift
 watchdog, and months of earned posteriors are not in this repo. They are
