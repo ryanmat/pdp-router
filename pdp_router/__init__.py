@@ -1,0 +1,94 @@
+# Description: PDP routing intelligence shared package for the Sibyl System.
+# Description: Re-exports the public API for model routing, LLM clients, and utilities.
+
+from __future__ import annotations
+
+from pdp_router._bandit import (
+    BanditState,
+    RoutingContext,
+    contextual_thompson_sample,
+    default_priors,
+    thompson_sample,
+    update_posterior,
+)
+from pdp_router._clients import (
+    AnthropicClient,
+    CompletionResult,
+    DeepSeekClient,
+    GeminiClient,
+    LLMClient,
+    OllamaClient,
+    get_client,
+)
+from pdp_router._cost import estimate_cost
+from pdp_router._domain_overrides import parse_overrides, resolve_routing_mode
+from pdp_router._models import (
+    DEEPSEEK,
+    GEMINI_FLASH,
+    GEMINI_FLASH_LITE,
+    GEMINI_PRO,
+    HAIKU,
+    LLAMA_MAVERICK,
+    LLAMA_SCOUT,
+    OPUS,
+    SONNET,
+    CreditExhaustionError,
+)
+from pdp_router._router import (
+    DEFAULT_REGISTRY,
+    ModelCapability,
+    ModelRegistry,
+    ModelSelection,
+    RoutingPicks,
+    apply_budget_override,
+    apply_cost_efficiency,
+    compute_routing_picks,
+    confidence_cascade,
+    next_cheaper,
+    route_request,
+    route_with_fallback,
+)
+from pdp_router._utils import parse_llm_json, strip_markdown_fences
+
+__all__ = [
+    "DEEPSEEK",
+    "DEFAULT_REGISTRY",
+    "GEMINI_FLASH",
+    "GEMINI_FLASH_LITE",
+    "GEMINI_PRO",
+    "HAIKU",
+    "LLAMA_MAVERICK",
+    "LLAMA_SCOUT",
+    "OPUS",
+    "SONNET",
+    "AnthropicClient",
+    "BanditState",
+    "CompletionResult",
+    "CreditExhaustionError",
+    "DeepSeekClient",
+    "GeminiClient",
+    "LLMClient",
+    "ModelCapability",
+    "ModelRegistry",
+    "ModelSelection",
+    "OllamaClient",
+    "RoutingContext",
+    "RoutingPicks",
+    "apply_budget_override",
+    "apply_cost_efficiency",
+    "compute_routing_picks",
+    "confidence_cascade",
+    "contextual_thompson_sample",
+    "default_priors",
+    "estimate_cost",
+    "get_client",
+    "next_cheaper",
+    "parse_llm_json",
+    "parse_overrides",
+    "resolve_routing_mode",
+    "route_request",
+    "route_with_fallback",
+    "strip_markdown_fences",
+    "thompson_sample",
+    "update_posterior",
+]
