@@ -1,8 +1,18 @@
+<div align="center">
+
 # pdp-router
 
-**An outcome-fed router for heterogeneous AI models.** PDP = parallel
-distributed processing: many diverse processors, one judgment, trust earned
-from recorded outcomes rather than configured by hand.
+**An outcome-fed router for heterogeneous AI models.**
+
+PDP = parallel distributed processing: many diverse processors, one judgment,
+trust earned from recorded outcomes rather than configured by hand.
+
+[![ci](https://github.com/ryanmat/pdp-router/actions/workflows/ci.yml/badge.svg)](https://github.com/ryanmat/pdp-router/actions/workflows/ci.yml)
+[![python](https://img.shields.io/badge/python-3.11_%7C_3.12_%7C_3.13-3776AB?logo=python&logoColor=white)](https://github.com/ryanmat/pdp-router/blob/main/pyproject.toml)
+[![license](https://img.shields.io/github/license/ryanmat/pdp-router)](https://github.com/ryanmat/pdp-router/blob/main/LICENSE)
+[![ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
+</div>
 
 This is the routing core of Sibyl, a personal multi-model system that routes
 production alert-enrichment and chat traffic across nine models from three
@@ -32,12 +42,14 @@ outcome rate was **0.800 vs the static confidence cascade's 0.893**
 20-row windows. The flip was reverted to a 10% canary the same day, under a
 tripwire pre-committed before the flip.
 
-The diagnosis is the most useful thing in this repo: the reward signal
-(did the alert clear?) was **blind to output quality** -- a model emitting
-garbage text was not penalized as long as the alert resolved. A learned
-router can only beat a good heuristic when its reward measures what you
-actually care about. The fix in the upstream system is a rubric-based judge
-ensemble as a second outcome source, soaking before it earns bandit weight.
+> [!IMPORTANT]
+> The diagnosis is the most useful thing in this repo: the reward signal
+> (did the alert clear?) was **blind to output quality** -- a model emitting
+> garbage text was not penalized as long as the alert resolved. A learned
+> router can only beat a good heuristic when its reward measures what you
+> actually care about. The fix in the upstream system is a rubric-based
+> judge ensemble as a second outcome source, soaking before it earns bandit
+> weight.
 
 Takeaways if you build on this:
 
@@ -47,30 +59,17 @@ Takeaways if you build on this:
 
 ## Architecture
 
-```
-            request (OpenAI-compatible /v1/chat/completions)
-                              |
-                     complexity classifier
-                       (cheap, fast model)
-                              |
-            +-----------------+------------------+
-            | panel_score >= 7 (decomposable)    | otherwise
-            v                                    v
-   PANEL: N lineage-diverse arms          CASCADE: cheapest capable arm,
-   in parallel + chair synthesis          escalate on low confidence;
-                                          trust-adjusted thresholds;
-                                          Thompson Sampling when
-                                          ROUTING_MODE=bandit
-            |                                    |
-            +-----------------+------------------+
-                              |
-               routing-decision rows (JSONL inbox)
-                              |
-              your outcome store + grading process
-                              |
-            nightly posterior recalc -> trust weights
-                              |
-              (loop closes: weights feed routing)
+```mermaid
+flowchart TD
+    REQ["request<br/>(OpenAI-compatible /v1/chat/completions)"] --> CLS["complexity classifier<br/>(cheap, fast model)"]
+    CLS -- "panel_score at threshold<br/>(decomposable query)" --> PANEL["panel: N lineage-diverse<br/>arms in parallel"]
+    PANEL --> CHAIR["chair synthesis"]
+    CLS -- "otherwise" --> CASCADE["cascade: cheapest capable arm,<br/>escalate on low confidence;<br/>Thompson Sampling when<br/>ROUTING_MODE=bandit"]
+    CHAIR --> LOG["routing-decision rows<br/>(JSONL inbox)"]
+    CASCADE --> LOG
+    LOG --> STORE[("your outcome store<br/>+ grading process")]
+    STORE --> RECALC["posterior recalc<br/>trust weights"]
+    RECALC -. "the loop closes" .-> CASCADE
 ```
 
 | Module | What it does |
