@@ -155,7 +155,7 @@ interface; closing the loop is the work.
 
 ## License
 
-MIT. Use it, fork it, learn from it. If you close the loop on your own
+Apache-2.0. Use it, fork it, learn from it. If you close the loop on your own
 domain, that is the whole point.
 
 ARE YOU LIVING IN THE REAL WORLD?
