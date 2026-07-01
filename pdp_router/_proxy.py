@@ -44,9 +44,9 @@ from pdp_router._utils import strip_markdown_fences
 
 log = logging.getLogger(__name__)
 
-# Soft import for clawflag so test environments without it still work. The
-# proxy_streaming feature flag defaults to False, so missing clawflag means
-# streaming stays gated off until the operator installs and enables it.
+# Soft import for the clawflag flag system. When it is absent (a standalone
+# build), _flag_enabled() falls back to PROXY_*_ENABLED environment variables so
+# the flag-gated features stay reachable without it.
 _clawflag: object | None = None
 try:
     import clawflag as _clawflag_mod  # type: ignore[import-not-found]
@@ -57,12 +57,27 @@ except ImportError:
     _clawflag = None
 
 
+def _flag_enabled(flag_key: str, env_var: str, default: bool) -> bool:
+    """Resolve a boolean feature flag.
+
+    With the clawflag flag system present the value is read from clawflag,
+    preserving its behavior. Without it (a standalone build) the same flag is
+    togglable via an environment variable, so the flag-gated features stay
+    reachable outside the private flag system. The env value is truthy for
+    1/true/yes/on (case-insensitive); unset falls back to the default.
+    """
+    if _clawflag is not None:
+        return _clawflag.get_bool(flag_key, default=default)  # type: ignore[attr-defined]
+    raw = os.getenv(env_var)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _streaming_enabled() -> bool:
     """Return True if pipeline.proxy_streaming_enabled is on (default False)."""
-    if _clawflag is None:
-        return False
-    return _clawflag.get_bool(  # type: ignore[attr-defined]
-        "pipeline.proxy_streaming_enabled", default=False
+    return _flag_enabled(
+        "pipeline.proxy_streaming_enabled", "PROXY_STREAMING_ENABLED", default=False
     )
 
 
@@ -75,10 +90,8 @@ def _autopanel_enabled() -> bool:
     panel-worthy requests fan out to N=3 lineage-diverse models and a
     chair-synth pass returns one coherent answer.
     """
-    if _clawflag is None:
-        return False
-    return _clawflag.get_bool(  # type: ignore[attr-defined]
-        "pipeline.proxy_autopanel_enabled", default=False
+    return _flag_enabled(
+        "pipeline.proxy_autopanel_enabled", "PROXY_AUTOPANEL_ENABLED", default=False
     )
 
 
@@ -92,10 +105,8 @@ def _web_search_enabled() -> bool:
     Anthropic) and inflates input tokens with retrieved content. The panel path
     does not consume this flag (MVP is cascade-only).
     """
-    if _clawflag is None:
-        return False
-    return _clawflag.get_bool(  # type: ignore[attr-defined]
-        "pipeline.proxy_web_search_enabled", default=False
+    return _flag_enabled(
+        "pipeline.proxy_web_search_enabled", "PROXY_WEB_SEARCH_ENABLED", default=False
     )
 
 
@@ -107,10 +118,8 @@ def _effort_routing_enabled() -> bool:
     threads it to the arms that support a dial (Anthropic non-fast, OpenRouter).
     Default OFF -- ship dark, smoke on real traffic, then enable.
     """
-    if _clawflag is None:
-        return False
-    return _clawflag.get_bool(  # type: ignore[attr-defined]
-        "pipeline.proxy_effort_routing_enabled", default=False
+    return _flag_enabled(
+        "pipeline.proxy_effort_routing_enabled", "PROXY_EFFORT_ROUTING_ENABLED", default=False
     )
 
 
@@ -124,10 +133,8 @@ def _route_footer_enabled() -> bool:
     surface only -- the default /v1 path is untouched (its consumers already get
     the model via the route_info event / the JSON `model` field).
     """
-    if _clawflag is None:
-        return False
-    return _clawflag.get_bool(  # type: ignore[attr-defined]
-        "pipeline.proxy_route_footer_enabled", default=False
+    return _flag_enabled(
+        "pipeline.proxy_route_footer_enabled", "PROXY_ROUTE_FOOTER_ENABLED", default=False
     )
 
 
@@ -141,10 +148,10 @@ def _panel_transcript_enabled() -> bool:
     only (no LLM calls, no effect on the response); independent of the panel flags so
     it can be toggled without touching routing behavior.
     """
-    if _clawflag is None:
-        return False
-    return _clawflag.get_bool(  # type: ignore[attr-defined]
-        "pipeline.proxy_panel_transcript_enabled", default=False
+    return _flag_enabled(
+        "pipeline.proxy_panel_transcript_enabled",
+        "PROXY_PANEL_TRANSCRIPT_ENABLED",
+        default=False,
     )
 
 
@@ -159,10 +166,10 @@ def _panel_streaming_enabled() -> bool:
     is absent (test envs) this returns True so the streaming-panel path is
     exercisable; the live kill-switch is the flag read here.
     """
-    if _clawflag is None:
-        return True
-    return _clawflag.get_bool(  # type: ignore[attr-defined]
-        "pipeline.proxy_panel_streaming_enabled", default=True
+    return _flag_enabled(
+        "pipeline.proxy_panel_streaming_enabled",
+        "PROXY_PANEL_STREAMING_ENABLED",
+        default=True,
     )
 
 

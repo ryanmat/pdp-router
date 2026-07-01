@@ -12,6 +12,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from pdp_router import _proxy
 from pdp_router._clients import CompletionResult
 from pdp_router._models import OPUS, CreditExhaustionError
 from pdp_router._proxy import (
@@ -140,6 +141,42 @@ class TestProxyConfigDefaults:
         monkeypatch.setenv("PROXY_ROUTING_INBOX_DIR", "/home/x/.pdp-router/inbox")
         config = ProxyConfig()
         assert str(config.panel_transcript_dir) == "/tmp/custom/transcripts"
+
+
+class TestFlagEnvFallback:
+    """When clawflag is absent (a standalone build), the flag helpers honor
+    PROXY_*_ENABLED env vars so the flag-gated features are reachable. With
+    clawflag present, clawflag wins and the env vars are not consulted."""
+
+    def test_autopanel_env_fallback_enables(self, monkeypatch) -> None:
+        monkeypatch.setattr(_proxy, "_clawflag", None)
+        monkeypatch.setenv("PROXY_AUTOPANEL_ENABLED", "1")
+        assert _proxy._autopanel_enabled() is True
+
+    def test_autopanel_env_fallback_defaults_off(self, monkeypatch) -> None:
+        monkeypatch.setattr(_proxy, "_clawflag", None)
+        monkeypatch.delenv("PROXY_AUTOPANEL_ENABLED", raising=False)
+        assert _proxy._autopanel_enabled() is False
+
+    def test_panel_streaming_env_fallback_defaults_on(self, monkeypatch) -> None:
+        monkeypatch.setattr(_proxy, "_clawflag", None)
+        monkeypatch.delenv("PROXY_PANEL_STREAMING_ENABLED", raising=False)
+        assert _proxy._panel_streaming_enabled() is True
+
+    def test_panel_streaming_env_fallback_can_disable(self, monkeypatch) -> None:
+        monkeypatch.setattr(_proxy, "_clawflag", None)
+        monkeypatch.setenv("PROXY_PANEL_STREAMING_ENABLED", "false")
+        assert _proxy._panel_streaming_enabled() is False
+
+    def test_clawflag_present_takes_precedence_over_env(self, monkeypatch) -> None:
+        class _FakeFlag:
+            @staticmethod
+            def get_bool(key: str, default: bool = False) -> bool:
+                return False
+
+        monkeypatch.setattr(_proxy, "_clawflag", _FakeFlag())
+        monkeypatch.setenv("PROXY_AUTOPANEL_ENABLED", "1")
+        assert _proxy._autopanel_enabled() is False
 
 
 class TestEffortRouting:
