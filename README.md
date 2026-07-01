@@ -220,6 +220,4 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 ---
 
-Months of work sit behind that loop closing. It was worth it.
-
 ARE YOU LIVING IN THE REAL WORLD?
