@@ -16,8 +16,11 @@ from pdp_router._clients import CompletionResult
 from pdp_router._models import OPUS, CreditExhaustionError
 from pdp_router._proxy import (
     _SCORE_TO_CONFIDENCE,
+    ChatMessage,
     TrustCache,
     _classify_request,
+    _classify_retryable,
+    _has_search_intent,
     _parse_classifier,
     app,
 )
@@ -124,6 +127,108 @@ class TestProxyConfigDefaults:
         config = ProxyConfig()
         assert str(config.routing_inbox_dir) == "/tmp/custom/inbox"
 
+    def test_panel_transcript_derives_from_inbox_when_env_unset(self, monkeypatch) -> None:
+        """GAP-2: with no PROXY_PANEL_TRANSCRIPT_DIR, the transcript dir is a sibling of
+        the (env-overridden) inbox, so the two cannot drift to different bases."""
+        monkeypatch.delenv("PROXY_PANEL_TRANSCRIPT_DIR", raising=False)
+        monkeypatch.setenv("PROXY_ROUTING_INBOX_DIR", "/home/x/.pdp-router/inbox")
+        config = ProxyConfig()
+        assert str(config.panel_transcript_dir) == "/home/x/.pdp-router/panel-transcripts"
+
+    def test_panel_transcript_env_override_wins(self, monkeypatch) -> None:
+        monkeypatch.setenv("PROXY_PANEL_TRANSCRIPT_DIR", "/tmp/custom/transcripts")
+        monkeypatch.setenv("PROXY_ROUTING_INBOX_DIR", "/home/x/.pdp-router/inbox")
+        config = ProxyConfig()
+        assert str(config.panel_transcript_dir) == "/tmp/custom/transcripts"
+
+
+class TestEffortRouting:
+    """_handle_chat computes the deterministic effort level from the score and
+    threads it to the model call -- only for pdp-auto picks, only when the flag is
+    on, only for effort-capable arms. _route_request is patched so the pick + score
+    are fixed (no classifier call, no epsilon-greedy explore randomness)."""
+
+    _ROUTE = (
+        "claude-opus-4-8",  # model_name (effort-capable arm)
+        0.15,  # confidence
+        5,  # score -> high effort
+        0,  # panel_score
+        False,  # search_intent
+        "",  # system
+        [ChatMessage(role="user", content="hard")],  # non_system
+    )
+
+    def _mock_client(self) -> MagicMock:
+        m = MagicMock()
+        m.complete.return_value = _mock_completion("ok")
+        return m
+
+    @patch("pdp_router._proxy._effort_routing_enabled", return_value=True)
+    @patch("pdp_router._proxy._route_request", return_value=_ROUTE)
+    @patch("pdp_router._proxy.get_client")
+    def test_effort_threaded_when_flag_on(self, mock_get_client, _route, _flag, client) -> None:
+        mock_llm = self._mock_client()
+        mock_get_client.return_value = mock_llm
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "pdp-auto", "messages": [{"role": "user", "content": "hard"}]},
+        )
+        assert resp.status_code == 200
+        assert mock_llm.complete.call_args.kwargs["effort"] == "high"
+
+    @patch("pdp_router._proxy._effort_routing_enabled", return_value=False)
+    @patch("pdp_router._proxy._route_request", return_value=_ROUTE)
+    @patch("pdp_router._proxy.get_client")
+    def test_effort_none_when_flag_off(self, mock_get_client, _route, _flag, client) -> None:
+        mock_llm = self._mock_client()
+        mock_get_client.return_value = mock_llm
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "pdp-auto", "messages": [{"role": "user", "content": "hard"}]},
+        )
+        assert mock_llm.complete.call_args.kwargs["effort"] is None
+
+    @patch("pdp_router._proxy._effort_routing_enabled", return_value=True)
+    @patch("pdp_router._proxy.get_client")
+    def test_effort_none_for_explicit_model(self, mock_get_client, _flag, client) -> None:
+        """Explicit-model requests skip classification (score=0) and must not get an
+        auto-effort even with the flag on -- gated on request.model == pdp-auto."""
+        mock_llm = self._mock_client()
+        mock_get_client.return_value = mock_llm
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": OPUS, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 200
+        assert mock_llm.complete.call_args.kwargs["effort"] is None
+
+    @patch("pdp_router._proxy._effort_routing_enabled", return_value=True)
+    @patch(
+        "pdp_router._proxy._route_request",
+        return_value=(
+            "claude-haiku-4-5-20251001",  # no-dial arm
+            0.95,
+            1,
+            0,
+            False,
+            "",
+            [ChatMessage(role="user", content="easy")],
+        ),
+    )
+    @patch("pdp_router._proxy.get_client")
+    def test_no_dial_model_gets_no_effort_when_flag_on(
+        self, mock_get_client, _route, _flag, client
+    ) -> None:
+        """supports_effort excludes Haiku/Gemini/DeepSeek/Llama at the proxy layer:
+        even with the flag on and a real score, a no-dial pick gets effort=None."""
+        mock_llm = self._mock_client()
+        mock_get_client.return_value = mock_llm
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "pdp-auto", "messages": [{"role": "user", "content": "easy"}]},
+        )
+        assert mock_llm.complete.call_args.kwargs["effort"] is None
+
 
 class TestClassifyRequest:
     @patch("pdp_router._proxy.get_client")
@@ -167,6 +272,88 @@ class TestClassifyRequest:
         _confidence, score, _panel_score = _classify_request(messages, config)
 
         assert score == 3
+
+    @patch("pdp_router._proxy.get_client")
+    def test_retries_transient_then_succeeds(self, mock_get_client) -> None:
+        """A transient classifier 503 is retried; the second call's score is used."""
+        mock_client = MagicMock()
+        mock_client.complete.side_effect = [
+            RuntimeError("503 UNAVAILABLE: model is overloaded"),
+            _mock_completion(text="4 8"),
+        ]
+        mock_get_client.return_value = mock_client
+
+        config = ProxyConfig()
+        messages = [ChatMessage(role="user", content="compare A vs B")]
+        with patch.dict(os.environ, {"PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"}):
+            confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (4, 8)
+        assert confidence == _SCORE_TO_CONFIDENCE[4]
+        assert mock_client.complete.call_count == 2
+
+    @patch("pdp_router._proxy.get_client")
+    def test_persistent_transient_falls_back_after_retries(self, mock_get_client) -> None:
+        """A classifier that keeps 503ing falls back to (3, 0) after the retry budget."""
+        mock_client = MagicMock()
+        mock_client.complete.side_effect = RuntimeError("503 UNAVAILABLE")
+        mock_get_client.return_value = mock_client
+
+        config = ProxyConfig()
+        messages = [ChatMessage(role="user", content="test")]
+        with patch.dict(
+            os.environ,
+            {"PROXY_CLASSIFY_RETRIES": "2", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
+        ):
+            _confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (3, 0)
+        assert mock_client.complete.call_count == 3  # initial + 2 retries
+
+    @patch("pdp_router._proxy.get_client")
+    def test_non_transient_error_does_not_retry(self, mock_get_client) -> None:
+        """A non-transient error (bad key) falls back immediately, no wasted retries."""
+        mock_client = MagicMock()
+        mock_client.complete.side_effect = ValueError("invalid api key")
+        mock_get_client.return_value = mock_client
+
+        config = ProxyConfig()
+        messages = [ChatMessage(role="user", content="test")]
+        with patch.dict(
+            os.environ,
+            {"PROXY_CLASSIFY_RETRIES": "2", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
+        ):
+            _confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (3, 0)
+        assert mock_client.complete.call_count == 1
+
+
+class TestClassifyRetryable:
+    def test_status_code_5xx_and_429_are_retryable(self) -> None:
+        for code, expected in [
+            (503, True),
+            (429, True),
+            (500, True),
+            (502, True),
+            (400, False),
+            (404, False),
+            (403, False),
+        ]:
+            e = RuntimeError("boom")
+            e.code = code  # type: ignore[attr-defined]
+            assert _classify_retryable(e) is expected, code
+
+    def test_message_signals_are_retryable(self) -> None:
+        assert _classify_retryable(RuntimeError("503 UNAVAILABLE")) is True
+        assert _classify_retryable(RuntimeError("RESOURCE_EXHAUSTED")) is True
+        assert _classify_retryable(Exception("deadline exceeded")) is True
+        assert _classify_retryable(Exception("429 too many requests")) is True
+
+    def test_non_transient_messages_are_not_retryable(self) -> None:
+        assert _classify_retryable(ValueError("invalid api key")) is False
+        assert _classify_retryable(ValueError("malformed request")) is False
+        assert _classify_retryable(Exception("")) is False
 
 
 class TestChatCompletions:
@@ -510,6 +697,165 @@ def _read_inbox_rows(inbox_dir):
     return [_json.loads(line) for line in files[0].read_text().splitlines() if line]
 
 
+@pytest.fixture()
+def transcript_dir(client, tmp_path):
+    """Per-test override of _config.panel_transcript_dir (mirrors inbox_dir)."""
+    from pdp_router import _proxy
+
+    out = tmp_path / "transcripts"
+    assert _proxy._config is not None
+    orig = _proxy._config.panel_transcript_dir
+    object.__setattr__(_proxy._config, "panel_transcript_dir", out)
+    try:
+        yield out
+    finally:
+        object.__setattr__(_proxy._config, "panel_transcript_dir", orig)
+
+
+def _read_transcript_rows(transcript_dir):
+    import json as _json
+
+    files = list(transcript_dir.glob("panel-*.jsonl"))
+    assert len(files) == 1, f"expected 1 transcript file, got {len(files)}"
+    return [_json.loads(line) for line in files[0].read_text().splitlines() if line]
+
+
+class TestPanelTranscriptCapture:
+    """proxy_panel_transcript_enabled -- persist full panel turns for the chat-quality eval."""
+
+    @patch("pdp_router._proxy._panel_transcript_enabled", return_value=True)
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy.compose_panel")
+    @patch("pdp_router._proxy.get_client")
+    def test_nonstream_panel_writes_transcript(
+        self,
+        mock_get_client,
+        mock_compose,
+        _classify,
+        _autopanel,
+        _transcript,
+        transcript_dir,
+        client,
+    ) -> None:
+        mock_compose.return_value = ["claude-opus-4-7", "gemini-2.5-pro", "deepseek-chat"]
+
+        def make_client(*_a, **_k):
+            m = MagicMock()
+            m.complete.return_value = _mock_completion("panelist answer")
+            return m
+
+        mock_get_client.side_effect = make_client
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "compare lock-free vs mutex"}],
+                "max_tokens": 500,
+            },
+        )
+        assert resp.status_code == 200
+        rows = _read_transcript_rows(transcript_dir)
+        assert len(rows) == 1
+        rec = rows[0]
+        assert rec["surface"] == "nonstream"
+        assert rec["panel_score"] == 9
+        assert rec["score"] == 3
+        assert rec["prompt"] == "compare lock-free vs mutex"
+        assert [m["model_id"] for m in rec["members"]] == [
+            "claude-opus-4-7",
+            "gemini-2.5-pro",
+            "deepseek-chat",
+        ]
+        assert all(m["text"] == "panelist answer" for m in rec["members"])
+        # chair runs through the same mock .complete, so the synthesis is non-empty.
+        assert rec["synthesis_text"] == "panelist answer"
+        assert rec["synthesis_status"] == "complete"
+        assert rec["messages"] == [{"role": "user", "content": "compare lock-free vs mutex"}]
+
+    @patch("pdp_router._proxy._panel_transcript_enabled", return_value=False)
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy.compose_panel")
+    @patch("pdp_router._proxy.get_client")
+    def test_nonstream_panel_no_transcript_when_flag_off(
+        self,
+        mock_get_client,
+        mock_compose,
+        _classify,
+        _autopanel,
+        _transcript,
+        transcript_dir,
+        client,
+    ) -> None:
+        mock_compose.return_value = ["claude-opus-4-7", "gemini-2.5-pro", "deepseek-chat"]
+
+        def make_client(*_a, **_k):
+            m = MagicMock()
+            m.complete.return_value = _mock_completion("panelist answer")
+            return m
+
+        mock_get_client.side_effect = make_client
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "compare lock-free vs mutex"}],
+                "max_tokens": 500,
+            },
+        )
+        assert resp.status_code == 200
+        # The panel actually ran (so "no file" is meaningful, not vacuous)...
+        assert resp.json()["model"].startswith("pdp-panel-")
+        # ...but the flag is off, so nothing was persisted.
+        assert not transcript_dir.exists() or not list(transcript_dir.glob("panel-*.jsonl"))
+
+    @patch("pdp_router._proxy._panel_transcript_enabled", return_value=True)
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy.compose_panel")
+    @patch("pdp_router._proxy.get_client")
+    def test_nonstream_chair_empty_records_empty_synthesis_not_fallback(
+        self,
+        mock_get_client,
+        mock_compose,
+        _classify,
+        _autopanel,
+        _transcript,
+        transcript_dir,
+        client,
+    ) -> None:
+        # Chair (claude-sonnet-4-6) returns empty -> the proxy substitutes the
+        # first-survivor text into the client response, but the transcript must record
+        # synthesis_text='' (chair.text), status chair_empty -- NOT the survivor text.
+        mock_compose.return_value = ["claude-opus-4-7", "gemini-2.5-pro", "deepseek-chat"]
+
+        def make_client(model_id, *_a, **_k):
+            m = MagicMock()
+            m.complete.return_value = _mock_completion(
+                "" if model_id == "claude-sonnet-4-6" else "member text"
+            )
+            return m
+
+        mock_get_client.side_effect = make_client
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "q"}],
+                "max_tokens": 500,
+            },
+        )
+        assert resp.status_code == 200
+        # Client got the first-survivor fallback + the chair_fallback relabel.
+        assert resp.json()["choices"][0]["message"]["content"] == "member text"
+        assert "chair_fallback" in resp.json()["model"]
+        rec = _read_transcript_rows(transcript_dir)[0]
+        assert rec["synthesis_text"] == ""
+        assert rec["synthesis_status"] == "chair_empty"
+        assert "member text" not in rec["synthesis_text"]
+
+
 class TestAutoPanelGate:
     """Sprint X.K -- clawflag-gated proxy auto-panel decompose+synth path."""
 
@@ -696,6 +1042,61 @@ class TestAutoPanelGate:
 
         assert resp.status_code == 200
         assert "pdp-panel-2+" in resp.json()["model"]
+
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy.compose_panel")
+    @patch("pdp_router._proxy.get_client")
+    def test_errored_member_excluded_from_routing_rows(
+        self,
+        mock_get_client,
+        mock_compose,
+        _mock_classify,
+        _mock_flag,
+        client,
+        inbox_dir,
+    ) -> None:
+        """An errored panel member must not get a panel_member routing row.
+
+        Regression for the results-vs-survivors bug: errored arms carry no
+        signal and must never reach the JSONL inbox the bandit drain consumes.
+        """
+        mock_compose.return_value = [
+            "claude-opus-4-7",
+            "gemini-2.5-pro",
+            "deepseek-chat",
+        ]
+
+        def make_client(model_id, **kwargs):
+            m = MagicMock()
+            if "deepseek" in model_id:
+                m.complete.side_effect = RuntimeError("upstream timeout")
+            else:
+                m.complete.return_value = _mock_completion(f"answer from {model_id}")
+            return m
+
+        mock_get_client.side_effect = make_client
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "complex Q"}],
+            },
+        )
+
+        assert resp.status_code == 200
+
+        rows = _read_inbox_rows(inbox_dir)
+        member_rows = [r for r in rows if r["routing_mode"] == "panel"]
+        chair_rows = [r for r in rows if r["routing_mode"] == "panel_chair"]
+        member_models = {r["model_selected"] for r in member_rows}
+
+        # The errored deepseek arm gets no row; only the 2 survivors do.
+        assert "deepseek-chat" not in member_models
+        assert member_models == {"claude-opus-4-7", "gemini-2.5-pro"}
+        assert len(member_rows) == 2
+        assert len(chair_rows) == 1
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
     @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
@@ -1029,6 +1430,376 @@ class TestAutoPanelGate:
         assert "chair_fallback" in data["model"]
         # Content is the first survivor's text, not empty.
         assert data["choices"][0]["message"]["content"] == "a real answer"
+
+
+class TestSearchIntentGateAndFloor:
+    """Search-intent routing: detect explicit web-search intent, skip the
+    search-free auto-panel, and floor non-searcher cascade picks to Sonnet so
+    the attached web_search tool actually fires (Haiku/meta/openai/qwen do not)."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "search the web for the best framework",
+            "do a web search for Y",
+            "browse the web for Z",
+            "look it up online",
+            "google it",
+            "google the release date of X",
+            "what is the latest news on AI",
+            "the latest AI news",
+            "current headlines about the vote",
+            "today's news",
+            "as of today, what changed",
+        ],
+    )
+    def test_has_search_intent_positive(self, text) -> None:
+        assert _has_search_intent([ChatMessage(role="user", content=text)]) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # Routine coding phrasing must NOT trip the gate (heavy-coding-user
+            # precision; these are the adversarial-review false positives).
+            "write a function to search a list",
+            "binary search for this sorted array",
+            "search for the user in the database",
+            "explain binary search",
+            "implement a hashtable lookup",
+            "look up the value in the hashmap",
+            "port the service to google cloud run",
+            "from google.cloud import storage",
+            "get_weather(city)",
+            "stock price moving average from this CSV",
+            "config url is https://example.com",
+            "bump to the latest release of pytest",
+            "fix the latest test results",
+            "who won the merge conflict",
+            "refactor the current code",
+            "what is the latest version of the code I wrote",
+            "compare Postgres and MySQL",
+        ],
+    )
+    def test_has_search_intent_negative(self, text) -> None:
+        assert _has_search_intent([ChatMessage(role="user", content=text)]) is False
+
+    def test_has_search_intent_uses_latest_user_message(self) -> None:
+        msgs = [
+            ChatMessage(role="user", content="search for the latest X"),
+            ChatMessage(role="assistant", content="..."),
+            ChatMessage(role="user", content="now refactor it"),
+        ]
+        assert _has_search_intent(msgs) is False
+
+    def test_has_search_intent_empty(self) -> None:
+        assert _has_search_intent([]) is False
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch("pdp_router._proxy.get_client")
+    def test_floor_haiku_to_sonnet(self, mock_get_client, _mock_cascade, _mock_ws, client) -> None:
+        """Search intent + flag on + cascade picked Haiku -> floored to Sonnet."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search for the latest news"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "claude-sonnet-4-6"
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch(
+        "pdp_router._proxy.confidence_cascade",
+        return_value="meta/llama-4-scout-17b-16e-instruct-maas",
+    )
+    @patch("pdp_router._proxy.get_client")
+    def test_floor_meta_llama_to_sonnet(
+        self, mock_get_client, _mock_cascade, _mock_ws, client
+    ) -> None:
+        """A non-searcher pick (meta/llama rejects the tool) is floored to Sonnet.
+        meta/llama is one of the models the ~10% epsilon-greedy explore branch can
+        emit; the floor sits after confidence_cascade so it catches those too."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "look it up online"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "claude-sonnet-4-6"
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=False)
+    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch("pdp_router._proxy.get_client")
+    def test_no_floor_when_web_search_off(
+        self, mock_get_client, _mock_cascade, _mock_ws, client
+    ) -> None:
+        """Flag off -> no floor even on a search-intent query (zero behavior change)."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search for the latest news"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "claude-haiku-4-5-20251001"
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy.confidence_cascade", return_value="gemini-2.5-pro")
+    @patch("pdp_router._proxy.get_client")
+    def test_no_floor_when_already_searcher(
+        self, mock_get_client, _mock_cascade, _mock_ws, client
+    ) -> None:
+        """A reliable-searcher cascade pick (gemini-2.5-pro) is left untouched."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search for the latest news"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "gemini-2.5-pro"
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch("pdp_router._proxy.get_client")
+    def test_search_intent_skips_panel_and_floors(
+        self, mock_get_client, _mock_cascade, _mock_classify, _mock_panel, _mock_ws, client
+    ) -> None:
+        """Search intent wins over panel_score>=7: skip the search-free panel,
+        stay on cascade, and floor Haiku -> Sonnet with web search attached."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search for the latest AI news"}],
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "pdp-panel" not in data["model"]
+        assert data["model"] == "claude-sonnet-4-6"
+        mock_llm.complete.assert_called_once()
+        assert mock_llm.complete.call_args.kwargs.get("enable_web_search") is True
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy.compose_panel")
+    @patch("pdp_router._proxy.get_client")
+    def test_panel_still_fires_without_search_intent(
+        self, mock_get_client, mock_compose, _mock_classify, _mock_panel, _mock_ws, client
+    ) -> None:
+        """Control: panel_score=9 + no search intent -> panel still fires
+        (the skip is search-intent-gated, not a blanket disable)."""
+        mock_compose.return_value = ["claude-opus-4-7", "gemini-2.5-pro", "deepseek-chat"]
+
+        def make_client(*args, **kwargs):
+            m = MagicMock()
+            m.complete.return_value = _mock_completion("panelist answer")
+            return m
+
+        mock_get_client.side_effect = make_client
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "compare lock-free vs mutex queues"}],
+                "max_tokens": 500,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"].startswith("pdp-panel-")
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy.get_client")
+    def test_explicit_model_never_floored(self, mock_get_client, _mock_ws, client) -> None:
+        """Explicit model selection bypasses the floor (search_intent=False)."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "messages": [{"role": "user", "content": "search for the latest news"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "claude-haiku-4-5-20251001"
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch("pdp_router._proxy.get_client")
+    def test_routing_row_records_search_intent(
+        self, mock_get_client, _mock_cascade, _mock_ws, client, inbox_dir
+    ) -> None:
+        """The cascade routing-decision row records search_intent for the drain."""
+        import json as _json
+
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search for the latest news"}],
+            },
+        )
+        assert resp.status_code == 200
+        rows = _read_inbox_rows(inbox_dir)
+        assert len(rows) == 1
+        assert _json.loads(rows[0]["context_json"])["search_intent"] is True
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy.confidence_cascade", return_value="gemini-2.5-flash-lite")
+    @patch("pdp_router._proxy.get_client")
+    def test_floor_flash_lite_to_sonnet(
+        self, mock_get_client, _mock_cascade, _mock_ws, client
+    ) -> None:
+        """Flash-Lite is deliberately excluded from reliable searchers -> floored."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search the web for X"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "claude-sonnet-4-6"
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-opus-4-8")
+    @patch("pdp_router._proxy.get_client")
+    def test_no_floor_when_opus(self, mock_get_client, _mock_cascade, _mock_ws, client) -> None:
+        """A low-confidence Opus cascade pick already searches -> left untouched."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search the web for X"}],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "claude-opus-4-8"
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.95, 1, 3))
+    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch("pdp_router._proxy.get_client")
+    def test_floor_without_panel_when_low_panel_score(
+        self, mock_get_client, _mock_cascade, _mock_classify, _mock_panel, _mock_ws, client
+    ) -> None:
+        """Search intent + low panel_score (no panel) -> plain cascade floored to Sonnet."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search the web for X"}],
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "pdp-panel" not in data["model"]
+        assert data["model"] == "claude-sonnet-4-6"
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._streaming_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch("pdp_router._proxy.get_client")
+    def test_streaming_search_intent_floors_and_searches(
+        self, mock_get_client, _mock_cascade, _mock_classify, _mock_streaming, _mock_ws, client
+    ) -> None:
+        """A streaming search-intent request whose cascade pick is a non-searcher is
+        floored to Sonnet and still streams with web search enabled."""
+        captured: dict = {}
+
+        async def fake_stream(**kwargs):
+            captured.update(kwargs)
+            yield "Hello"
+
+        mock_llm = MagicMock()
+        mock_llm.stream_complete = lambda **kw: fake_stream(**kw)
+        mock_get_client.return_value = mock_llm
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search the web for today's headlines"}],
+                "stream": True,
+            },
+        )
+        assert resp.status_code == 200
+        _ = resp.text  # drain so the stream generator runs
+        assert mock_get_client.call_args.args[0] == "claude-sonnet-4-6"
+        assert captured.get("enable_web_search") is True
+        assert "claude-sonnet-4-6" in resp.text
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch("pdp_router._proxy.get_client")
+    def test_routing_row_records_search_intent_false(
+        self, mock_get_client, _mock_cascade, _mock_ws, client, inbox_dir
+    ) -> None:
+        """A non-search query records search_intent=False in the routing row."""
+        import json as _json
+
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "explain how a hashmap works"}],
+            },
+        )
+        assert resp.status_code == 200
+        rows = _read_inbox_rows(inbox_dir)
+        assert len(rows) == 1
+        assert _json.loads(rows[0]["context_json"])["search_intent"] is False
 
 
 class TestWebSearchGate:

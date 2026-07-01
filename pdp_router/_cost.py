@@ -16,6 +16,8 @@ _MODEL_PRICING: list[tuple[str, dict[str, float]]] = [
     ("gemini-2.5-pro", {"input": 1.25, "output": 10.00}),
     ("meta/llama-4-scout", {"input": 0.25, "output": 0.70}),
     ("meta/llama-4-maverick", {"input": 0.35, "output": 1.15}),
+    ("openai/gpt-5.5", {"input": 5.00, "output": 30.00}),
+    ("qwen/qwen3.7-plus", {"input": 0.32, "output": 1.28}),
 ]
 
 _FALLBACK_PRICING: dict[str, float] = {"input": 3.00, "output": 15.00}

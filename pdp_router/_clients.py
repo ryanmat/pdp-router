@@ -13,6 +13,11 @@ import anthropic
 from opentelemetry import trace
 
 from pdp_router._cost import estimate_cost
+from pdp_router._effort import (
+    anthropic_output_config,
+    is_anthropic_effort_model,
+    openrouter_reasoning_body,
+)
 from pdp_router._models import CreditExhaustionError
 
 log = logging.getLogger(__name__)
@@ -62,6 +67,12 @@ class LLMClient(Protocol):
     path while leaving the panel path and every other pdp-router consumer
     untouched. Providers without native web search (DeepSeek, Ollama) accept and
     ignore it to satisfy this protocol.
+
+    effort opts a single call into a provider reasoning-effort knob (low/medium/
+    high). Like enable_web_search it is a per-call value, None meaning "do not set
+    the knob." The proxy only passes a non-None effort to models that support it
+    (see _effort.supports_effort); providers/models with no dial (Gemini, DeepSeek,
+    Llama, Haiku, Ollama) accept and ignore it to satisfy this protocol.
     """
 
     def complete(
@@ -71,6 +82,7 @@ class LLMClient(Protocol):
         max_tokens: int = 1024,
         langsmith_extra: dict | None = None,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult: ...
 
     def complete_multi(
@@ -79,6 +91,7 @@ class LLMClient(Protocol):
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult: ...
 
     def stream_complete(
@@ -87,6 +100,7 @@ class LLMClient(Protocol):
         user_message: str,
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens as they arrive from the backend."""
         ...
@@ -97,6 +111,7 @@ class LLMClient(Protocol):
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens for multi-turn conversations."""
         ...
@@ -146,6 +161,7 @@ class AnthropicClient:
         max_tokens: int = 1024,
         langsmith_extra: dict | None = None,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult:
         """Send a single-turn completion request.
 
@@ -156,6 +172,9 @@ class AnthropicClient:
             langsmith_extra: Per-call LangSmith metadata (passed through to SDK).
             enable_web_search: Attach the web_search server tool. The model still
                 decides whether to actually search.
+            effort: Reasoning-effort level (low/medium/high). When set on a non-Haiku
+                model, attached as output_config.effort; Haiku rejects the parameter
+                so it is dropped here (and the proxy also gates it out upstream).
 
         Raises:
             CreditExhaustionError: On HTTP 402 or billing-related errors.
@@ -166,6 +185,8 @@ class AnthropicClient:
             extra_kwargs["langsmith_extra"] = langsmith_extra
         if enable_web_search:
             extra_kwargs["tools"] = [_anthropic_web_search_tool()]
+        if effort and is_anthropic_effort_model(self._model):
+            extra_kwargs["output_config"] = anthropic_output_config(effort)
 
         message = self._make_api_call(
             system=system,
@@ -181,6 +202,7 @@ class AnthropicClient:
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult:
         """Send a multi-turn completion request.
 
@@ -190,6 +212,8 @@ class AnthropicClient:
             max_tokens: Maximum tokens to generate.
             enable_web_search: Attach the web_search server tool. The model still
                 decides whether to actually search.
+            effort: Reasoning-effort level (low/medium/high). When set, attached as
+                output_config.effort.
 
         Raises:
             CreditExhaustionError: On HTTP 402 or billing-related errors.
@@ -198,6 +222,8 @@ class AnthropicClient:
         extra_kwargs: dict = {}
         if enable_web_search:
             extra_kwargs["tools"] = [_anthropic_web_search_tool()]
+        if effort and is_anthropic_effort_model(self._model):
+            extra_kwargs["output_config"] = anthropic_output_config(effort)
 
         message = self._make_api_call(
             system=system,
@@ -272,6 +298,7 @@ class AnthropicClient:
         user_message: str,
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens as they arrive from the Anthropic backend."""
         async for token in self._stream(
@@ -279,6 +306,7 @@ class AnthropicClient:
             messages=[{"role": "user", "content": user_message}],
             max_tokens=max_tokens,
             enable_web_search=enable_web_search,
+            effort=effort,
         ):
             yield token
 
@@ -288,6 +316,7 @@ class AnthropicClient:
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens for a multi-turn conversation."""
         async for token in self._stream(
@@ -295,6 +324,7 @@ class AnthropicClient:
             messages=messages,
             max_tokens=max_tokens,
             enable_web_search=enable_web_search,
+            effort=effort,
         ):
             yield token
 
@@ -305,17 +335,21 @@ class AnthropicClient:
         messages: list[dict[str, str]],
         max_tokens: int,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
         """Iterate the async messages stream, yielding content_block_delta text.
 
         With web search on, the stream interleaves server_tool_use and
         web_search_tool_result blocks (and a pause while the search runs); the
-        text_delta filter below skips them and yields only answer text.
+        text_delta filter below skips them and yields only answer text. With
+        effort set, output_config.effort rides on the stream request.
         """
         client = self._get_async_client()
         stream_kwargs: dict = {}
         if enable_web_search:
             stream_kwargs["tools"] = [_anthropic_web_search_tool()]
+        if effort and is_anthropic_effort_model(self._model):
+            stream_kwargs["output_config"] = anthropic_output_config(effort)
         try:
             async with client.messages.stream(
                 model=self._model,
@@ -391,8 +425,14 @@ class GeminiClient:
         max_tokens: int = 1024,
         langsmith_extra: dict | None = None,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult:
-        """Send a single-turn completion request."""
+        """Send a single-turn completion request.
+
+        effort is accepted for protocol parity and ignored: Gemini's thinking
+        knob (thinking_budget/level) is Gemini-version dependent on the 2.5 roster
+        and is not wired in v1 (see _effort.supports_effort).
+        """
         response = self._make_api_call(
             contents=user_message,
             system=system,
@@ -407,8 +447,9 @@ class GeminiClient:
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult:
-        """Send a multi-turn completion request."""
+        """Send a multi-turn completion request (effort accepted, ignored in v1)."""
         from google.genai import types
 
         contents = []
@@ -515,8 +556,12 @@ class GeminiClient:
         user_message: str,
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
-        """Yield text tokens as they arrive from the Gemini backend."""
+        """Yield text tokens as they arrive from the Gemini backend.
+
+        effort is accepted for protocol parity and ignored (no Gemini dial in v1).
+        """
         async for token in self._stream(
             contents=user_message,
             system=system,
@@ -531,8 +576,12 @@ class GeminiClient:
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
-        """Yield text tokens for a multi-turn Gemini conversation."""
+        """Yield text tokens for a multi-turn Gemini conversation.
+
+        effort is accepted for protocol parity and ignored (no Gemini dial in v1).
+        """
         from google.genai import types
 
         contents = []
@@ -582,25 +631,42 @@ class GeminiClient:
             raise
 
 
-class DeepSeekClient:
-    """Wraps the DeepSeek OpenAI-compatible API behind the LLMClient interface.
+class OpenAICompatibleClient:
+    """Wraps any OpenAI-compatible /chat/completions API behind the LLMClient interface.
 
-    Uses httpx directly since DeepSeek is a simple OpenAI-compatible endpoint.
+    Uses httpx directly. base_url must include the version segment (for example
+    "https://openrouter.ai/api/v1"); every request POSTs to the absolute
+    "{base_url}/chat/completions". label names the provider in error messages.
+    Fronts OpenRouter (openai/* and qwen/* slugs); DeepSeekClient subclasses it.
     """
 
-    _API_URL = "https://api.deepseek.com/v1/chat/completions"
-
-    def __init__(self, model: str, *, api_key: str = "") -> None:
+    def __init__(
+        self,
+        model: str,
+        *,
+        api_key: str = "",
+        base_url: str = "",
+        label: str = "OpenAI-compatible",
+        supports_reasoning_effort: bool = True,
+    ) -> None:
         self._model = model
+        self._label = label
+        # OpenRouter normalizes a unified reasoning.effort param across its arms;
+        # DeepSeek's direct API has no such param (its reasoning is a separate
+        # model, not a request field), so the DeepSeek subclass disables this.
+        # Guards against ever putting an unsupported field on a direct provider.
+        self._supports_reasoning_effort = supports_reasoning_effort
 
         if not api_key:
-            raise ValueError("No DeepSeek credentials provided. Pass api_key.")
+            raise ValueError(f"No {label} credentials provided. Pass api_key.")
+        if not base_url:
+            raise ValueError(f"No base_url provided for the {label} client.")
 
         import httpx
 
         self._api_key = api_key
+        self._chat_url = f"{base_url.rstrip('/')}/chat/completions"
         self._client = httpx.Client(
-            base_url="https://api.deepseek.com",
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10),
         )
@@ -612,7 +678,6 @@ class DeepSeekClient:
             import httpx
 
             self._async_client = httpx.AsyncClient(
-                base_url="https://api.deepseek.com",
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10),
             )
@@ -625,11 +690,14 @@ class DeepSeekClient:
         max_tokens: int = 1024,
         langsmith_extra: dict | None = None,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult:
         """Send a single-turn completion request.
 
-        enable_web_search is accepted for protocol parity and ignored: DeepSeek
-        has no native web search on this endpoint.
+        enable_web_search is accepted for protocol parity and ignored: these
+        OpenAI-compatible endpoints have no native web-search server tool. effort,
+        when set on a reasoning-effort-capable endpoint (OpenRouter), rides as the
+        unified reasoning.effort body param.
         """
         return self._call(
             messages=[
@@ -637,6 +705,7 @@ class DeepSeekClient:
                 {"role": "user", "content": user_message},
             ],
             max_tokens=max_tokens,
+            effort=effort,
         )
 
     def complete_multi(
@@ -645,17 +714,23 @@ class DeepSeekClient:
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult:
         """Send a multi-turn completion request (enable_web_search ignored)."""
         full_messages = [{"role": "system", "content": system}, *messages]
-        return self._call(messages=full_messages, max_tokens=max_tokens)
+        return self._call(messages=full_messages, max_tokens=max_tokens, effort=effort)
 
-    def _call(self, messages: list[dict[str, str]], max_tokens: int) -> CompletionResult:
+    def _call(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        effort: str | None = None,
+    ) -> CompletionResult:
         """Make the API call and process the response."""
-        response = self._client.post(
-            "/v1/chat/completions",
-            json={"model": self._model, "messages": messages, "max_tokens": max_tokens},
-        )
+        body: dict = {"model": self._model, "messages": messages, "max_tokens": max_tokens}
+        if effort and self._supports_reasoning_effort:
+            body.update(openrouter_reasoning_body(effort))
+        response = self._client.post(self._chat_url, json=body)
 
         if response.status_code == 402 or (
             response.status_code >= 400
@@ -666,7 +741,7 @@ class DeepSeekClient:
             span = trace.get_current_span()
             span.set_attribute("pdp_router.credit_exhaustion", True)
             raise CreditExhaustionError(
-                f"DeepSeek API billing error (HTTP {response.status_code}): {response.text}"
+                f"{self._label} API billing error (HTTP {response.status_code}): {response.text}"
             )
 
         response.raise_for_status()
@@ -699,14 +774,16 @@ class DeepSeekClient:
         user_message: str,
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
-        """Yield text tokens as they arrive from DeepSeek (enable_web_search ignored)."""
+        """Yield text tokens as they arrive from the endpoint (enable_web_search ignored)."""
         async for token in self._stream(
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_message},
             ],
             max_tokens=max_tokens,
+            effort=effort,
         ):
             yield token
 
@@ -716,28 +793,35 @@ class DeepSeekClient:
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
-        """Yield text tokens for a multi-turn DeepSeek conversation (enable_web_search ignored)."""
+        """Yield text tokens for a multi-turn conversation (enable_web_search ignored)."""
         full_messages = [{"role": "system", "content": system}, *messages]
-        async for token in self._stream(messages=full_messages, max_tokens=max_tokens):
+        async for token in self._stream(
+            messages=full_messages, max_tokens=max_tokens, effort=effort
+        ):
             yield token
 
     async def _stream(
         self,
         messages: list[dict[str, str]],
         max_tokens: int,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
-        """Open an SSE stream against DeepSeek, yield delta content."""
+        """Open an SSE stream against the endpoint, yield delta content."""
         client = self._get_async_client()
+        body: dict = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if effort and self._supports_reasoning_effort:
+            body.update(openrouter_reasoning_body(effort))
         async with client.stream(  # type: ignore[attr-defined]
             "POST",
-            "/v1/chat/completions",
-            json={
-                "model": self._model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "stream": True,
-            },
+            self._chat_url,
+            json=body,
         ) as response:
             if response.status_code == 402 or (
                 response.status_code >= 400
@@ -749,7 +833,7 @@ class DeepSeekClient:
                 span = trace.get_current_span()
                 span.set_attribute("pdp_router.credit_exhaustion", True)
                 raise CreditExhaustionError(
-                    f"DeepSeek API billing error (HTTP {response.status_code})"
+                    f"{self._label} API billing error (HTTP {response.status_code})"
                 )
             response.raise_for_status()
 
@@ -773,6 +857,25 @@ class DeepSeekClient:
                     yield content
 
 
+class DeepSeekClient(OpenAICompatibleClient):
+    """OpenAI-compatible client pinned to DeepSeek's endpoint.
+
+    DeepSeek is a genuinely decorrelated training lineage; this thin subclass
+    fixes the base_url and the credential-error label.
+    """
+
+    def __init__(self, model: str, *, api_key: str = "") -> None:
+        super().__init__(
+            model,
+            api_key=api_key,
+            base_url="https://api.deepseek.com/v1",
+            label="DeepSeek",
+            # DeepSeek's reasoning is a separate model (deepseek-reasoner), not a
+            # request param, so no unified reasoning.effort knob: do not emit it.
+            supports_reasoning_effort=False,
+        )
+
+
 class OllamaClient:
     """Stub client for local Ollama models (DGX Spark integration pending)."""
 
@@ -787,6 +890,7 @@ class OllamaClient:
         max_tokens: int = 1024,
         langsmith_extra: dict | None = None,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult:
         raise RuntimeError(f"Ollama not yet available -- Mac Studio pending. Model: {self._model}")
 
@@ -796,6 +900,7 @@ class OllamaClient:
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> CompletionResult:
         raise RuntimeError(f"Ollama not yet available -- Mac Studio pending. Model: {self._model}")
 
@@ -805,6 +910,7 @@ class OllamaClient:
         user_message: str,
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
         raise RuntimeError("Streaming not implemented for Ollama")
         # pragma: no cover -- unreachable, satisfies AsyncIterator typing.
@@ -817,6 +923,7 @@ class OllamaClient:
         messages: list[dict[str, str]],
         max_tokens: int = 1024,
         enable_web_search: bool = False,
+        effort: str | None = None,
     ) -> AsyncIterator[str]:
         raise RuntimeError("Streaming not implemented for Ollama")
         # pragma: no cover -- unreachable, satisfies AsyncIterator typing.
@@ -833,7 +940,7 @@ def get_client(
     project: str = "",
     location: str = "",
     deepseek_api_key: str = "",
-) -> AnthropicClient | GeminiClient | DeepSeekClient | OllamaClient:
+) -> AnthropicClient | GeminiClient | OpenAICompatibleClient | OllamaClient:
     """Return the appropriate client wrapper for a model name.
 
     Args:
@@ -841,7 +948,7 @@ def get_client(
             "meta/llama-4-scout-...", "deepseek-chat", or "ollama/llama3").
         api_key: API key for Anthropic or Gemini models.
         auth_token: OAuth token for Anthropic models (fallback if no api_key).
-        base_url: Base URL for Ollama models.
+        base_url: Base URL for Ollama and OpenAI-compatible (OpenRouter) models.
         project: GCP project ID for Vertex AI partner models (meta/*).
         location: GCP region for Vertex AI partner models (default: us-central1).
         deepseek_api_key: API key for DeepSeek models.
@@ -862,4 +969,11 @@ def get_client(
         return GeminiClient(model_name, project=project, location=location)
     if model_name.startswith("ollama/") or model_name.startswith("local/"):
         return OllamaClient(model=model_name, base_url=base_url or "http://localhost:11434")
+    if model_name.startswith("openai/") or model_name.startswith("qwen"):
+        return OpenAICompatibleClient(
+            model_name,
+            api_key=api_key,
+            base_url=base_url or "https://openrouter.ai/api/v1",
+            label="OpenRouter",
+        )
     raise ValueError(f"Unknown model provider for: {model_name}")

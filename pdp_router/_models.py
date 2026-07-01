@@ -26,6 +26,12 @@ GEMINI_FLASH_LITE = "gemini-2.5-flash-lite"
 LLAMA_SCOUT = "meta/llama-4-scout-17b-16e-instruct-maas"
 LLAMA_MAVERICK = "meta/llama-4-maverick-17b-128e-instruct-maas"
 
+# OpenAI (via OpenRouter, OpenAI-compatible API)
+GPT_5_5 = "openai/gpt-5.5"
+
+# Qwen / Alibaba (via OpenRouter, OpenAI-compatible API)
+QWEN_3_7_PLUS = "qwen/qwen3.7-plus"
+
 
 # Live registry: every model ID the proxy/orchestrator may select. Used by
 # expand_canonical_to_live() to fan a canonical posterior back out to every
@@ -40,6 +46,8 @@ LIVE_REGISTRY: tuple[str, ...] = (
     GEMINI_FLASH_LITE,
     LLAMA_SCOUT,
     LLAMA_MAVERICK,
+    GPT_5_5,
+    QWEN_3_7_PLUS,
 )
 
 
@@ -64,8 +72,8 @@ def canonicalize_model_id(model_id: str) -> str:
 
     Non-Anthropic IDs pass through unchanged: Gemini's pro/flash/flash-lite
     are capability tiers (not version aliases), Llama's full MaaS suffix is
-    required by the Vertex endpoint and the cost lookup, and DeepSeek/local
-    IDs are already stable.
+    required by the Vertex endpoint and the cost lookup, and DeepSeek/OpenAI/
+    Qwen/local IDs are already stable.
     """
     if not model_id:
         return model_id

@@ -9,7 +9,7 @@ from pdp_router._cost import estimate_cost
 
 
 class TestEstimateCost:
-    """Port of enrichment-orchestrator TestEstimateCost + multi-provider additions."""
+    """Per-provider cost estimation tests with multi-provider additions."""
 
     def test_haiku_cost(self) -> None:
         usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
@@ -72,6 +72,22 @@ class TestEstimateCost:
         usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
         cost = estimate_cost("deepseek-chat", usage)
         assert cost == pytest.approx(0.28 + 0.42)
+
+    def test_gpt_5_5_cost(self) -> None:
+        usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+        cost = estimate_cost("openai/gpt-5.5", usage)
+        assert cost == pytest.approx(5.00 + 30.00)
+
+    def test_gpt_5_5_dated_slug_matches_prefix(self) -> None:
+        # The dated alias must hit the same prefix row, not the fallback.
+        usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+        cost = estimate_cost("openai/gpt-5.5-20260423", usage)
+        assert cost == pytest.approx(5.00 + 30.00)
+
+    def test_qwen_3_7_plus_cost(self) -> None:
+        usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+        cost = estimate_cost("qwen/qwen3.7-plus", usage)
+        assert cost == pytest.approx(0.32 + 1.28)
 
     def test_missing_keys_default_to_zero(self) -> None:
         assert estimate_cost("claude-opus-4-7", {}) == 0.0

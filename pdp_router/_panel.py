@@ -1,5 +1,5 @@
-# Description: Shared panel composer + chair synthesis + JSONL routing-decisions writer.
-# Description: Pure-Python; no FastMCP, no mcporter; consumers wire I/O.
+# Description: Shared panel composer + chair synthesis + JSONL routing-decisions and
+# Description: panel-transcript writers. Pure-Python; no FastMCP, no mcporter; consumers wire I/O.
 
 from __future__ import annotations
 
@@ -120,9 +120,7 @@ def compose_panel(
     for model_id in pool:
         by_lineage.setdefault(classify_lineage(model_id), []).append(model_id)
     for lineage in by_lineage:
-        by_lineage[lineage].sort(
-            key=lambda m: weights.get(m, _DEFAULT_TRUST), reverse=True
-        )
+        by_lineage[lineage].sort(key=lambda m: weights.get(m, _DEFAULT_TRUST), reverse=True)
 
     lineages_sorted = sorted(
         by_lineage.keys(),
@@ -152,6 +150,33 @@ def compose_panel(
         cursors[classify_lineage(chosen)] += 1
 
     return picked
+
+
+def build_chair_prompt(
+    *,
+    user_prompt: str,
+    system: str,
+    survivors: list[PanelMemberResponse],
+) -> tuple[str, str]:
+    """Build the (chair_system, chair_user) prompt for chair synthesis.
+
+    Panelist identities are anonymized to A/B/C/... labels so the chair never
+    sees model IDs (brand / positional bias mitigation). `survivors` must already
+    be the error-free, non-empty-text subset -- this helper does not re-filter.
+    Shared by synthesize_chair (blocking) and the proxy streaming chair path so
+    both build byte-identical prompts.
+    """
+    labels = string.ascii_uppercase
+    panel_section = "\n\n".join(
+        f"PANELIST {labels[i]}:\n{survivors[i].text}" for i in range(len(survivors))
+    )
+    chair_user = f"USER PROMPT:\n{user_prompt}\n\n---\n\n{panel_section}"
+    chair_system_parts: list[str] = []
+    if system:
+        chair_system_parts.append(system)
+    chair_system_parts.append(CHAIR_SYSTEM.format(n=len(survivors)))
+    chair_system = "\n\n".join(chair_system_parts)
+    return chair_system, chair_user
 
 
 def synthesize_chair(
@@ -189,16 +214,9 @@ def synthesize_chair(
             error="no_panel_survivors",
         )
 
-    labels = string.ascii_uppercase
-    panel_section = "\n\n".join(
-        f"PANELIST {labels[i]}:\n{survivors[i].text}" for i in range(len(survivors))
+    chair_system, chair_user = build_chair_prompt(
+        user_prompt=user_prompt, system=system, survivors=survivors
     )
-    chair_user = f"USER PROMPT:\n{user_prompt}\n\n---\n\n{panel_section}"
-    chair_system_parts: list[str] = []
-    if system:
-        chair_system_parts.append(system)
-    chair_system_parts.append(CHAIR_SYSTEM.format(n=len(survivors)))
-    chair_system = "\n\n".join(chair_system_parts)
 
     t0 = time.monotonic()
     try:
@@ -246,6 +264,92 @@ def append_routing_decisions_jsonl(
             for row in rows:
                 f.write(json.dumps(row) + "\n")
     except OSError as e:
-        log.warning(
-            "Failed to write routing decisions JSONL to %s: %s", inbox_dir, e
-        )
+        log.warning("Failed to write routing decisions JSONL to %s: %s", inbox_dir, e)
+
+
+def append_panel_transcript_jsonl(
+    *,
+    transcript_dir: Path,
+    chat_request_id: str,
+    surface: str,
+    prompt: str,
+    messages: list[dict[str, str]],
+    system: str,
+    members: list[PanelMemberResponse],
+    synthesis_text: str,
+    synthesis_status: str,
+    chair_model: str,
+    panel_score: int,
+    score: int,
+) -> None:
+    """Append ONE panel-turn transcript object to {transcript_dir}/panel-{YYYYMMDD}.jsonl.
+
+    Unlike the routing-decisions writer (one metadata row per member + chair), this
+    persists the full gradeable artifact for a single panel turn as ONE JSON object:
+    the prompt, each member's response text, and the chair synthesis. It is the only
+    place the member/synthesis TEXT is written to disk -- the routing inbox keeps
+    metadata only, and both panel paths otherwise discard the texts after the chair
+    runs. A downstream Ryan-grade / judge-ensemble eval reads one line == one
+    gradeable turn (synthesis vs single best member).
+
+    `members` is the survivor list (error-free, non-empty text); an empty list is a
+    no-op (nothing to grade). `messages` is the full conversation the members actually
+    saw (members answer multi-turn requests with history, so the grader needs more than
+    the last turn); `prompt` is the last user message kept as a convenience key.
+
+    `synthesis_status` lets the grader exclude non-clean turns so a truncated answer is
+    never scored as a real synthesis (which would bias the eval against synthesis):
+      - "complete": the chair finished cleanly with non-empty output.
+      - "chair_empty": the chair produced nothing; the caller streamed/returned the
+        first-survivor fallback to the client, but synthesis_text stays "".
+      - "error": the chair stream raised mid-flight; synthesis_text holds the partial
+        tokens emitted before the error and the client saw a failed turn.
+      - "disconnect": the client went away mid-stream; synthesis_text holds whatever
+        had streamed. The non-streaming path never produces this status.
+
+    Fire-and-forget: swallows ANY exception with a warn-with-traceback log and never
+    raises into the request path -- it runs inside the streaming `finally` (around a
+    GeneratorExit on client disconnect), so an escape would corrupt the SSE or replace
+    the in-flight GeneratorExit. Single-writer assumption: one uvicorn worker serializes
+    appends; a multi-worker scale-out would need O_APPEND-atomic or per-turn files since
+    these records exceed PIPE_BUF. No rotation -- a long-running enabled flag accrues
+    full-text records (~few MB/week at panel rates); prune manually if it grows.
+    Local-only sidecar, same trust boundary as the routing inbox.
+    """
+    if not members:
+        return
+    now = datetime.now(UTC)
+    record = {
+        "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "chat_request_id": chat_request_id,
+        "surface": surface,
+        "panel_score": panel_score,
+        "score": score,
+        "chair_model": chair_model,
+        "system": system,
+        "prompt": prompt,
+        "messages": messages,
+        "members": [
+            {
+                "model_id": m.model_id,
+                "lineage": m.lineage,
+                "text": m.text,
+                "input_tokens": m.input_tokens,
+                "output_tokens": m.output_tokens,
+                "estimated_cost_usd": m.estimated_cost_usd,
+            }
+            for m in members
+        ],
+        "synthesis_text": synthesis_text,
+        "synthesis_status": synthesis_status,
+    }
+    try:
+        # Serialize BEFORE touching the filesystem so a non-serializable field fails
+        # without leaving an empty turd file (open("a") would create one first).
+        line = json.dumps(record) + "\n"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        path = transcript_dir / f"panel-{now.strftime('%Y%m%d')}.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        log.warning("Failed to write panel transcript JSONL to %s", transcript_dir, exc_info=True)

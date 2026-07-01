@@ -3,10 +3,10 @@
 
 [project]
 name = "pdp-router"
-version = "0.3.2"
+version = "0.3.3"
 description = "Outcome-fed routing across heterogeneous AI models: confidence cascade, Thompson Sampling bandit, multi-model panel"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Ryan Matuszewski" }]
 requires-python = ">=3.11,<3.14"
 dependencies = [

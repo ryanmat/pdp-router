@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import logging
 import os
 
@@ -22,7 +23,14 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcess
 log = logging.getLogger(__name__)
 
 DEFAULT_SERVICE_NAME = "pdp-router-proxy"
-SERVICE_VERSION = "0.3.1"
+
+# Version comes from the installed package metadata so OTel resources can never
+# drift from pyproject.toml. Uninstalled source trees (e.g. ad-hoc imports
+# outside a venv) fall back to a sentinel rather than crashing telemetry setup.
+try:
+    SERVICE_VERSION = importlib.metadata.version("pdp-router")
+except importlib.metadata.PackageNotFoundError:
+    SERVICE_VERSION = "0.0.0+uninstalled"
 
 
 def _service_name() -> str:

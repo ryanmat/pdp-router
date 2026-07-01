@@ -12,10 +12,12 @@ from pdp_router._models import (
     GEMINI_FLASH,
     GEMINI_FLASH_LITE,
     GEMINI_PRO,
+    GPT_5_5,
     HAIKU,
     LLAMA_MAVERICK,
     LLAMA_SCOUT,
     OPUS,
+    QWEN_3_7_PLUS,
     SONNET,
 )
 
@@ -30,7 +32,7 @@ class ModelCapability:
     tier: int  # 1=frontier, 2=standard, 3=fast, 4=budget, 5=local
     cost_per_mtok_in: float
     cost_per_mtok_out: float
-    provider: str  # "anthropic" | "gemini" | "vertex" | "ollama"
+    provider: str  # "anthropic" | "gemini" | "vertex" | "ollama" | "deepseek" | "openrouter"
     available: bool
 
 
@@ -139,6 +141,26 @@ DEFAULT_REGISTRY = ModelRegistry(
             cost_per_mtok_in=0.28,
             cost_per_mtok_out=0.42,
             provider="deepseek",
+            available=True,
+        ),
+        # OpenRouter arms -- lineage diversity (OpenAI + Qwen/Alibaba), API-only,
+        # reachable via the panel composer and the cascade explore branch. Credentials
+        # come from OPENROUTER_API_KEY in the proxy env; set available=False to retire
+        # an arm (kill switch).
+        GPT_5_5: ModelCapability(
+            name=GPT_5_5,
+            tier=2,
+            cost_per_mtok_in=5.0,
+            cost_per_mtok_out=30.0,
+            provider="openrouter",
+            available=True,
+        ),
+        QWEN_3_7_PLUS: ModelCapability(
+            name=QWEN_3_7_PLUS,
+            tier=3,
+            cost_per_mtok_in=0.32,
+            cost_per_mtok_out=1.28,
+            provider="openrouter",
             available=True,
         ),
     }

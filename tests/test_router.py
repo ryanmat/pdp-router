@@ -12,8 +12,10 @@ from pdp_router._models import (
     GEMINI_FLASH,
     GEMINI_FLASH_LITE,
     GEMINI_PRO,
+    GPT_5_5,
     HAIKU,
     OPUS,
+    QWEN_3_7_PLUS,
     SONNET,
 )
 from pdp_router._router import (
@@ -61,6 +63,16 @@ class TestModelRegistry:
         cap = DEFAULT_REGISTRY.get(GEMINI_PRO)
         assert cap is not None
         assert cap.available
+
+    def test_openrouter_arms_registered_and_available(self) -> None:
+        """OpenAI + Qwen arms are registered, tagged openrouter, and available
+        (panel + cascade-explore eligible); credentials come from the proxy env."""
+        for name, tier in ((GPT_5_5, 2), (QWEN_3_7_PLUS, 3)):
+            cap = DEFAULT_REGISTRY.get(name)
+            assert cap is not None, f"{name} missing from DEFAULT_REGISTRY"
+            assert cap.provider == "openrouter"
+            assert cap.tier == tier
+            assert cap.available is True
 
     def test_custom_registry(self) -> None:
         custom = ModelRegistry(

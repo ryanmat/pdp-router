@@ -8,6 +8,8 @@ LINEAGE_GOOGLE = "google"
 LINEAGE_META = "meta"
 LINEAGE_DEEPSEEK = "deepseek"
 LINEAGE_OLLAMA = "ollama"
+LINEAGE_OPENAI = "openai"
+LINEAGE_QWEN = "qwen"
 LINEAGE_UNKNOWN = "unknown"
 
 ALL_LINEAGES = (
@@ -16,6 +18,8 @@ ALL_LINEAGES = (
     LINEAGE_META,
     LINEAGE_DEEPSEEK,
     LINEAGE_OLLAMA,
+    LINEAGE_OPENAI,
+    LINEAGE_QWEN,
 )
 
 
@@ -40,6 +44,10 @@ def classify_lineage(model_id: str) -> str:
         return LINEAGE_DEEPSEEK
     if model_id.startswith("ollama"):
         return LINEAGE_OLLAMA
+    if model_id.startswith("openai/"):
+        return LINEAGE_OPENAI
+    if model_id.startswith("qwen"):
+        return LINEAGE_QWEN
     return LINEAGE_UNKNOWN
 
 

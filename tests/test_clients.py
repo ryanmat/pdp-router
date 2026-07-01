@@ -12,7 +12,9 @@ from pdp_router._clients import (
     WEB_SEARCH_TOOL_VERSION,
     AnthropicClient,
     CompletionResult,
+    DeepSeekClient,
     OllamaClient,
+    OpenAICompatibleClient,
     get_client,
 )
 from pdp_router._models import CreditExhaustionError
@@ -259,6 +261,193 @@ class TestOllamaClient:
             client.complete_multi("system", [{"role": "user", "content": "hi"}])
 
 
+class TestOpenAICompatibleClient:
+    """Generalized OpenAI-compatible transport (OpenRouter arms + DeepSeek subclass)."""
+
+    def test_no_api_key_raises_with_label(self) -> None:
+        with pytest.raises(ValueError, match="No OpenRouter credentials"):
+            OpenAICompatibleClient(
+                "openai/gpt-5.5",
+                api_key="",
+                base_url="https://openrouter.ai/api/v1",
+                label="OpenRouter",
+            )
+
+    def test_no_base_url_raises(self) -> None:
+        with pytest.raises(ValueError, match="No base_url"):
+            OpenAICompatibleClient("openai/gpt-5.5", api_key="k", base_url="")
+
+    def test_chat_url_strips_trailing_slash(self) -> None:
+        with patch("httpx.Client"):
+            client = OpenAICompatibleClient(
+                "openai/gpt-5.5", api_key="k", base_url="https://openrouter.ai/api/v1/"
+            )
+            assert client._chat_url == "https://openrouter.ai/api/v1/chat/completions"
+
+    def test_complete_parses_content_and_usage(self) -> None:
+        with patch("httpx.Client") as mock_cls:
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "choices": [{"message": {"content": "hi there"}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 7},
+            }
+            mock_cls.return_value.post.return_value = resp
+            client = OpenAICompatibleClient(
+                "openai/gpt-5.5", api_key="k", base_url="https://openrouter.ai/api/v1"
+            )
+            result = client.complete("system", "user")
+            assert result.text == "hi there"
+            assert result.input_tokens == 12
+            assert result.output_tokens == 7
+            assert result.model == "openai/gpt-5.5"
+            # POSTs to the absolute chat URL, not a relative path.
+            assert (
+                mock_cls.return_value.post.call_args.args[0]
+                == "https://openrouter.ai/api/v1/chat/completions"
+            )
+
+    def test_enable_web_search_accepted_and_not_forwarded(self) -> None:
+        with patch("httpx.Client") as mock_cls:
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "choices": [{"message": {"content": "x"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+            mock_cls.return_value.post.return_value = resp
+            client = OpenAICompatibleClient(
+                "openai/gpt-5.5", api_key="k", base_url="https://openrouter.ai/api/v1"
+            )
+            client.complete("system", "user", enable_web_search=True)
+            sent = mock_cls.return_value.post.call_args.kwargs["json"]
+            assert set(sent) == {"model", "messages", "max_tokens"}
+
+    def test_complete_402_raises_credit_exhaustion(self) -> None:
+        with patch("httpx.Client") as mock_cls:
+            resp = MagicMock()
+            resp.status_code = 402
+            resp.text = "payment required"
+            mock_cls.return_value.post.return_value = resp
+            client = OpenAICompatibleClient(
+                "openai/gpt-5.5",
+                api_key="k",
+                base_url="https://openrouter.ai/api/v1",
+                label="OpenRouter",
+            )
+            with pytest.raises(CreditExhaustionError, match="OpenRouter"):
+                client.complete("system", "user")
+
+    def test_complete_billing_keyword_raises(self) -> None:
+        with patch("httpx.Client") as mock_cls:
+            resp = MagicMock()
+            resp.status_code = 400
+            resp.text = "Insufficient balance to complete request"
+            mock_cls.return_value.post.return_value = resp
+            client = OpenAICompatibleClient(
+                "qwen/qwen3.7-plus",
+                api_key="k",
+                base_url="https://openrouter.ai/api/v1",
+                label="OpenRouter",
+            )
+            with pytest.raises(CreditExhaustionError):
+                client.complete("system", "user")
+
+    def test_deepseek_subclass_uses_deepseek_url(self) -> None:
+        with patch("httpx.Client"):
+            client = DeepSeekClient("deepseek-chat", api_key="k")
+            assert isinstance(client, OpenAICompatibleClient)
+            assert client._chat_url == "https://api.deepseek.com/v1/chat/completions"
+
+    def test_deepseek_no_api_key_raises(self) -> None:
+        with pytest.raises(ValueError, match="No DeepSeek credentials"):
+            DeepSeekClient("deepseek-chat", api_key="")
+
+
+class TestEffortKnob:
+    """Per-call reasoning-effort dial (Thread 3). Anthropic -> output_config.effort;
+    OpenRouter -> reasoning.effort; the DeepSeek subclass and effort=None omit it."""
+
+    def _mock_anthropic_message(self) -> MagicMock:
+        msg = MagicMock()
+        msg.content = [MagicMock(type="text", text="ok")]
+        msg.usage.input_tokens = 10
+        msg.usage.output_tokens = 5
+        msg.usage.server_tool_use.web_search_requests = 0
+        return msg
+
+    def test_anthropic_effort_sets_output_config(self) -> None:
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            create.return_value = self._mock_anthropic_message()
+            client = AnthropicClient("claude-sonnet-4-6", api_key="sk-test")
+            client.complete("sys", "msg", effort="high")
+            assert create.call_args.kwargs["output_config"] == {"effort": "high"}
+
+    def test_anthropic_no_effort_omits_output_config(self) -> None:
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            create.return_value = self._mock_anthropic_message()
+            client = AnthropicClient("claude-sonnet-4-6", api_key="sk-test")
+            client.complete("sys", "msg")
+            assert "output_config" not in create.call_args.kwargs
+
+    def test_anthropic_haiku_self_guards_drops_effort(self) -> None:
+        # Client-layer defense: even if a caller passes effort to a Haiku model
+        # (which rejects output_config.effort), the client must drop it.
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            create.return_value = self._mock_anthropic_message()
+            client = AnthropicClient("claude-haiku-4-5-20251001", api_key="sk-test")
+            client.complete("sys", "msg", effort="high")
+            assert "output_config" not in create.call_args.kwargs
+
+    def test_anthropic_complete_multi_effort(self) -> None:
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            create.return_value = self._mock_anthropic_message()
+            client = AnthropicClient("claude-opus-4-8", api_key="sk-test")
+            client.complete_multi("sys", [{"role": "user", "content": "hi"}], effort="medium")
+            assert create.call_args.kwargs["output_config"] == {"effort": "medium"}
+
+    def _mock_httpx_ok(self, mock_cls: MagicMock) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "x"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        mock_cls.return_value.post.return_value = resp
+
+    def test_openrouter_effort_sets_reasoning(self) -> None:
+        with patch("httpx.Client") as mock_cls:
+            self._mock_httpx_ok(mock_cls)
+            client = OpenAICompatibleClient(
+                "openai/gpt-5.5", api_key="k", base_url="https://openrouter.ai/api/v1"
+            )
+            client.complete("system", "user", effort="high")
+            sent = mock_cls.return_value.post.call_args.kwargs["json"]
+            assert sent["reasoning"] == {"effort": "high"}
+
+    def test_openrouter_no_effort_omits_reasoning(self) -> None:
+        with patch("httpx.Client") as mock_cls:
+            self._mock_httpx_ok(mock_cls)
+            client = OpenAICompatibleClient(
+                "openai/gpt-5.5", api_key="k", base_url="https://openrouter.ai/api/v1"
+            )
+            client.complete("system", "user")
+            sent = mock_cls.return_value.post.call_args.kwargs["json"]
+            assert "reasoning" not in sent
+
+    def test_deepseek_subclass_never_sends_reasoning(self) -> None:
+        with patch("httpx.Client") as mock_cls:
+            self._mock_httpx_ok(mock_cls)
+            client = DeepSeekClient("deepseek-chat", api_key="k")
+            client.complete("system", "user", effort="high")
+            sent = mock_cls.return_value.post.call_args.kwargs["json"]
+            assert "reasoning" not in sent
+
+
 class TestGetClient:
     def test_claude_prefix_returns_anthropic(self) -> None:
         with patch("pdp_router._clients.anthropic"):
@@ -296,6 +485,28 @@ class TestGetClient:
                 location="us-east5",
             )
             assert isinstance(client, GeminiClient)
+
+    def test_openai_prefix_returns_openai_compatible(self) -> None:
+        with patch("httpx.Client"):
+            client = get_client(
+                "openai/gpt-5.5", api_key="k", base_url="https://openrouter.ai/api/v1"
+            )
+            assert isinstance(client, OpenAICompatibleClient)
+            assert client._chat_url == "https://openrouter.ai/api/v1/chat/completions"
+
+    def test_qwen_prefix_returns_openai_compatible_with_default_base(self) -> None:
+        with patch("httpx.Client"):
+            client = get_client("qwen/qwen3.7-plus", api_key="k")
+            assert isinstance(client, OpenAICompatibleClient)
+            # No base_url passed -> defaults to OpenRouter.
+            assert client._chat_url == "https://openrouter.ai/api/v1/chat/completions"
+
+    def test_deepseek_prefix_returns_deepseek_subclass(self) -> None:
+        with patch("httpx.Client"):
+            client = get_client("deepseek-chat", api_key="k")
+            assert isinstance(client, DeepSeekClient)
+            assert isinstance(client, OpenAICompatibleClient)
+            assert client._chat_url == "https://api.deepseek.com/v1/chat/completions"
 
     def test_unknown_prefix_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown model provider"):

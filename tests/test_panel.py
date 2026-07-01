@@ -13,7 +13,9 @@ from pdp_router._lineage import classify_lineage
 from pdp_router._panel import (
     ChairSynthResult,
     PanelMemberResponse,
+    append_panel_transcript_jsonl,
     append_routing_decisions_jsonl,
+    build_chair_prompt,
     compose_panel,
     synthesize_chair,
 )
@@ -39,6 +41,7 @@ def _member(model_id: str, text: str = "answer", error: str | None = None) -> Pa
         latency_ms=50.0,
         error=error,
     )
+
 
 _POOL = [
     "claude-opus-4-7",
@@ -80,9 +83,7 @@ def test_compose_picks_highest_trust_per_lineage():
 
 
 def test_compose_anthropic_only_filter():
-    picked = compose_panel(
-        n=3, lineage_filter="anthropic", candidates=_POOL, trust_weights=_TRUST
-    )
+    picked = compose_panel(n=3, lineage_filter="anthropic", candidates=_POOL, trust_weights=_TRUST)
     assert all(m.startswith("claude-") for m in picked)
     assert len(picked) == 3
 
@@ -130,6 +131,30 @@ def test_compose_no_trust_data_still_picks():
 def test_compose_unknown_lineage_filter_raises():
     with pytest.raises(ValueError):
         compose_panel(n=3, lineage_filter="weird", candidates=_POOL)
+
+
+def test_classify_lineage_openai_and_qwen():
+    assert classify_lineage("openai/gpt-5.5") == "openai"
+    assert classify_lineage("openai/gpt-5.5-20260423") == "openai"
+    assert classify_lineage("qwen/qwen3.7-plus") == "qwen"
+
+
+def test_compose_includes_openai_and_qwen_lineages():
+    """The OpenRouter arms compose as distinct lineages, not collapsed to unknown."""
+    pool = [
+        "claude-opus-4-7",
+        "gemini-2.5-pro",
+        "openai/gpt-5.5",
+        "qwen/qwen3.7-plus",
+    ]
+    picked = compose_panel(n=4, candidates=pool, trust_weights={})
+    assert set(picked) == set(pool)
+    assert {classify_lineage(m) for m in picked} == {
+        "anthropic",
+        "google",
+        "openai",
+        "qwen",
+    }
 
 
 def test_synthesize_chair_anonymizes_panelist_labels():
@@ -266,9 +291,7 @@ def test_jsonl_writer_creates_dir(tmp_path):
     """Inbox dir is auto-created if missing."""
     inbox = tmp_path / "deep" / "nested" / "inbox"
     assert not inbox.exists()
-    append_routing_decisions_jsonl(
-        inbox_dir=inbox, rows=[{"alert_id": "a", "model_selected": "x"}]
-    )
+    append_routing_decisions_jsonl(inbox_dir=inbox, rows=[{"alert_id": "a", "model_selected": "x"}])
     assert inbox.exists()
     assert len(list(inbox.glob("proxy-*.jsonl"))) == 1
 
@@ -289,3 +312,187 @@ def test_jsonl_writer_no_rows_is_noop(tmp_path):
     inbox = tmp_path / "inbox"
     append_routing_decisions_jsonl(inbox_dir=inbox, rows=[])
     assert not inbox.exists()
+
+
+# -- append_panel_transcript_jsonl (the chat-quality eval capture sidecar) --
+# Reuses the module-level _member helper (signature: model_id, text, error).
+
+
+def _write_transcript(out, **overrides):
+    """append_panel_transcript_jsonl with sensible defaults; override per test."""
+    kwargs = {
+        "transcript_dir": out,
+        "chat_request_id": "r",
+        "surface": "nonstream",
+        "prompt": "p",
+        "messages": [{"role": "user", "content": "p"}],
+        "system": "",
+        "members": [_member("claude-opus-4-7", text="a")],
+        "synthesis_text": "s",
+        "synthesis_status": "complete",
+        "chair_model": "claude-sonnet-4-6",
+        "panel_score": 7,
+        "score": 3,
+    }
+    kwargs.update(overrides)
+    append_panel_transcript_jsonl(**kwargs)
+
+
+def test_panel_transcript_round_trip(tmp_path):
+    out = tmp_path / "transcripts"
+    members = [
+        _member("claude-opus-4-7", text="opus answer"),
+        _member("gemini-2.5-pro", text="gemini answer"),
+    ]
+    # Multi-turn: the full conversation the members saw, plus the last-turn convenience key.
+    convo = [
+        {"role": "user", "content": "earlier turn"},
+        {"role": "assistant", "content": "earlier reply"},
+        {"role": "user", "content": "compare X vs Y"},
+    ]
+    _write_transcript(
+        out,
+        chat_request_id="req-1",
+        prompt="compare X vs Y",
+        messages=convo,
+        system="be terse",
+        members=members,
+        synthesis_text="the synthesized answer",
+        synthesis_status="complete",
+        panel_score=8,
+        score=4,
+    )
+
+    files = list(out.glob("panel-*.jsonl"))
+    assert len(files) == 1
+    lines = files[0].read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, "one panel turn == one JSON object, members nested"
+    rec = json.loads(lines[0])
+    assert rec["chat_request_id"] == "req-1"
+    assert rec["surface"] == "nonstream"
+    assert rec["panel_score"] == 8
+    assert rec["score"] == 4
+    assert rec["chair_model"] == "claude-sonnet-4-6"
+    assert rec["prompt"] == "compare X vs Y"
+    assert rec["messages"] == convo, "full multi-turn history is what the members saw"
+    assert rec["system"] == "be terse"
+    assert rec["synthesis_text"] == "the synthesized answer"
+    assert rec["synthesis_status"] == "complete"
+    assert [m["model_id"] for m in rec["members"]] == ["claude-opus-4-7", "gemini-2.5-pro"]
+    assert [m["text"] for m in rec["members"]] == ["opus answer", "gemini answer"]
+    assert rec["members"][0]["lineage"] == "anthropic"
+    assert rec["members"][0]["output_tokens"] == 20
+    assert "ts" in rec
+
+
+def test_panel_transcript_empty_synthesis_records_chair_failure(tmp_path):
+    """An empty synthesis_text + chair_empty status is recorded as-is, not dropped."""
+    out = tmp_path / "transcripts"
+    _write_transcript(
+        out,
+        members=[_member("claude-opus-4-7", text="only answer")],
+        synthesis_text="",
+        synthesis_status="chair_empty",
+    )
+    rec = json.loads(next(out.glob("panel-*.jsonl")).read_text().splitlines()[0])
+    assert rec["synthesis_text"] == ""
+    assert rec["synthesis_status"] == "chair_empty"
+    assert len(rec["members"]) == 1
+
+
+def test_panel_transcript_creates_dir(tmp_path):
+    out = tmp_path / "deep" / "nested" / "transcripts"
+    assert not out.exists()
+    _write_transcript(out)
+    assert out.exists()
+    assert len(list(out.glob("panel-*.jsonl"))) == 1
+
+
+def test_panel_transcript_empty_members_noop(tmp_path):
+    """No survivors -> nothing gradeable -> no file."""
+    out = tmp_path / "transcripts"
+    _write_transcript(out, members=[])
+    assert not out.exists()
+
+
+def test_panel_transcript_swallows_oserror_on_mkdir(tmp_path):
+    """OSError on mkdir is logged and swallowed; never raises into the request."""
+    out = tmp_path / "transcripts"
+    with patch("pathlib.Path.mkdir", side_effect=OSError("permission denied")):
+        _write_transcript(out)
+    assert not out.exists() or not list(out.glob("panel-*.jsonl"))
+
+
+def test_panel_transcript_swallows_oserror_on_write(tmp_path):
+    """OSError on the open/write branch (mkdir succeeds first) is also swallowed."""
+    out = tmp_path / "transcripts"
+    with patch("pathlib.Path.open", side_effect=OSError("disk full")):
+        _write_transcript(out)
+    # mkdir may have created the dir, but no file was written and nothing raised.
+    assert not list(out.glob("panel-*.jsonl"))
+
+
+def test_panel_transcript_swallows_non_serializable(tmp_path):
+    """A non-JSON-serializable field raises TypeError inside the try; the broadened
+    except must swallow it so the fire-and-forget contract holds in the stream finally."""
+    out = tmp_path / "transcripts"
+    # object() is not JSON-serializable -> json.dumps raises TypeError, not OSError.
+    _write_transcript(out, messages=[{"role": "user", "content": object()}])
+    assert not list(out.glob("panel-*.jsonl"))
+
+
+# -- build_chair_prompt (extracted helper shared by blocking + streaming chair) --
+
+
+def test_build_chair_prompt_anonymizes_and_composes():
+    survivors = [_member("claude-opus-4-7", "alpha"), _member("gemini-2.5-pro", "beta")]
+    chair_system, chair_user = build_chair_prompt(
+        user_prompt="Which is better?", system="Be terse.", survivors=survivors
+    )
+    # Anonymized A/B labels carry the survivor text in order.
+    assert "PANELIST A:\nalpha" in chair_user
+    assert "PANELIST B:\nbeta" in chair_user
+    assert "USER PROMPT:\nWhich is better?" in chair_user
+    # Model ids never leak to the chair (brand / positional bias mitigation).
+    assert "claude-opus-4-7" not in chair_user
+    assert "gemini-2.5-pro" not in chair_user
+    # System composition: caller system first, then the chair instruction with N=2.
+    assert chair_system.startswith("Be terse.")
+    assert "chair of a panel of 2" in chair_system
+
+
+def test_build_chair_prompt_no_caller_system():
+    chair_system, _ = build_chair_prompt(
+        user_prompt="Q", system="", survivors=[_member("deepseek-chat", "x")]
+    )
+    # With no caller system, only the chair instruction is present (no leading blank join).
+    assert chair_system.startswith("You are the chair")
+
+
+def test_synthesize_chair_uses_build_chair_prompt():
+    """Behavioral parity: synthesize_chair builds the same anonymized prompt and
+    passes it to complete_fn."""
+    captured: dict = {}
+
+    def _complete_fn(system, user, max_tokens):
+        captured["system"] = system
+        captured["user"] = user
+        return _FakeCompletion(text="synth", input_tokens=3, output_tokens=4)
+
+    result = synthesize_chair(
+        user_prompt="Compare",
+        system="Sys.",
+        panel_responses=[_member("claude-opus-4-7", "a"), _member("deepseek-chat", "b")],
+        chair_model_id="claude-sonnet-4-6",
+        complete_fn=_complete_fn,
+        max_tokens=128,
+    )
+    assert result.text == "synth"
+    assert result.error is None
+    expected_system, expected_user = build_chair_prompt(
+        user_prompt="Compare",
+        system="Sys.",
+        survivors=[_member("claude-opus-4-7", "a"), _member("deepseek-chat", "b")],
+    )
+    assert captured["system"] == expected_system
+    assert captured["user"] == expected_user
