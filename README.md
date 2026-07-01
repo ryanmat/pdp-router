@@ -139,7 +139,8 @@ the faithful surface fans out to several lineage-diverse models and streams the
 **chair synthesis** of their answers back through that same OpenAI shape. The
 client asked what it thinks is one model a hard question, and transparently got
 a multi-model panel. Keep-alive comments bridge the quiet while the panel runs,
-so the stream never looks dead.
+so the stream never looks dead. (The panel is opt-in; enable it with
+`PROXY_AUTOPANEL_ENABLED=1`.)
 
 > [!IMPORTANT]
 > Whether the synthesis actually beats the single best member is an open
@@ -173,6 +174,12 @@ Strict agent clients should use the faithful surface at
 Works out of the box with just API keys: with no trust DB present, the
 confidence cascade routes on defaults. The learned layer activates when you
 bring outcomes (next section).
+
+The panel, streaming, effort routing, and web search are opt-in. Turn them on
+with environment variables (see `.env.example`); for example
+`PROXY_AUTOPANEL_ENABLED=1` convenes the panel on hard queries. Defaults are
+conservative: a fresh clone runs the single-model cascade until you enable the
+extras.
 
 ## Bring your own outcomes
 
