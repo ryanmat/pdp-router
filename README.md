@@ -39,43 +39,25 @@ the routing-and-feedback architecture is the durable part.
 - **Observability built in.** Optional OpenTelemetry traces, metrics, and GenAI
   instrumentation.
 
-## What this is (and is not)
+## Where it fits
 
-This is a reference implementation you can actually run, published in full. It
-is honest about what it is: a personal system, not a company product, so there
-is no support SLA, no roadmap promises, and the repo is a one-way mirror from a
-private upstream (see CONTRIBUTING).
-
-Where it fits: LiteLLM and OpenRouter are excellent gateways for reaching many
+LiteLLM and OpenRouter are excellent gateways for reaching many
 models behind one API. pdp-router is a smaller, more opinionated thing: a
 learned router with a real feedback loop wrapped around that idea. If you want a
 gateway, use those. If you want a router that measures its own decisions and
 improves from them, clone this and bring your outcomes.
 
-## Honest results
-
-Most router READMEs claim the learned router wins. Here is real data saying it
-is not that simple.
+## Current results
 
 At a 100% bandit-routing flip on one production domain, the bandit's outcome
-rate was **0.800 vs the static confidence cascade's 0.893** (n=80 graded
+rate was 0.800 vs the static confidence cascade's 0.893 (n=80 graded
 decisions, Fisher exact p=0.017), monotonically worsening in 20-row windows.
 The flip was reverted to a 10% canary the same day, under a tripwire
 pre-committed before the flip.
 
-> [!IMPORTANT]
-> The diagnosis is the most useful thing in this repo: the reward signal (did
-> the alert clear?) was **blind to output quality**. A model emitting garbage
-> text was not penalized as long as the alert resolved. A learned router can
-> only beat a good heuristic when its reward measures what you actually care
-> about. The fix upstream is a rubric-based judge ensemble as a second outcome
-> source, soaking before it earns bandit weight.
+The reward signal (did the alert clear?) was blind to output quality. A model emitting garbage text was not penalized as long as the alert resolved. The fix upstream is a rubric-based judge ensemble as a second outcome source, soaking before it earns bandit weight. 
 
-Takeaways if you build on this:
-
-1. The router is the easy part. **Outcome plumbing is the product.**
-2. Pre-commit your revert tripwires before you flip traffic.
-3. Audit your reward signal for blindness before trusting any win.
+Takeaway: A learned router can only beat a good heuristic when its reward measures what the user actually cares about. 
 
 ## Architecture
 
@@ -110,40 +92,6 @@ AI), DeepSeek, and OpenAI and Qwen via OpenRouter. Eleven models in total. The
 deliberate point is **cognitive diversity**: different training lineages fail
 differently, and the panel selects across lineages rather than stacking
 near-clones.
-
-## Two surfaces, one of them for strict agent clients
-
-There are two OpenAI-compatible endpoints, and the difference is a small lesson
-in how picky real agent clients are.
-
-`/v1/chat/completions` is the default. It leads each stream with a small
-non-standard event naming the model the router picked, which is handy when you
-control the client and want the routing decision inline.
-
-`/openai/v1/chat/completions` is byte-faithful to OpenAI's streaming shape: a
-leading assistant-role delta, then content, then a terminal
-`finish_reason: "stop"` and `[DONE]`. Nothing proprietary on the wire.
-
-Why two? Point a strict agent client at the default surface and it rejects the
-leading event and the missing terminal `finish_reason` as an unexpected end of
-stream. [Crush](https://github.com/charmbracelet/crush) does exactly that. So
-the faithful surface exists to speak the dialect those clients expect, and they
-talk to it without ever knowing a router is on the other end.
-
-The payoff is the panel. When the classifier scores a query as decomposable,
-the faithful surface fans out to several lineage-diverse models and streams the
-**chair synthesis** of their answers back through that same OpenAI shape. The
-client asked what it thinks is one model a hard question, and transparently got
-a multi-model panel. Keep-alive comments bridge the quiet while the panel runs,
-so the stream never looks dead. (The panel is opt-in; enable it with
-`PROXY_AUTOPANEL_ENABLED=1`.)
-
-> [!IMPORTANT]
-> Whether the synthesis actually beats the single best member is an open
-> question here, not a settled win. It is measured the same honest way the
-> bandit was: capture real turns, grade them, let the data decide. The
-> architecture makes the panel cheap to route. It does not make the panel
-> automatically right.
 
 ## Quickstart
 
@@ -198,15 +146,6 @@ carrying the selected model, confidence, context bucket, and a request UUID that
 also rides the `X-PDP-Prediction-Id` response header. Drain those rows into your
 store, grade them against whatever outcome you care about, recompute posteriors,
 write them back. That loop, not this code, is where the value lives.
-
-## What is deliberately not here
-
-pdp-router was extracted from a larger private system that runs it in
-production. That system's outcome store, judge ensemble and rubrics, drift
-watchdog, and earned trust weights are not included here: they are specific to
-their domain, and they are exactly the substance you would replace with your
-own. What is here is the full routing-and-feedback machinery and the schema
-contract you plug outcomes into.
 
 ## Further reading
 
