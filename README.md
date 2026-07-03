@@ -17,10 +17,6 @@ decision, and lets recorded outcomes reshape the trust weights and Thompson
 Sampling posteriors behind future decisions. Point an OpenAI-compatible client
 at it, and it picks the model, or convenes a panel of models, for you.
 
-It runs in production for its author, routing chat and agent traffic across
-eleven models from six training lineages. The premise: models come and go, but
-the routing-and-feedback architecture is the durable part.
-
 ## Features
 
 - **Outcome-fed.** Every routing decision is logged, and real outcomes flow back
