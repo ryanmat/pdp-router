@@ -4,9 +4,6 @@
 
 **An outcome-fed router for heterogeneous AI models.**
 
-Many diverse models, one answer, trust earned from recorded outcomes rather
-than configured by hand.
-
 [![ci](https://github.com/ryanmat/pdp-router/actions/workflows/ci.yml/badge.svg)](https://github.com/ryanmat/pdp-router/actions/workflows/ci.yml)
 [![python](https://img.shields.io/badge/python-3.11_%7C_3.12_%7C_3.13-3776AB?logo=python&logoColor=white)](https://github.com/ryanmat/pdp-router/blob/main/pyproject.toml)
 [![license](https://img.shields.io/github/license/ryanmat/pdp-router)](https://github.com/ryanmat/pdp-router/blob/main/LICENSE)
@@ -15,8 +12,7 @@ than configured by hand.
 </div>
 
 pdp-router routes a single request across many AI models and learns, from real
-outcomes, which model to trust for a given job. Rather than hardcoding "use this
-model for that task," it starts from a confidence cascade, logs every routing
+outcomes, which model to trust for a given job. It starts from a confidence cascade, logs every routing
 decision, and lets recorded outcomes reshape the trust weights and Thompson
 Sampling posteriors behind future decisions. Point an OpenAI-compatible client
 at it, and it picks the model, or convenes a panel of models, for you.
