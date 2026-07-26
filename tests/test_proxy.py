@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from unittest.mock import MagicMock, patch
 
@@ -57,6 +58,116 @@ class TestHealthEndpoint:
         data = resp.json()
         assert data["status"] == "ok"
         assert data["models"] > 0
+
+    def test_reports_configured_providers(self, client) -> None:
+        """`models: 11` is a static registry count and says nothing about reachability.
+
+        A first-run user needs to see whether their key actually landed, without
+        having to send a billable request to find out.
+        """
+        data = client.get("/health").json()
+        assert data["providers"]["anthropic"] is True
+        assert data["providers"]["gemini"] is True
+        assert data["providers"]["openrouter"] is False
+        assert data["providers"]["vertex"] is False
+
+    def test_reports_missing_credentials(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), TestClient(app) as c:
+            data = c.get("/health").json()
+        assert data["providers"]["anthropic"] is False
+        assert data["providers"]["gemini"] is False
+
+    def test_reports_absent_trust_db(self, client) -> None:
+        data = client.get("/health").json()
+        assert data["trust_db"]["present"] is False
+
+    def test_reports_present_trust_db(self, tmp_path) -> None:
+        import sqlite3
+
+        db = tmp_path / "trust.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("CREATE TABLE model_trust (model_id TEXT, weight REAL);")
+        conn.close()
+        with (
+            patch.dict(os.environ, {"PROXY_TRUST_DB": str(db)}),
+            TestClient(app) as c,
+        ):
+            data = c.get("/health").json()
+        assert data["trust_db"]["present"] is True
+        assert data["trust_db"]["readable"] is True
+
+    def test_reports_unreadable_trust_db(self, tmp_path) -> None:
+        """A file that exists but is not a database must not read as healthy."""
+        db = tmp_path / "trust.db"
+        db.write_text("this is not sqlite")
+        with (
+            patch.dict(os.environ, {"PROXY_TRUST_DB": str(db)}),
+            TestClient(app) as c,
+        ):
+            data = c.get("/health").json()
+        assert data["trust_db"]["present"] is True
+        assert data["trust_db"]["readable"] is False
+
+    def test_reports_routing_mode(self, client) -> None:
+        assert client.get("/health").json()["routing_mode"] == "cascade"
+
+
+class TestErrorResponseShape:
+    """Errors must be OpenAI-compatible and valid JSON.
+
+    FastAPI wraps HTTPException detail under `detail`, and the previous code
+    passed str(model_dump()), producing a Python repr with single quotes nested
+    inside a JSON string. An OpenAI SDK client cannot parse that. The streaming
+    surface already emits {"error": {...}} frames, so this aligns the two.
+    """
+
+    def test_unknown_model_is_openai_shaped(self, client) -> None:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "no-such-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "detail" not in body
+        assert isinstance(body["error"]["message"], str)
+        assert "no-such-model" in body["error"]["message"]
+        assert isinstance(body["error"]["type"], str)
+
+    def test_client_creation_failure_is_openai_shaped(self, client) -> None:
+        with patch.object(_proxy, "get_client", side_effect=RuntimeError("no credentials")):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"model": OPUS, "messages": [{"role": "user", "content": "hi"}]},
+            )
+        assert resp.status_code == 503
+        body = resp.json()
+        assert "detail" not in body
+        assert "no credentials" in body["error"]["message"]
+        assert body["error"]["type"] == "server_error"
+
+    def test_credit_exhaustion_is_openai_shaped(self, client) -> None:
+        mock = MagicMock()
+        mock.complete_multi.side_effect = CreditExhaustionError("out of credits")
+        mock.complete.side_effect = CreditExhaustionError("out of credits")
+        with patch.object(_proxy, "get_client", return_value=mock):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"model": OPUS, "messages": [{"role": "user", "content": "hi"}]},
+            )
+        assert resp.status_code == 402
+        body = resp.json()
+        assert "detail" not in body
+        assert body["error"]["type"] == "billing_error"
+        assert "out of credits" in body["error"]["message"]
+
+    def test_error_body_has_no_python_repr(self, client) -> None:
+        """Regression guard: the old shape embedded "{'error': {'message': ...}}"."""
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "no-such-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert "'" not in resp.text or '"error"' in resp.text
+        assert not resp.text.startswith('{"detail"')
 
 
 class TestModelsEndpoint:
@@ -274,7 +385,7 @@ class TestClassifyRequest:
         mock_client.complete.return_value = _mock_completion(text="3")
         mock_get_client.return_value = mock_client
 
-        config = ProxyConfig()
+        config = ProxyConfig(gemini_api_key="gk-test")
         from pdp_router._proxy import ChatMessage
 
         messages = [ChatMessage(role="user", content="Explain recursion")]
@@ -287,7 +398,7 @@ class TestClassifyRequest:
     def test_classifier_failure_falls_back_to_3(self, mock_get_client) -> None:
         mock_get_client.side_effect = Exception("API down")
 
-        config = ProxyConfig()
+        config = ProxyConfig(gemini_api_key="gk-test")
         from pdp_router._proxy import ChatMessage
 
         messages = [ChatMessage(role="user", content="test")]
@@ -302,7 +413,7 @@ class TestClassifyRequest:
         mock_client.complete.return_value = _mock_completion(text="moderate")
         mock_get_client.return_value = mock_client
 
-        config = ProxyConfig(classify_fallback_model="")
+        config = ProxyConfig(classify_fallback_model="", gemini_api_key="gk-test")
         from pdp_router._proxy import ChatMessage
 
         messages = [ChatMessage(role="user", content="test")]
@@ -320,7 +431,7 @@ class TestClassifyRequest:
         ]
         mock_get_client.return_value = mock_client
 
-        config = ProxyConfig()
+        config = ProxyConfig(gemini_api_key="gk-test")
         messages = [ChatMessage(role="user", content="compare A vs B")]
         with patch.dict(os.environ, {"PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"}):
             confidence, score, panel_score = _classify_request(messages, config)
@@ -336,7 +447,7 @@ class TestClassifyRequest:
         mock_client.complete.side_effect = RuntimeError("503 UNAVAILABLE")
         mock_get_client.return_value = mock_client
 
-        config = ProxyConfig(classify_fallback_model="")
+        config = ProxyConfig(classify_fallback_model="", gemini_api_key="gk-test")
         messages = [ChatMessage(role="user", content="test")]
         with patch.dict(
             os.environ,
@@ -354,7 +465,7 @@ class TestClassifyRequest:
         mock_client.complete.side_effect = ValueError("invalid api key")
         mock_get_client.return_value = mock_client
 
-        config = ProxyConfig(classify_fallback_model="")
+        config = ProxyConfig(classify_fallback_model="", gemini_api_key="gk-test")
         messages = [ChatMessage(role="user", content="test")]
         with patch.dict(
             os.environ,
@@ -369,6 +480,62 @@ class TestClassifyRequest:
 class TestClassifyFallback:
     """Cross-lineage fallback classifier: rescues the (3, 0) collapse that
     silently disables the auto-panel when the primary classifier is down."""
+
+    def test_missing_primary_credentials_skips_the_doomed_attempt(self, caplog) -> None:
+        """A single-provider user must not see a traceback on the happy path.
+
+        The default classifier is gemini-2.5-flash-lite, so an Anthropic-only
+        user had every request construct a Gemini client that could only raise,
+        logging a full ValueError traceback before recovering. The README says
+        one key is enough; the logs said otherwise.
+        """
+        fallback = MagicMock()
+        fallback.complete.return_value = _mock_completion(text="4 8")
+        config = ProxyConfig(anthropic_api_key="sk-test", gemini_api_key="")
+        messages = [ChatMessage(role="user", content="compare A vs B")]
+
+        with (
+            patch("pdp_router._proxy.get_client", return_value=fallback) as mock_get_client,
+            caplog.at_level(logging.DEBUG, logger="pdp_router._proxy"),
+        ):
+            _confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (4, 8)
+        # The uncredentialed primary is never constructed at all.
+        assert mock_get_client.call_count == 1
+        assert mock_get_client.call_args.args[0] == config.classify_fallback_model
+        assert "Traceback" not in caplog.text
+        assert not [r for r in caplog.records if r.exc_info]
+
+    def test_genuine_primary_failure_still_logs_the_traceback(self, caplog) -> None:
+        """Diagnostics are preserved: a credentialed classifier that breaks is loud."""
+        primary = MagicMock()
+        primary.complete.side_effect = RuntimeError("503 UNAVAILABLE")
+        fallback = MagicMock()
+        fallback.complete.return_value = _mock_completion(text="2 0")
+        config = ProxyConfig(anthropic_api_key="sk-test", gemini_api_key="gk-test")
+        messages = [ChatMessage(role="user", content="test")]
+
+        with (
+            patch("pdp_router._proxy.get_client", side_effect=[primary, fallback]),
+            patch.dict(
+                os.environ,
+                {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
+            ),
+            caplog.at_level(logging.WARNING, logger="pdp_router._proxy"),
+        ):
+            _classify_request(messages, config)
+
+        assert [r for r in caplog.records if r.exc_info], "real failures must keep exc_info"
+
+    def test_no_credentials_at_all_collapses_quietly(self) -> None:
+        """Neither model is reachable: collapse to (3, 0) without constructing clients."""
+        config = ProxyConfig(anthropic_api_key="", gemini_api_key="")
+        messages = [ChatMessage(role="user", content="test")]
+        with patch("pdp_router._proxy.get_client") as mock_get_client:
+            _confidence, score, panel_score = _classify_request(messages, config)
+        assert (score, panel_score) == (3, 0)
+        mock_get_client.assert_not_called()
 
     def _config(self, **overrides) -> ProxyConfig:
         kwargs = {

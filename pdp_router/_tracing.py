@@ -37,6 +37,21 @@ def _service_name() -> str:
     """Service name for all OTel providers; per-deployment via OTEL_SERVICE_NAME."""
     return os.environ.get("OTEL_SERVICE_NAME", DEFAULT_SERVICE_NAME)
 
+
+def _capture_content() -> bool:
+    """True when GenAI instrumentation may record prompt and completion text.
+
+    Off unless OTEL_CAPTURE_CONTENT opts in. Capturing content ships the text of
+    every request and response to whatever OTLP backend is configured, so it is
+    a deliberate choice rather than a side effect of enabling tracing.
+    """
+    return os.environ.get("OTEL_CAPTURE_CONTENT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
 _tracer: trace.Tracer | None = None
 _logger_provider: LoggerProvider | None = None
 
@@ -99,8 +114,14 @@ def init_tracing() -> trace.Tracer:
     trace.set_tracer_provider(provider)
     _tracer = trace.get_tracer(_service_name(), SERVICE_VERSION)
 
-    _init_openlit()
-    _init_traceloop()
+    # GenAI auto-instrumentation only when there is somewhere to send it. With no
+    # endpoint there is no configured LoggerProvider, so openlit's GenAI log
+    # records fall back to the console and print the full prompt and completion
+    # text of every request to stdout. Gated after set_tracer_provider because
+    # openlit auto-detects the provider it attaches to.
+    if enabled and endpoint:
+        _init_openlit()
+        _init_traceloop()
 
     return _tracer
 
@@ -163,7 +184,8 @@ def _init_openlit() -> None:
     Generates OTel traces and metrics for Anthropic + Gemini SDK calls (token
     usage, latency, cost). openlit auto-detects the existing TracerProvider
     and MeterProvider so all telemetry flows through the configured OTLP
-    exporters.
+    exporters. Prompt and completion text is recorded only when
+    OTEL_CAPTURE_CONTENT opts in (see _capture_content).
     """
     try:
         import openlit
@@ -172,7 +194,7 @@ def _init_openlit() -> None:
             environment=os.environ.get("OTEL_ENVIRONMENT", "lab"),
             application_name=_service_name(),
             collect_gpu_stats=False,
-            capture_message_content=True,
+            capture_message_content=_capture_content(),
             disable_metrics=False,
         )
         log.info("OpenLIT GenAI instrumentation initialized")

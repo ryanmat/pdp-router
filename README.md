@@ -33,7 +33,8 @@ at it, and it picks the model, or convenes a panel of models, for you.
 - **Bring your own outcomes.** Point it at a SQLite trust DB your grading
   process populates. With no DB, it routes on the static cascade.
 - **Observability built in.** Optional OpenTelemetry traces, metrics, and GenAI
-  instrumentation.
+  instrumentation. Point `OTEL_EXPORTER_OTLP_ENDPOINT` at any OTLP collector,
+  including LangSmith, with no extra dependency.
 
 ## Where it fits
 
@@ -93,9 +94,9 @@ near-clones.
 
 ```bash
 git clone https://github.com/ryanmat/pdp-router && cd pdp-router
-cp .env.example .env          # add your own API keys
+cp .env.example .env          # add one provider key
 uv sync --all-extras
-uv run uvicorn pdp_router._proxy:app --host 127.0.0.1 --port 7741
+uv run pdp-router-proxy
 ```
 
 Then point any OpenAI-compatible client at it:
@@ -107,13 +108,26 @@ curl -s http://127.0.0.1:7741/v1/chat/completions \
 ```
 
 `model: pdp-auto` engages routing; a concrete model ID pins that model.
-`GET /v1/models` lists the roster, `GET /health` shows what it looks like.
-Strict agent clients should use the faithful surface at
-`/openai/v1/chat/completions`.
+`GET /v1/models` lists the roster. `GET /health` reports which provider
+credentials actually landed and whether a trust DB was found, so you can
+confirm your setup without spending a request. Strict agent clients should use
+the faithful surface at `/openai/v1/chat/completions`.
 
-Works out of the box with just API keys: with no trust DB present, the
-confidence cascade routes on defaults. The learned layer activates when you
-bring outcomes (next section).
+**One provider key is enough.** With only `ANTHROPIC_API_KEY` set, the Gemini
+complexity classifier falls back cross-lineage to Haiku and routing works
+normally; the arms you have no credentials for are simply never selected. With
+no trust DB present, the confidence cascade routes on defaults. The learned
+layer activates when you bring outcomes (next section).
+
+`uv run pdp-router-proxy` is the launch path that reads `.env`. If you invoke
+uvicorn directly, either export the variables yourself or use
+`uv run --env-file .env uvicorn pdp_router._proxy:app`. Real environment
+variables always take precedence over the file.
+
+> **No authentication.** The proxy binds `127.0.0.1` and has no auth, no rate
+> limiting, and no quota. Anything that can reach the port can spend your
+> provider credits. Put your own auth in front of it before exposing it
+> anywhere, and treat `PROXY_HOST=0.0.0.0` as a deliberate decision.
 
 The panel, streaming, effort routing, and web search are opt-in. Turn them on
 with environment variables (see `.env.example`); for example
@@ -142,6 +156,22 @@ carrying the selected model, confidence, context bucket, and a request UUID that
 also rides the `X-PDP-Prediction-Id` response header. Drain those rows into your
 store, grade them against whatever outcome you care about, recompute posteriors,
 write them back. That loop, not this code, is where the value lives.
+
+## Tracing
+
+Nothing is exported and no GenAI instrumentation is loaded until you set an OTLP
+endpoint. Any OTLP-compatible backend works. LangSmith needs no SDK and no extra
+dependency, just two variables:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://api.smith.langchain.com/otel
+OTEL_EXPORTER_OTLP_HEADERS=x-api-key=<your-key>,Langsmith-Project=pdp-router
+```
+
+Traces carry the routing decision, token usage, latency, and cost per arm.
+Prompt and completion **text** is not recorded unless you set
+`OTEL_CAPTURE_CONTENT=1`, because turning that on ships the content of every
+request and response to your backend.
 
 ## Further reading
 

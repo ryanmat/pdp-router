@@ -3,7 +3,7 @@
 
 [project]
 name = "pdp-router"
-version = "0.3.3"
+version = "0.4.0"
 description = "Outcome-fed routing across heterogeneous AI models: confidence cascade, Thompson Sampling bandit, multi-model panel"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -42,7 +42,13 @@ Issues = "https://github.com/ryanmat/pdp-router/issues"
 
 [project.optional-dependencies]
 gemini = ["google-genai>=1.0.0"]
-proxy = ["fastapi>=0.115.0", "uvicorn[standard]>=0.34.0"]
+# python-dotenv is declared rather than leaned on: uvicorn[standard] happens to
+# pull it in today, and the .env loading in the entry point must not depend on
+# that. This repo ships no uv.lock, so CI resolves fresh per matrix Python.
+proxy = ["fastapi>=0.115.0", "uvicorn[standard]>=0.34.0", "python-dotenv>=1.0.0"]
+
+[project.scripts]
+pdp-router-proxy = "pdp_router.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

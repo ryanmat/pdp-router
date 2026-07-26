@@ -14,8 +14,8 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from pdp_router._clients import CompletionResult, get_client
@@ -409,6 +409,15 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
 
     score, panel_score = 3, 0
     try:
+        # Preflight the credentials rather than learning it from an exception on
+        # every request. The default classifier is gemini-2.5-flash-lite, so a
+        # single-provider (Anthropic-only) user would otherwise construct a
+        # doomed Gemini client per request and log a ValueError traceback before
+        # recovering via the cross-lineage fallback: correct routing that reads
+        # as a crash. A genuine failure on a credentialed model still raises and
+        # is still logged with its traceback below.
+        if not _has_credentials_for(config.classify_model, config):
+            raise _MissingClassifierCredentialsError(config.classify_model)
         client = get_client(
             config.classify_model, **_client_kwargs(config.classify_model, config)
         )
@@ -438,15 +447,22 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
                         time.sleep(backoff * (attempt + 1))
                     continue
                 raise
-    except Exception:
+    except Exception as primary_error:
         fallback = config.classify_fallback_model
         fb_kwargs = _client_kwargs(fallback, config) if fallback else {}
         if fallback and fallback != config.classify_model and fb_kwargs.get("api_key"):
-            log.warning(
-                "Classifier %s failed; trying cross-lineage fallback %s",
+            # Absent credentials are a configuration fact, not a fault. The
+            # substitution is announced once at startup (see _lifespan), so per
+            # request it is INFO and carries no traceback. A real failure on a
+            # credentialed model stays a WARNING with its traceback.
+            uncredentialed = isinstance(primary_error, _MissingClassifierCredentialsError)
+            log.log(
+                logging.INFO if uncredentialed else logging.WARNING,
+                "Classifier %s unavailable (%s); using cross-lineage fallback %s",
                 config.classify_model,
+                "no credentials configured" if uncredentialed else "failed",
                 fallback,
-                exc_info=True,
+                exc_info=not uncredentialed,
             )
             try:
                 fb_client = get_client(fallback, **fb_kwargs)
@@ -613,6 +629,25 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
     if not _config.anthropic_api_key and not _config.gemini_api_key:
         log.warning("No API keys configured. Set ANTHROPIC_API_KEY or GEMINI_API_KEY.")
 
+    # Announce a classifier substitution once here rather than on every request.
+    # One provider key is a supported setup, so the per-request path stays quiet.
+    if not _has_credentials_for(_config.classify_model, _config):
+        fallback = _config.classify_fallback_model
+        if fallback and _has_credentials_for(fallback, _config):
+            log.warning(
+                "Classifier %s has no credentials; every request will use the "
+                "cross-lineage fallback %s. Set PROXY_CLASSIFY_MODEL to a model you "
+                "have credentials for to remove the extra hop.",
+                _config.classify_model,
+                fallback,
+            )
+        else:
+            log.warning(
+                "Classifier %s has no credentials and no usable fallback; requests "
+                "will route at the default complexity (3, 0) with the auto-panel off.",
+                _config.classify_model,
+            )
+
     available = DEFAULT_REGISTRY.available_models()
     log.info(
         "PDP Router Proxy started. %d models available. routing_mode=%s",
@@ -628,11 +663,75 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="PDP Router Proxy", version="0.1.0", lifespan=_lifespan)
 
 
+@app.exception_handler(HTTPException)
+async def _openai_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Render HTTPException as an OpenAI-compatible top-level {"error": {...}} body.
+
+    FastAPI's default handler nests the detail under "detail", which no
+    OpenAI-compatible client reads. Raise sites pass an ErrorResponse.model_dump()
+    dict; a plain-string detail is wrapped so ad-hoc raises stay compatible.
+    Mirrors the shape the streaming surface already emits in its SSE error frames.
+    """
+    detail = exc.detail
+    if isinstance(detail, dict) and "error" in detail:
+        content = detail
+    else:
+        error_type = "invalid_request_error" if exc.status_code < 500 else "server_error"
+        content = ErrorResponse(
+            error=ErrorDetail(message=str(detail), type=error_type)
+        ).model_dump()
+    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
+
+
+def _configured_providers(config: ProxyConfig) -> dict[str, bool]:
+    """Which provider credentials are actually present in this process.
+
+    Registry size says nothing about reachability: the roster is a static list,
+    so /health reports 11 models with zero keys configured. This is what a
+    first-run user needs instead, without spending a billable request to find out.
+    """
+    return {
+        "anthropic": bool(config.anthropic_api_key),
+        "gemini": bool(config.gemini_api_key),
+        "vertex": bool(config.gcp_project),
+        "openrouter": bool(config.openrouter_api_key),
+    }
+
+
+def _trust_db_status(config: ProxyConfig) -> dict[str, Any]:
+    """Presence and readability of the trust DB.
+
+    Absent is a supported configuration (the cascade routes on defaults), so it
+    is reported rather than treated as an error. Present-but-unreadable is a user
+    error worth surfacing, because the learned layer silently does nothing.
+    """
+    path = config.trust_db_path
+    present = path.exists()
+    readable = False
+    if present:
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+                readable = True
+            finally:
+                conn.close()
+        except Exception:
+            log.warning("Trust DB at %s exists but is not readable", path, exc_info=True)
+    return {"path": str(path), "present": present, "readable": readable}
+
+
 @app.get("/health")
 async def health() -> dict:
+    config = _config if _config is not None else ProxyConfig()
     return {
         "status": "ok",
         "models": len(DEFAULT_REGISTRY.available_models()),
+        "providers": _configured_providers(config),
+        "trust_db": _trust_db_status(config),
+        "routing_mode": config.routing_mode,
     }
 
 
@@ -752,6 +851,35 @@ def _route_request(
     return model_name, confidence, score, panel_score, search_intent, system, non_system
 
 
+class _MissingClassifierCredentialsError(RuntimeError):
+    """The configured classifier has no credentials in this process.
+
+    Distinguishes "you did not configure this provider" from "the provider
+    broke", so the first can be reported in one line and the second keeps its
+    traceback. Not part of the public API.
+    """
+
+    def __init__(self, model_name: str) -> None:
+        super().__init__(f"no credentials configured for {model_name}")
+        self.model_name = model_name
+
+
+def _has_credentials_for(model_name: str, config: ProxyConfig) -> bool:
+    """Whether this process holds credentials that can reach model_name.
+
+    Reads the same per-provider mapping the client builder uses
+    (_client_kwargs), so the two cannot disagree about what "configured" means.
+    Local models need no credentials. Prefix matching here mirrors
+    _client_kwargs and moves to the registry when provider dispatch does.
+    """
+    if model_name.startswith(("ollama/", "local/")):
+        return True
+    kwargs = _client_kwargs(model_name, config)
+    if model_name.startswith("meta/"):
+        return bool(kwargs.get("project"))
+    return bool(kwargs.get("api_key"))
+
+
 def _client_kwargs(model_name: str, config: ProxyConfig) -> dict[str, str]:
     """Provider credentials + base_url for get_client, chosen by model-name prefix.
 
@@ -786,11 +914,9 @@ def _build_client(model_name: str) -> object:
         log.error("Failed to create client for %s: %s", model_name, e)
         raise HTTPException(
             status_code=503,
-            detail=str(
-                ErrorResponse(
-                    error=ErrorDetail(message=f"Client creation failed: {e}", type="server_error")
-                ).model_dump()
-            ),
+            detail=ErrorResponse(
+                error=ErrorDetail(message=f"Client creation failed: {e}", type="server_error")
+            ).model_dump(),
         ) from e
 
 
@@ -886,19 +1012,17 @@ def _execute_single(
     except CreditExhaustionError as e:
         raise HTTPException(
             status_code=402,
-            detail=str(
-                ErrorResponse(error=ErrorDetail(message=str(e), type="billing_error")).model_dump()
-            ),
+            detail=ErrorResponse(
+                error=ErrorDetail(message=str(e), type="billing_error")
+            ).model_dump(),
         ) from e
     except Exception as e:
         log.exception("Completion failed on %s", model_name)
         raise HTTPException(
             status_code=503,
-            detail=str(
-                ErrorResponse(
-                    error=ErrorDetail(message=f"Completion failed: {e}", type="server_error")
-                ).model_dump()
-            ),
+            detail=ErrorResponse(
+                error=ErrorDetail(message=f"Completion failed: {e}", type="server_error")
+            ).model_dump(),
         ) from e
 
     elapsed = time.monotonic() - start
@@ -1151,11 +1275,9 @@ async def _execute_panel_with_synth(
     if not survivors:
         raise HTTPException(
             status_code=503,
-            detail=str(
-                ErrorResponse(
-                    error=ErrorDetail(message="all panel members failed", type="server_error")
-                ).model_dump()
-            ),
+            detail=ErrorResponse(
+                error=ErrorDetail(message="all panel members failed", type="server_error")
+            ).model_dump(),
         )
 
     user_text = non_system[-1].content if non_system else ""
