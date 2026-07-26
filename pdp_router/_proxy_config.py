@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pdp_router._domain_overrides import parse_overrides
+from pdp_router._models import HAIKU
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,12 @@ class ProxyConfig:
     )
     classify_max_tokens: int = field(
         default_factory=lambda: int(os.getenv("PROXY_CLASSIFY_MAX_TOKENS", "16"))
+    )
+    # Cross-lineage fallback when the primary classifier fails outright: one
+    # attempt before the (3, 0) collapse that disables the auto-panel. Empty
+    # string disables the fallback.
+    classify_fallback_model: str = field(
+        default_factory=lambda: os.getenv("PROXY_CLASSIFY_FALLBACK_MODEL", HAIKU)
     )
     trust_db_path: Path = field(
         default_factory=lambda: Path(

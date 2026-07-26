@@ -323,15 +323,17 @@ CLASSIFY_SYSTEM = (
 _SCORE_TO_CONFIDENCE = {1: 0.95, 2: 0.75, 3: 0.55, 4: 0.35, 5: 0.15}
 
 
-def _parse_classifier(text: str) -> tuple[int, int]:
+def _parse_classifier(text: str) -> tuple[int, int] | None:
     """Parse the classifier reply into (complexity, panel_score).
 
-    Handles three shapes gracefully:
+    Handles two shapes:
       - '4 8'  -> (4, 8)            Sprint X.K two-int format.
       - '4'    -> (4, 0)            Pre-X.K single-int back-compat.
-      - garbage -> (3, 0)           Sonnet-tier complexity, no panel.
 
-    Complexity clamped to [1, 5]; panel_score clamped to [0, 10].
+    Complexity clamped to [1, 5]; panel_score clamped to [0, 10]. Returns
+    None on an unparseable reply so _classify_request can treat it as a
+    classifier failure (retry/fallback) instead of a silent (3, 0) collapse
+    that would disable the auto-panel with no trace.
     """
     try:
         cleaned = strip_markdown_fences(text).strip()
@@ -342,7 +344,7 @@ def _parse_classifier(text: str) -> tuple[int, int]:
             return (max(1, min(5, int(parts[0]))), 0)
     except (ValueError, IndexError):
         pass
-    return (3, 0)
+    return None
 
 
 def _classify_retryable(exc: Exception) -> bool:
@@ -380,14 +382,18 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
     """Classify request complexity, return (confidence, score, panel_score).
 
     The classifier call is retried a bounded number of times on a TRANSIENT error
-    (a provider 503/429, a timeout) before falling back to (0.55, 3, 0) -- the
-    Sonnet-tier, no-panel default. The transient retry matters because a single
+    (a provider 503/429, a timeout). The transient retry matters because a single
     capacity blip on the classifier model otherwise zeroes panel_score and
-    silently disables the whole auto-panel (streaming + bot). Non-transient errors
-    (bad key, etc.) fall back immediately. Retry budget + backoff are env-tunable
-    (PROXY_CLASSIFY_RETRIES default 2, PROXY_CLASSIFY_RETRY_BACKOFF_S default 0.2).
-    The backoff is a blocking sleep -- acceptable for this single-user proxy, where
-    the classifier call is already synchronous on the request path.
+    silently disables the whole auto-panel (streaming + bot). Retry budget +
+    backoff are env-tunable (PROXY_CLASSIFY_RETRIES default 2,
+    PROXY_CLASSIFY_RETRY_BACKOFF_S default 0.2). The backoff is a blocking
+    sleep -- acceptable for this single-user proxy, where the classifier call is
+    already synchronous on the request path.
+
+    When the primary fails outright (retries exhausted, a non-transient error,
+    or client construction), one cross-lineage fallback attempt runs on
+    config.classify_fallback_model (default Haiku; requires its provider key)
+    before the final (0.55, 3, 0) collapse -- the Sonnet-tier, no-panel default.
     """
     # Classify against the LATEST user message only, not the whole history.
     # The classifier is asking "how complex is THIS request?" -- conversation
@@ -404,10 +410,7 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
     score, panel_score = 3, 0
     try:
         client = get_client(
-            config.classify_model,
-            api_key=config.gemini_api_key or config.anthropic_api_key,
-            project=config.gcp_project,
-            location=config.gcp_location,
+            config.classify_model, **_client_kwargs(config.classify_model, config)
         )
         for attempt in range(retries + 1):
             try:
@@ -416,7 +419,12 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
                     user_message=user_text,
                     max_tokens=config.classify_max_tokens,
                 )
-                score, panel_score = _parse_classifier(result.text)
+                parsed = _parse_classifier(result.text)
+                if parsed is None:
+                    raise ValueError(
+                        f"unparseable classifier reply: {result.text[:80]!r}"
+                    )
+                score, panel_score = parsed
                 break
             except Exception as e:
                 if attempt < retries and _classify_retryable(e):
@@ -431,8 +439,38 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
                     continue
                 raise
     except Exception:
-        log.warning("Classifier failed, falling back to (3, 0)", exc_info=True)
-        score, panel_score = 3, 0
+        fallback = config.classify_fallback_model
+        fb_kwargs = _client_kwargs(fallback, config) if fallback else {}
+        if fallback and fallback != config.classify_model and fb_kwargs.get("api_key"):
+            log.warning(
+                "Classifier %s failed; trying cross-lineage fallback %s",
+                config.classify_model,
+                fallback,
+                exc_info=True,
+            )
+            try:
+                fb_client = get_client(fallback, **fb_kwargs)
+                result = fb_client.complete(
+                    system=CLASSIFY_SYSTEM,
+                    user_message=user_text,
+                    max_tokens=config.classify_max_tokens,
+                )
+                parsed = _parse_classifier(result.text)
+                if parsed is None:
+                    raise ValueError(
+                        f"unparseable fallback classifier reply: {result.text[:80]!r}"
+                    )
+                score, panel_score = parsed
+            except Exception:
+                log.warning(
+                    "Fallback classifier %s also failed, falling back to (3, 0)",
+                    fallback,
+                    exc_info=True,
+                )
+                score, panel_score = 3, 0
+        else:
+            log.warning("Classifier failed, falling back to (3, 0)", exc_info=True)
+            score, panel_score = 3, 0
 
     return _SCORE_TO_CONFIDENCE.get(score, 0.55), score, panel_score
 
@@ -714,28 +752,28 @@ def _route_request(
     return model_name, confidence, score, panel_score, search_intent, system, non_system
 
 
-def _client_kwargs(model_name: str) -> dict[str, str]:
+def _client_kwargs(model_name: str, config: ProxyConfig) -> dict[str, str]:
     """Provider credentials + base_url for get_client, chosen by model-name prefix.
 
     OpenRouter-fronted arms (openai/*, qwen*) take the OpenRouter key + base_url;
     gemini-* takes the Gemini key; everything else (claude-*, meta/*) takes the
     Anthropic key with the Vertex project/location riding along for meta/* MaaS.
-    Shared by _build_client (cascade + chair) and the panel member builder so the
-    routing for the new arms lives in exactly one place.
+    Shared by _build_client (cascade + chair), the panel member builder, and the
+    classifier (primary + fallback) so the routing for the arms lives in exactly
+    one place.
     """
-    assert _config is not None
     if model_name.startswith("openai/") or model_name.startswith("qwen"):
         return {
-            "api_key": _config.openrouter_api_key,
-            "base_url": _config.openrouter_base_url,
+            "api_key": config.openrouter_api_key,
+            "base_url": config.openrouter_base_url,
         }
     return {
         "api_key": (
-            _config.gemini_api_key if model_name.startswith("gemini") else _config.anthropic_api_key
+            config.gemini_api_key if model_name.startswith("gemini") else config.anthropic_api_key
         ),
         "auth_token": "",
-        "project": _config.gcp_project,
-        "location": _config.gcp_location,
+        "project": config.gcp_project,
+        "location": config.gcp_location,
     }
 
 
@@ -743,7 +781,7 @@ def _build_client(model_name: str) -> object:
     """Instantiate the LLM client for a model, raising HTTPException on failure."""
     assert _config is not None
     try:
-        return get_client(model_name, **_client_kwargs(model_name))
+        return get_client(model_name, **_client_kwargs(model_name, _config))
     except Exception as e:
         log.error("Failed to create client for %s: %s", model_name, e)
         raise HTTPException(
@@ -947,7 +985,7 @@ async def _run_panel_members(
     async def _one(model_id: str) -> PanelMemberResponse:
         t0 = time.monotonic()
         try:
-            cli = get_client(model_id, **_client_kwargs(model_id))
+            cli = get_client(model_id, **_client_kwargs(model_id, _config))
             if len(non_system) == 1:
                 r: CompletionResult = await asyncio.to_thread(
                     cli.complete,

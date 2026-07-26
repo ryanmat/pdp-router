@@ -302,7 +302,7 @@ class TestClassifyRequest:
         mock_client.complete.return_value = _mock_completion(text="moderate")
         mock_get_client.return_value = mock_client
 
-        config = ProxyConfig()
+        config = ProxyConfig(classify_fallback_model="")
         from pdp_router._proxy import ChatMessage
 
         messages = [ChatMessage(role="user", content="test")]
@@ -336,7 +336,7 @@ class TestClassifyRequest:
         mock_client.complete.side_effect = RuntimeError("503 UNAVAILABLE")
         mock_get_client.return_value = mock_client
 
-        config = ProxyConfig()
+        config = ProxyConfig(classify_fallback_model="")
         messages = [ChatMessage(role="user", content="test")]
         with patch.dict(
             os.environ,
@@ -354,7 +354,7 @@ class TestClassifyRequest:
         mock_client.complete.side_effect = ValueError("invalid api key")
         mock_get_client.return_value = mock_client
 
-        config = ProxyConfig()
+        config = ProxyConfig(classify_fallback_model="")
         messages = [ChatMessage(role="user", content="test")]
         with patch.dict(
             os.environ,
@@ -364,6 +364,157 @@ class TestClassifyRequest:
 
         assert (score, panel_score) == (3, 0)
         assert mock_client.complete.call_count == 1
+
+
+class TestClassifyFallback:
+    """Cross-lineage fallback classifier: rescues the (3, 0) collapse that
+    silently disables the auto-panel when the primary classifier is down."""
+
+    def _config(self, **overrides) -> ProxyConfig:
+        kwargs = {
+            "anthropic_api_key": "sk-test",
+            "gemini_api_key": "gk-test",
+        }
+        kwargs.update(overrides)
+        return ProxyConfig(**kwargs)
+
+    @patch("pdp_router._proxy.get_client")
+    def test_fallback_rescues_exhausted_primary(self, mock_get_client) -> None:
+        primary = MagicMock()
+        primary.complete.side_effect = RuntimeError("503 UNAVAILABLE")
+        fallback = MagicMock()
+        fallback.complete.return_value = _mock_completion(text="4 8")
+        mock_get_client.side_effect = [primary, fallback]
+
+        config = self._config()
+        messages = [ChatMessage(role="user", content="compare A vs B")]
+        with patch.dict(
+            os.environ,
+            {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
+        ):
+            confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (4, 8)
+        assert confidence == _SCORE_TO_CONFIDENCE[4]
+        assert mock_get_client.call_count == 2
+        primary_call, fallback_call = mock_get_client.call_args_list
+        # Primary is gemini-*: gets the Gemini key, not anthropic-or-gemini soup.
+        assert primary_call.args[0] == config.classify_model
+        assert primary_call.kwargs["api_key"] == "gk-test"
+        # Fallback is claude-*: gets the Anthropic key.
+        assert fallback_call.args[0] == config.classify_fallback_model
+        assert fallback_call.args[0].startswith("claude-")
+        assert fallback_call.kwargs["api_key"] == "sk-test"
+
+    @patch("pdp_router._proxy.get_client")
+    def test_fallback_covers_non_retryable_primary_error(self, mock_get_client) -> None:
+        primary = MagicMock()
+        primary.complete.side_effect = ValueError("400 bad request")
+        fallback = MagicMock()
+        fallback.complete.return_value = _mock_completion(text="2 0")
+        mock_get_client.side_effect = [primary, fallback]
+
+        config = self._config()
+        messages = [ChatMessage(role="user", content="test")]
+        with patch.dict(
+            os.environ,
+            {"PROXY_CLASSIFY_RETRIES": "2", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
+        ):
+            _confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (2, 0)
+        assert primary.complete.call_count == 1  # non-retryable: no wasted retries
+
+    @patch("pdp_router._proxy.get_client")
+    def test_fallback_skipped_without_creds(self, mock_get_client) -> None:
+        primary = MagicMock()
+        primary.complete.side_effect = RuntimeError("503 UNAVAILABLE")
+        mock_get_client.return_value = primary
+
+        config = self._config(anthropic_api_key="")
+        messages = [ChatMessage(role="user", content="test")]
+        with patch.dict(
+            os.environ,
+            {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
+        ):
+            _confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (3, 0)
+        assert mock_get_client.call_count == 1
+
+    @patch("pdp_router._proxy.get_client")
+    def test_fallback_failure_collapses_to_default(self, mock_get_client) -> None:
+        broken = MagicMock()
+        broken.complete.side_effect = RuntimeError("503 UNAVAILABLE")
+        mock_get_client.return_value = broken
+
+        config = self._config()
+        messages = [ChatMessage(role="user", content="test")]
+        with patch.dict(
+            os.environ,
+            {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
+        ):
+            _confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (3, 0)
+        assert mock_get_client.call_count == 2
+
+    @patch("pdp_router._proxy.get_client")
+    def test_fallback_rescues_unparseable_primary_reply(self, mock_get_client) -> None:
+        """An HTTP-200 reply the parser cannot read is a classifier failure:
+        it must reach the fallback, not silently collapse to (3, 0)."""
+        primary = MagicMock()
+        primary.complete.return_value = _mock_completion(text="Complexity: 4, Panel: 8")
+        fallback = MagicMock()
+        fallback.complete.return_value = _mock_completion(text="4 8")
+        mock_get_client.side_effect = [primary, fallback]
+
+        config = self._config()
+        messages = [ChatMessage(role="user", content="compare A vs B")]
+        with patch.dict(
+            os.environ,
+            {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
+        ):
+            _confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (4, 8)
+        assert mock_get_client.call_count == 2
+
+    @patch("pdp_router._proxy.get_client")
+    def test_same_model_fallback_skipped(self, mock_get_client) -> None:
+        """fallback == primary is a doomed retry against the same dead model;
+        the guard must skip it and collapse directly."""
+        broken = MagicMock()
+        broken.complete.side_effect = RuntimeError("503 UNAVAILABLE")
+        mock_get_client.return_value = broken
+
+        config = self._config(
+            classify_model="gemini-2.5-flash-lite",
+            classify_fallback_model="gemini-2.5-flash-lite",
+        )
+        messages = [ChatMessage(role="user", content="test")]
+        with patch.dict(
+            os.environ,
+            {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
+        ):
+            _confidence, score, panel_score = _classify_request(messages, config)
+
+        assert (score, panel_score) == (3, 0)
+        assert mock_get_client.call_count == 1
+
+    @patch("pdp_router._proxy.get_client")
+    def test_claude_primary_gets_anthropic_key(self, mock_get_client) -> None:
+        """Regression: a claude-* classify model used to receive the Gemini key
+        whenever both keys were set (gemini_api_key or anthropic_api_key)."""
+        mock_client = MagicMock()
+        mock_client.complete.return_value = _mock_completion(text="3")
+        mock_get_client.return_value = mock_client
+
+        config = self._config(classify_model="claude-haiku-4-5-20251001")
+        messages = [ChatMessage(role="user", content="test")]
+        _classify_request(messages, config)
+
+        assert mock_get_client.call_args.kwargs["api_key"] == "sk-test"
 
 
 class TestClassifyRetryable:
@@ -687,10 +838,13 @@ class TestParseClassifier:
         assert _parse_classifier("4") == (4, 0)
         assert _parse_classifier("1") == (1, 0)
 
-    def test_garbage_falls_back(self) -> None:
-        assert _parse_classifier("moderate") == (3, 0)
-        assert _parse_classifier("") == (3, 0)
-        assert _parse_classifier("no clue") == (3, 0)
+    def test_garbage_returns_none(self) -> None:
+        # None signals parse failure so _classify_request can route it to the
+        # cross-lineage fallback instead of silently collapsing to (3, 0).
+        assert _parse_classifier("moderate") is None
+        assert _parse_classifier("") is None
+        assert _parse_classifier("no clue") is None
+        assert _parse_classifier("4/8") is None
 
     def test_clamps_both_axes(self) -> None:
         assert _parse_classifier("9 99") == (5, 10)
