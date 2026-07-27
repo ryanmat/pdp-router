@@ -856,6 +856,78 @@ class TestFaithfulPanelStreaming:
         assert len(rows) == 1
         assert rows[0]["routing_mode"] == "cascade_panel_empty_fallback"
 
+    @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
+    @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy.compose_panel", return_value=[])
+    @patch("pdp_router._proxy.get_client")
+    def test_empty_members_fallback_records_the_executed_policy(
+        self,
+        mock_get_client,
+        _compose,
+        _classify,
+        _autopanel,
+        _panelstream,
+        _footer,
+        tmp_path,
+    ) -> None:
+        """This fallback runs the bandit when one is configured, so the label must say so.
+
+        It passed routing_mode=_config.routing_mode into confidence_cascade but
+        then wrote a flat "cascade_panel_empty_fallback" literal, mislabelling a
+        Thompson-sampled pick as a cascade one.
+
+        Builds its own client rather than using the `client`/`inbox_dir` pair,
+        because that fixture mutates the outer _config while a nested TestClient
+        re-runs the lifespan and replaces it. The inbox is therefore set through
+        the environment so the fresh config picks it up.
+        """
+        import sqlite3
+
+        db = tmp_path / "trust.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE model_trust (model_id TEXT, weight REAL);"
+            "CREATE TABLE bandit_state (model_id TEXT, mu REAL, sigma REAL,"
+            " n_obs INTEGER, sum_reward REAL, sum_sq_reward REAL,"
+            " effective_n REAL, effective_sum REAL);"
+        )
+        conn.execute(
+            "INSERT INTO bandit_state VALUES "
+            "('claude-opus-4',0.98,0.005,900,880.0,870.0,900.0,882.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        inbox = tmp_path / "inbox"
+        mock_get_client.return_value = _make_streaming_mock_client(["ok"])
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": "sk-test",
+                    "GEMINI_API_KEY": "gm-test",
+                    "ROUTING_MODE": "bandit",
+                    "PROXY_TRUST_DB": str(db),
+                    "PROXY_ROUTING_INBOX_DIR": str(inbox),
+                    "PROXY_EXPLORE_RATE": "0",
+                },
+            ),
+            patch("pdp_router._proxy._streaming_enabled", return_value=True),
+            TestClient(app) as c,
+        ):
+            c.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [{"role": "user", "content": "compare X vs Y"}],
+                    "stream": True,
+                },
+            )
+        rows = _read_inbox_rows(inbox)
+        assert rows[0]["routing_mode"] == "bandit_panel_empty_fallback"
+
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
     @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))

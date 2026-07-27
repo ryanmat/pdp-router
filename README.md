@@ -151,11 +151,26 @@ CREATE TABLE bandit_state (
 ```
 
 Every request appends a routing-decision row to a JSONL inbox (default
-`~/.pdp-router/inbox/proxy-YYYYMMDD.jsonl`, override `PROXY_ROUTING_INBOX_DIR`)
-carrying the selected model, confidence, context bucket, and a request UUID that
-also rides the `X-PDP-Prediction-Id` response header. Drain those rows into your
-store, grade them against whatever outcome you care about, recompute posteriors,
-write them back. That loop, not this code, is where the value lives.
+`~/.pdp-router/inbox/proxy-YYYYMMDD.jsonl`, override `PROXY_ROUTING_INBOX_DIR`).
+Drain those rows into your store, grade them against whatever outcome you care
+about, recompute posteriors, write them back. That loop, not this code, is where
+the value lives.
+
+Reading a row, the three fields that matter most:
+
+| Field | Meaning |
+|---|---|
+| `context_json.chat_request_id` | **Join on this.** The request UUID, identical to the `X-PDP-Prediction-Id` response header. `alert_id` carries it too, as `chat-<uuid>`. |
+| `routing_mode` | The policy that actually produced the pick: `bandit` when Thompson Sampling ran, `cascade` for the thresholds, `explicit` when the caller pinned a model, `panel`/`panel_chair` for panel rows. Group by this to compare policies. |
+| `cascade_explored` | `true` when the pick came from the epsilon-greedy explore branch and is uniform-random rather than threshold-driven. Exclude these before computing agreement rates. |
+
+`prediction_id` is a literal `0`, not an identifier. It is a sentinel for "no
+upstream prediction id" and joining on it will match every row.
+
+Configuring `ROUTING_MODE=bandit` is not the same as the bandit running: with no
+readable `bandit_state` table, routing silently falls through to the cascade. The
+proxy warns at startup when that happens, and `routing_mode` on each row records
+which policy actually served the request.
 
 ## Tracing
 

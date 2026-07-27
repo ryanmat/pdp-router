@@ -8,10 +8,12 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -38,7 +40,7 @@ from pdp_router._panel import (
     synthesize_chair,
 )
 from pdp_router._proxy_config import ProxyConfig
-from pdp_router._router import DEFAULT_REGISTRY, confidence_cascade
+from pdp_router._router import DEFAULT_REGISTRY, bandit_branch_active, confidence_cascade
 from pdp_router._tracing import init_tracing, shutdown_tracing
 from pdp_router._utils import strip_markdown_fences
 
@@ -494,120 +496,154 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
 # -- Trust cache --
 
 
-class TrustCache:
-    """Mtime-cached trust weights from pdp-tracker SQLite DB."""
+_CACHE_POLL_INTERVAL_S = 5.0
+
+
+class _MtimeCache:
+    """Poll-throttled, mtime-invalidated reader for the read-only trust DB.
+
+    Shared by the trust-weight and bandit-posterior caches: same freshness and
+    failure policy, different query.
+
+    Freshness: at most one filesystem poll per _CACHE_POLL_INTERVAL_S; between
+    polls the cached value is returned untouched. A poll re-reads when the file
+    mtime changed, or when `ttl` has elapsed since the last successful read.
+
+    Failure policy: an absent file is a supported configuration (the confidence
+    cascade routes on defaults), so it stays quiet. A file that exists but
+    cannot be opened or queried is a user error that silently disables the
+    learned layer, so it warns -- once per failure episode rather than once per
+    request, and again only after a successful read resets the state.
+    """
+
+    # Named in operator-facing warnings; overridden per subclass.
+    label = "trust DB"
 
     def __init__(self, db_path: str, ttl: int = 300) -> None:
         self._db_path = db_path
         self._ttl = ttl
-        self._weights: dict[str, float] = {}
         self._last_mtime: float = 0.0
-        self._last_check: float = time.monotonic()
+        # -inf, not time.monotonic(). Priming these to "now" made the poll
+        # throttle swallow the very first call and hand back the empty initial
+        # value, so a ROUTING_MODE=bandit deployment ran the plain cascade for
+        # its first 5 seconds with no indication that it was doing so.
+        self._last_poll: float = float("-inf")
+        self._last_read: float = float("-inf")
+        self._warned_unreadable = False
 
-    def get_weights(self) -> dict[str, float]:
+    def _query(self, conn: sqlite3.Connection) -> None:
+        """Populate the subclass's cached value from an open read-only connection."""
+        raise NotImplementedError
+
+    def _refresh(self) -> None:
         now = time.monotonic()
-        if now - self._last_check < 5.0:
-            return self._weights
-
-        self._last_check = now
+        if now - self._last_poll < _CACHE_POLL_INTERVAL_S:
+            return
+        self._last_poll = now
 
         try:
-            import os
-
             mtime = os.path.getmtime(self._db_path)
-            if mtime == self._last_mtime and (now - self._last_check) < self._ttl:
-                return self._weights
-
-            import sqlite3
+            if mtime == self._last_mtime and (now - self._last_read) < self._ttl:
+                return
 
             conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
             try:
-                rows = conn.execute("SELECT model_id, weight FROM model_trust").fetchall()
-                # Storage keys on canonical model_id (e.g. claude-opus-4); the
-                # router consumes weights keyed on live registry IDs (e.g.
-                # claude-opus-4-7). Fan each canonical row out to every live
-                # alias that canonicalizes to it. See _models.expand_canonical_to_live.
-                weights: dict[str, float] = {}
-                for canonical, weight in rows:
-                    for live_id in expand_canonical_to_live(canonical):
-                        weights[live_id] = weight
-                self._weights = weights
+                self._query(conn)
             finally:
                 conn.close()
 
             self._last_mtime = mtime
+            self._last_read = now
+            self._warned_unreadable = False
+        except FileNotFoundError:
+            log.debug(
+                "%s absent at %s; routing on cascade defaults",
+                self.label,
+                self._db_path,
+            )
         except Exception:
-            log.debug("Trust DB read failed, using cached weights", exc_info=True)
+            if not self._warned_unreadable:
+                log.warning(
+                    "%s at %s exists but could not be read. The learned layer is "
+                    "inactive and routing has fallen back to the static cascade. "
+                    "Check the schema against the README.",
+                    self.label,
+                    self._db_path,
+                    exc_info=True,
+                )
+                self._warned_unreadable = True
 
+
+class TrustCache(_MtimeCache):
+    """Mtime-cached trust weights from pdp-tracker SQLite DB."""
+
+    label = "trust DB (model_trust)"
+
+    def __init__(self, db_path: str, ttl: int = 300) -> None:
+        super().__init__(db_path, ttl)
+        self._weights: dict[str, float] = {}
+
+    def _query(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("SELECT model_id, weight FROM model_trust").fetchall()
+        # Storage keys on canonical model_id (e.g. claude-opus-4); the
+        # router consumes weights keyed on live registry IDs (e.g.
+        # claude-opus-4-7). Fan each canonical row out to every live
+        # alias that canonicalizes to it. See _models.expand_canonical_to_live.
+        weights: dict[str, float] = {}
+        for canonical, weight in rows:
+            for live_id in expand_canonical_to_live(canonical):
+                weights[live_id] = weight
+        self._weights = weights
+
+    def get_weights(self) -> dict[str, float]:
+        self._refresh()
         return self._weights
 
 
 # -- Bandit cache --
 
 
-class BanditCache:
+class BanditCache(_MtimeCache):
     """Mtime-cached bandit posteriors from pdp-tracker SQLite DB."""
 
+    label = "bandit posterior store (bandit_state)"
+
     def __init__(self, db_path: str, ttl: int = 300) -> None:
-        self._db_path = db_path
-        self._ttl = ttl
+        super().__init__(db_path, ttl)
         self._states: dict | None = None
-        self._last_mtime: float = 0.0
-        self._last_check: float = time.monotonic()
+
+    def _query(self, conn: sqlite3.Connection) -> None:
+        from pdp_router._bandit import BanditState
+
+        rows = conn.execute(
+            "SELECT model_id, mu, sigma, n_obs, sum_reward, "
+            "sum_sq_reward, "
+            "IFNULL(effective_n, 0.0), IFNULL(effective_sum, 0.0) "
+            "FROM bandit_state"
+        ).fetchall()
+        # Storage keys on canonical model_id; expand to every live
+        # registry alias for the router. Mirrors the MCP-tool
+        # expansion in pdp-tracker so cache and MCP return the same
+        # ID shape regardless of which path the caller uses.
+        states: dict[str, BanditState] = {}
+        for row in rows:
+            canonical = row[0]
+            posterior = BanditState(
+                mu=row[1],
+                sigma=row[2],
+                n_obs=row[3],
+                sum_reward=row[4],
+                sum_sq_reward=row[5],
+                effective_n=row[6],
+                effective_sum=row[7],
+            )
+            for live_id in expand_canonical_to_live(canonical):
+                states[live_id] = posterior
+        self._states = states
 
     def get_states(self) -> dict | None:
         """Read bandit_state table, return dict[str, BanditState] or None."""
-        now = time.monotonic()
-        if now - self._last_check < 5.0:
-            return self._states
-
-        self._last_check = now
-
-        try:
-            import os
-
-            mtime = os.path.getmtime(self._db_path)
-            if mtime == self._last_mtime and (now - self._last_check) < self._ttl:
-                return self._states
-
-            import sqlite3
-
-            from pdp_router._bandit import BanditState
-
-            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
-            try:
-                rows = conn.execute(
-                    "SELECT model_id, mu, sigma, n_obs, sum_reward, "
-                    "sum_sq_reward, "
-                    "IFNULL(effective_n, 0.0), IFNULL(effective_sum, 0.0) "
-                    "FROM bandit_state"
-                ).fetchall()
-                # Storage keys on canonical model_id; expand to every live
-                # registry alias for the router. Mirrors the MCP-tool
-                # expansion in pdp-tracker so cache and MCP return the same
-                # ID shape regardless of which path the caller uses.
-                states: dict[str, BanditState] = {}
-                for row in rows:
-                    canonical = row[0]
-                    posterior = BanditState(
-                        mu=row[1],
-                        sigma=row[2],
-                        n_obs=row[3],
-                        sum_reward=row[4],
-                        sum_sq_reward=row[5],
-                        effective_n=row[6],
-                        effective_sum=row[7],
-                    )
-                    for live_id in expand_canonical_to_live(canonical):
-                        states[live_id] = posterior
-                self._states = states
-            finally:
-                conn.close()
-
-            self._last_mtime = mtime
-        except Exception:
-            log.debug("Bandit DB read failed, using cached states", exc_info=True)
-
+        self._refresh()
         return self._states
 
 
@@ -628,6 +664,18 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     if not _config.anthropic_api_key and not _config.gemini_api_key:
         log.warning("No API keys configured. Set ANTHROPIC_API_KEY or GEMINI_API_KEY.")
+
+    # Configuring bandit mode is not the same as the bandit running: with no
+    # readable posteriors, confidence_cascade falls through to the thresholds.
+    # Say so at startup rather than letting the operator believe a learned
+    # policy is live while the static cascade serves every request.
+    if _config.routing_mode == "bandit" and not _bandit_cache.get_states():
+        log.warning(
+            "ROUTING_MODE=bandit but no bandit posteriors were readable from %s. "
+            "Every request will route on the static confidence cascade until the "
+            "bandit_state table is populated.",
+            _config.trust_db_path,
+        )
 
     # Announce a classifier substitution once here rather than on every request.
     # One provider key is a supported setup, so the per-request path stays quiet.
@@ -710,8 +758,6 @@ def _trust_db_status(config: ProxyConfig) -> dict[str, Any]:
     readable = False
     if present:
         try:
-            import sqlite3
-
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             try:
                 conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
@@ -775,14 +821,16 @@ async def list_models() -> dict:
 
 def _route_request(
     request: ChatCompletionRequest,
-) -> tuple[str, float, int, int, bool, str, list[ChatMessage]]:
+) -> tuple[str, float, int, int, bool, str, list[ChatMessage], _RouteProvenance]:
     """Apply classification and routing.
 
     Returns (model_name, confidence, score, panel_score, search_intent, system,
-    non_system). panel_score is 0 for explicit-model requests (caller did
-    selection; auto-panel never triggers). search_intent is True only when web
+    non_system, provenance). panel_score is 0 for explicit-model requests (caller
+    did selection; auto-panel never triggers). search_intent is True only when web
     search is enabled AND the latest user message shows explicit search intent;
     it drives the auto-panel skip (handler) and the Sonnet capability floor.
+    provenance carries which policy actually produced the pick, so the routing
+    row records the executed mode rather than a hardcoded guess.
 
     Raises HTTPException(400) on unknown explicit model.
     """
@@ -808,17 +856,14 @@ def _route_request(
         model_name = request.model
         confidence, score, panel_score = -1.0, 0, 0
         search_intent = False
+        # No routing ran: the caller chose. Recording this as "cascade" would
+        # put caller-pinned picks into the cascade's own outcome statistics.
+        provenance = _RouteProvenance(mode="explicit")
     else:
         confidence, score, panel_score = _classify_request(non_system, _config)
-        trust_weights = _trust_cache.get_weights()
-        bandit_states = _bandit_cache.get_states() if _config.routing_mode == "bandit" else None
-        model_name = confidence_cascade(
+        model_name, provenance = _cascade_with_provenance(
             confidence=confidence,
-            trust_weights=trust_weights,
-            explore_rate=_config.explore_rate,
-            cost_adjusted=True,
-            routing_mode=_config.routing_mode,
-            bandit_states=bandit_states,
+            trust_weights=_trust_cache.get_weights(),
         )
 
         # Web-search capability floor. Web search attaches only on the cascade
@@ -848,7 +893,64 @@ def _route_request(
                     model_name,
                 )
 
-    return model_name, confidence, score, panel_score, search_intent, system, non_system
+    return (
+        model_name,
+        confidence,
+        score,
+        panel_score,
+        search_intent,
+        system,
+        non_system,
+        provenance,
+    )
+
+
+@dataclass(frozen=True)
+class _RouteProvenance:
+    """How the executed pick was actually made, for the routing row.
+
+    Derived where the decision happens rather than restated at the log site, so
+    the recorded policy cannot drift from the policy that ran.
+    """
+
+    # "bandit" (Thompson Sampling ran), "cascade" (confidence thresholds), or
+    # "explicit" (caller pinned a model, no routing at all).
+    mode: str
+    # True when the cascade took its epsilon-greedy branch, so the pick is
+    # uniform-random rather than threshold-driven. None where no cascade ran.
+    explored: bool | None = None
+
+
+def _cascade_with_provenance(
+    *, confidence: float, trust_weights: dict[str, float]
+) -> tuple[str, _RouteProvenance]:
+    """Run the configured routing policy and report which one actually ran.
+
+    The single place that pairs a routing call with its provenance, so the three
+    call sites (main path plus the two panel-empty fallbacks) cannot disagree
+    about how to label a decision.
+    """
+    assert _config is not None
+    assert _bandit_cache is not None
+
+    bandit_states = _bandit_cache.get_states() if _config.routing_mode == "bandit" else None
+    # return_debug reports whether the epsilon-greedy branch fired, which the
+    # drain's cascade_explored column exists to record and nothing populated.
+    model_name, explored = confidence_cascade(
+        confidence=confidence,
+        trust_weights=trust_weights,
+        explore_rate=_config.explore_rate,
+        cost_adjusted=True,
+        routing_mode=_config.routing_mode,
+        bandit_states=bandit_states,
+        return_debug=True,
+    )
+    # Configured mode is not executed mode: bandit with an absent or unreadable
+    # posterior store falls through to the cascade. Ask the same predicate the
+    # router branches on instead of restating the condition.
+    if bandit_branch_active(_config.routing_mode, bandit_states):
+        return model_name, _RouteProvenance(mode="bandit", explored=False)
+    return model_name, _RouteProvenance(mode="cascade", explored=explored)
 
 
 class _MissingClassifierCredentialsError(RuntimeError):
@@ -931,16 +1033,29 @@ def _make_routing_row(
     panel_score: int,
     search_intent: bool = False,
     role: str | None = None,
+    explored: bool | None = None,
 ) -> dict[str, Any]:
     """Build one routing-decisions row matching pdp-tracker's record_routing_decision schema.
 
-    pdp-tracker's record_routing_decision tool coerces both `prediction_id=0`
-    and `prediction_id=None` to NULL in the DB row, so the proxy writes 0 as
-    a stable "no upstream prediction id" sentinel that the inbox drain can read
-    without ambiguity (the JSONL preserves the 0; the MCP tool's coercion is
-    where the NULL appears). The per-request UUID rides in `context_json` as
-    `chat_request_id` so the drain can correlate panel-member rows + chair
-    row + the X-PDP-Prediction-Id response header without a schema migration.
+    Every key here must be a parameter of that tool: it takes explicit keyword
+    arguments, so a drain doing `record_routing_decision(**row)` raises TypeError
+    on anything extra. That constraint is why the per-request UUID rides inside
+    `context_json` as `chat_request_id` rather than becoming a top-level field.
+    That value is the join key for outcomes, and it equals the
+    X-PDP-Prediction-Id response header; `alert_id` carries it too as
+    `chat-<uuid>`.
+
+    `prediction_id` is a literal 0, not an id. The tool coerces both 0 and None
+    to NULL in the DB row, so the proxy writes 0 as a stable "no upstream
+    prediction id" sentinel the drain can read unambiguously. Do not join on it.
+
+    `routing_mode` is the policy that actually produced the pick, and `explored`
+    populates `cascade_explored` so uniform-random epsilon-greedy picks can be
+    excluded from agreement-rate analytics. Bandit-mode rows record False, not
+    None: posterior sampling is the bandit's own exploration mechanism, so it is
+    not epsilon-greedy exploration (see confidence_cascade's return_debug).
+    `explored=None` omits the key entirely, for rows where the concept does not
+    apply at all -- panel members, the chair, and caller-pinned models.
     """
     context: dict[str, Any] = {
         "chat_request_id": chat_request_id,
@@ -950,7 +1065,7 @@ def _make_routing_row(
     }
     if role is not None:
         context["role"] = role
-    return {
+    row: dict[str, Any] = {
         "alert_id": f"chat-{chat_request_id}",
         "model_selected": model_selected,
         "context_json": json.dumps(context),
@@ -962,6 +1077,9 @@ def _make_routing_row(
         "routing_mode": routing_mode,
         "prediction_id": 0,
     }
+    if explored is not None:
+        row["cascade_explored"] = explored
+    return row
 
 
 def _execute_single(
@@ -1234,14 +1352,9 @@ async def _execute_panel_with_synth(
             "compose_panel returned empty (chair=%s excluded); falling back to cascade",
             chair_model,
         )
-        bandit_states = _bandit_cache.get_states() if _config.routing_mode == "bandit" else None
-        model_name = confidence_cascade(
+        model_name, provenance = _cascade_with_provenance(
             confidence=confidence,
             trust_weights=_trust_cache.get_weights(),
-            explore_rate=_config.explore_rate,
-            cost_adjusted=True,
-            routing_mode=_config.routing_mode,
-            bandit_states=bandit_states,
         )
         client = _build_client(model_name)
         append_routing_decisions_jsonl(
@@ -1250,11 +1363,14 @@ async def _execute_panel_with_synth(
                 _make_routing_row(
                     chat_request_id=chat_request_id,
                     model_selected=model_name,
-                    routing_mode="cascade_panel_empty_fallback",
+                    # Carries the executed policy: this fallback runs the bandit
+                    # when one is configured, so a flat literal would mislabel it.
+                    routing_mode=f"{provenance.mode}_panel_empty_fallback",
                     context_bucket="chat:cascade",
                     confidence=confidence,
                     score=score,
                     panel_score=panel_score,
+                    explored=provenance.explored,
                 )
             ],
         )
@@ -1407,9 +1523,16 @@ async def _handle_chat(
     response.headers["X-PDP-Prediction-Id"] = chat_request_id
 
     try:
-        model_name, confidence, score, panel_score, search_intent, system, non_system = (
-            _route_request(request)
-        )
+        (
+            model_name,
+            confidence,
+            score,
+            panel_score,
+            search_intent,
+            system,
+            non_system,
+            provenance,
+        ) = _route_request(request)
 
         effective_stream = request.stream and _streaming_enabled()
         panel_base = (
@@ -1465,12 +1588,13 @@ async def _handle_chat(
                 _make_routing_row(
                     chat_request_id=chat_request_id,
                     model_selected=model_name,
-                    routing_mode="cascade",
+                    routing_mode=provenance.mode,
                     context_bucket="chat:cascade",
                     confidence=confidence,
                     score=score,
                     panel_score=panel_score,
                     search_intent=search_intent,
+                    explored=provenance.explored,
                 )
             ],
         )
@@ -1932,14 +2056,9 @@ async def _iter_panel_sse(
             chair_model,
             completion_id,
         )
-        bandit_states = _bandit_cache.get_states() if _config.routing_mode == "bandit" else None
-        model_name = confidence_cascade(
+        model_name, provenance = _cascade_with_provenance(
             confidence=confidence,
             trust_weights=_trust_cache.get_weights(),
-            explore_rate=_config.explore_rate,
-            cost_adjusted=True,
-            routing_mode=_config.routing_mode,
-            bandit_states=bandit_states,
         )
         append_routing_decisions_jsonl(
             inbox_dir=_config.routing_inbox_dir,
@@ -1947,11 +2066,14 @@ async def _iter_panel_sse(
                 _make_routing_row(
                     chat_request_id=chat_request_id,
                     model_selected=model_name,
-                    routing_mode="cascade_panel_empty_fallback",
+                    # Carries the executed policy: this fallback runs the bandit
+                    # when one is configured, so a flat literal would mislabel it.
+                    routing_mode=f"{provenance.mode}_panel_empty_fallback",
                     context_bucket="chat:cascade",
                     confidence=confidence,
                     score=score,
                     panel_score=panel_score,
+                    explored=provenance.explored,
                 )
             ],
         )

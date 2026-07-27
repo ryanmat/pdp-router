@@ -167,6 +167,20 @@ DEFAULT_REGISTRY = ModelRegistry(
 )
 
 
+def bandit_branch_active(routing_mode: str, bandit_states: dict | None) -> bool:
+    """Whether Thompson Sampling, not the threshold cascade, drives the pick.
+
+    The single source of truth for the bandit gate. confidence_cascade branches
+    on this, and callers that record the executed policy read the same predicate
+    rather than restating the condition. Restating it is how the routing rows
+    came to claim "cascade" for every Thompson-sampled decision: configuring
+    ROUTING_MODE=bandit is not the same as the bandit actually running, because
+    an absent or unreadable posterior store silently falls through to the
+    cascade.
+    """
+    return routing_mode == "bandit" and bool(bandit_states)
+
+
 # Trust-based threshold adjustment constants.
 _DEFAULT_TRUST = 0.5
 _TRUST_SCALE = 0.20  # max +-0.10 threshold shift from +-0.50 trust delta
@@ -438,7 +452,7 @@ def confidence_cascade(
     reg = registry or DEFAULT_REGISTRY
 
     # Thompson Sampling: sample from posteriors, pick highest draw.
-    if routing_mode == "bandit" and bandit_states:
+    if bandit_branch_active(routing_mode, bandit_states):
         from pdp_router._bandit import (
             RoutingContext,
             apply_cost_to_bandit,

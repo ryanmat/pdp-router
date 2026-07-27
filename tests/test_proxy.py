@@ -112,6 +112,267 @@ class TestHealthEndpoint:
         assert client.get("/health").json()["routing_mode"] == "cascade"
 
 
+def _trust_db(path, *, trust=(), bandit=()):
+    """Build a trust DB using exactly the schema the README documents."""
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE model_trust (model_id TEXT, weight REAL);"
+        "CREATE TABLE bandit_state (model_id TEXT, mu REAL, sigma REAL,"
+        " n_obs INTEGER, sum_reward REAL, sum_sq_reward REAL,"
+        " effective_n REAL, effective_sum REAL);"
+    )
+    for model_id, weight in trust:
+        conn.execute("INSERT INTO model_trust VALUES (?,?)", (model_id, weight))
+    for row in bandit:
+        conn.execute("INSERT INTO bandit_state VALUES (?,?,?,?,?,?,?,?)", row)
+    conn.commit()
+    conn.close()
+    return path
+
+
+class TestCacheColdStart:
+    """The first read must actually read.
+
+    Both caches primed _last_check to time.monotonic() in __init__, so the
+    5-second poll throttle short-circuited the very first call and returned the
+    empty initial value. A ROUTING_MODE=bandit deployment therefore ran the
+    plain cascade until 5 seconds had elapsed, with no signal that it was doing
+    so, and the learned layer looked switched on while doing nothing.
+    """
+
+    def test_trust_weights_available_on_first_call(self, tmp_path) -> None:
+        db = _trust_db(tmp_path / "t.db", trust=[("claude-opus-4", 0.9)])
+        cache = TrustCache(str(db), ttl=300)
+        assert cache.get_weights(), "first call returned nothing; cold start is broken"
+
+    def test_bandit_states_available_on_first_call(self, tmp_path) -> None:
+        db = _trust_db(
+            tmp_path / "t.db",
+            bandit=[("claude-opus-4", 0.98, 0.005, 900, 880.0, 870.0, 900.0, 882.0)],
+        )
+        cache = _proxy.BanditCache(str(db), ttl=300)
+        assert cache.get_states(), "first call returned nothing; bandit can never engage"
+
+
+class TestCacheFailureVisibility:
+    """Absent is supported and quiet; present-but-broken is a user error and loud.
+
+    The old code swallowed every exception at log.debug, invisible at the
+    default level, so a bandit_state table missing two columns downgraded the
+    user to the static cascade forever with zero output. Verified against the
+    live proxy: a malformed schema produced HTTP 200 and not one log line.
+    """
+
+    def test_absent_db_is_quiet(self, tmp_path, caplog) -> None:
+        cache = TrustCache(str(tmp_path / "nope.db"), ttl=300)
+        with caplog.at_level(logging.WARNING, logger="pdp_router._proxy"):
+            assert cache.get_weights() == {}
+        assert not caplog.records, "an absent trust DB is a supported setup, not a warning"
+
+    def test_unreadable_db_warns(self, tmp_path, caplog) -> None:
+        bad = tmp_path / "bad.db"
+        bad.write_text("this is not sqlite")
+        cache = TrustCache(str(bad), ttl=300)
+        with caplog.at_level(logging.WARNING, logger="pdp_router._proxy"):
+            cache.get_weights()
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_wrong_schema_warns(self, tmp_path, caplog) -> None:
+        """The realistic user error: followed the README but dropped two columns."""
+        import sqlite3
+
+        bad = tmp_path / "partial.db"
+        conn = sqlite3.connect(bad)
+        conn.executescript(
+            "CREATE TABLE bandit_state (model_id TEXT, mu REAL, sigma REAL,"
+            " n_obs INTEGER, sum_reward REAL, sum_sq_reward REAL);"
+        )
+        conn.commit()
+        conn.close()
+        cache = _proxy.BanditCache(str(bad), ttl=300)
+        with caplog.at_level(logging.WARNING, logger="pdp_router._proxy"):
+            cache.get_states()
+        assert "bandit" in caplog.text.lower()
+
+    def test_warning_does_not_repeat_every_poll(self, tmp_path, caplog) -> None:
+        """One warning per failure episode, not one per request forever."""
+        bad = tmp_path / "bad.db"
+        bad.write_text("not sqlite")
+        cache = TrustCache(str(bad), ttl=300)
+        with caplog.at_level(logging.WARNING, logger="pdp_router._proxy"):
+            for _ in range(5):
+                cache._last_poll = float("-inf")  # force each poll past the throttle
+                cache.get_weights()
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, f"expected one warning, got {len(warnings)}"
+
+
+class TestRoutingModeProvenance:
+    """The logged routing_mode must be the policy that actually made the pick.
+
+    Every _make_routing_row call site passed a hardcoded literal, so a
+    ROUTING_MODE=bandit deployment recorded every Thompson-sampled decision as
+    "cascade". routing_mode is the field you group by to compare policies, so a
+    wrong value silently invalidates the outcome analysis the whole design rests
+    on. Verified against the live proxy: bandit posteriors with opus mu=0.98 and
+    no trust weights sent a trivial prompt to Opus 3/3 while every row said
+    cascade.
+    """
+
+    def _rows(self, tmp_path) -> list[dict]:
+        import json as _json
+
+        rows = []
+        for path in sorted(tmp_path.glob("*.jsonl")):
+            rows += [_json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return rows
+
+    def _post(self, tmp_path, env: dict, body: dict) -> list[dict]:
+        mock = MagicMock()
+        mock.complete_multi.return_value = _mock_completion()
+        mock.complete.return_value = _mock_completion(text="1 0")
+        base = {
+            "ANTHROPIC_API_KEY": "sk-test",
+            "GEMINI_API_KEY": "gm-test",
+            "PROXY_ROUTING_INBOX_DIR": str(tmp_path),
+        }
+        base.update(env)
+        with (
+            patch.dict(os.environ, base),
+            patch.object(_proxy, "get_client", return_value=mock),
+            TestClient(app) as c,
+        ):
+            c.post("/v1/chat/completions", json=body)
+        return self._rows(tmp_path)
+
+    def test_cascade_mode_records_cascade(self, tmp_path) -> None:
+        rows = self._post(
+            tmp_path,
+            {"ROUTING_MODE": "cascade", "PROXY_EXPLORE_RATE": "0"},
+            {"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert [r["routing_mode"] for r in rows] == ["cascade"]
+
+    def test_bandit_mode_records_bandit(self, tmp_path) -> None:
+        """The executed policy was Thompson Sampling; the row must say so."""
+        db = _trust_db(
+            tmp_path / "trust.db",
+            bandit=[("claude-opus-4", 0.98, 0.005, 900, 880.0, 870.0, 900.0, 882.0)],
+        )
+        rows = self._post(
+            tmp_path,
+            {
+                "ROUTING_MODE": "bandit",
+                "PROXY_EXPLORE_RATE": "0",
+                "PROXY_TRUST_DB": str(db),
+            },
+            {"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert [r["routing_mode"] for r in rows] == ["bandit"]
+
+    def test_bandit_mode_without_posteriors_records_cascade(self, tmp_path) -> None:
+        """Configured bandit but no usable posteriors executes the cascade, so log cascade."""
+        rows = self._post(
+            tmp_path,
+            {
+                "ROUTING_MODE": "bandit",
+                "PROXY_EXPLORE_RATE": "0",
+                "PROXY_TRUST_DB": str(tmp_path / "absent.db"),
+            },
+            {"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert [r["routing_mode"] for r in rows] == ["cascade"]
+
+    def test_pinned_model_is_not_a_cascade_decision(self, tmp_path) -> None:
+        """An explicit model pin bypasses routing entirely; calling it cascade is a lie."""
+        rows = self._post(
+            tmp_path,
+            {"PROXY_EXPLORE_RATE": "0"},
+            {"model": OPUS, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert [r["routing_mode"] for r in rows] == ["explicit"]
+
+    def test_explore_branch_is_marked(self, tmp_path) -> None:
+        """cascade_explored exists in the drain schema and was never populated.
+
+        Uniform-random explore picks must be excludable from agreement-rate
+        analytics, which is exactly what the column is documented for.
+        """
+        rows = self._post(
+            tmp_path,
+            {"ROUTING_MODE": "cascade", "PROXY_EXPLORE_RATE": "1.0"},
+            {"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert rows[0]["cascade_explored"] is True
+
+    def test_threshold_pick_is_not_marked_explored(self, tmp_path) -> None:
+        rows = self._post(
+            tmp_path,
+            {"ROUTING_MODE": "cascade", "PROXY_EXPLORE_RATE": "0"},
+            {"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert rows[0]["cascade_explored"] is False
+
+    def test_row_keys_stay_within_the_drain_signature(self, tmp_path) -> None:
+        """pdp_record_routing_decision takes explicit kwargs; unknown keys would TypeError."""
+        accepted = {
+            "alert_id",
+            "model_selected",
+            "context_json",
+            "context_bucket",
+            "confidence",
+            "domain",
+            "severity",
+            "agreement_level",
+            "routing_mode",
+            "prediction_id",
+            "shadow_model_selected",
+            "cascade_pick_mu",
+            "shadow_pick_mu",
+            "cascade_pick_n_obs",
+            "shadow_pick_n_obs",
+            "cascade_explored",
+        }
+        rows = self._post(
+            tmp_path,
+            {"PROXY_EXPLORE_RATE": "0"},
+            {"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert set(rows[0]) <= accepted, f"unknown keys: {set(rows[0]) - accepted}"
+
+    def test_correlation_id_matches_the_response_header(self, tmp_path) -> None:
+        """context_json.chat_request_id is the documented join key for outcomes."""
+        import json as _json
+
+        mock = MagicMock()
+        mock.complete_multi.return_value = _mock_completion()
+        mock.complete.return_value = _mock_completion(text="1 0")
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": "sk-test",
+                    "GEMINI_API_KEY": "gm-test",
+                    "PROXY_ROUTING_INBOX_DIR": str(tmp_path),
+                    "PROXY_EXPLORE_RATE": "0",
+                },
+            ),
+            patch.object(_proxy, "get_client", return_value=mock),
+            TestClient(app) as c,
+        ):
+            resp = c.post(
+                "/v1/chat/completions",
+                json={"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        header_id = resp.headers["X-PDP-Prediction-Id"]
+        row = self._rows(tmp_path)[0]
+        assert _json.loads(row["context_json"])["chat_request_id"] == header_id
+        assert row["alert_id"] == f"chat-{header_id}"
+        assert row["prediction_id"] == 0
+
+
 class TestErrorResponseShape:
     """Errors must be OpenAI-compatible and valid JSON.
 
@@ -304,6 +565,7 @@ class TestEffortRouting:
         False,  # search_intent
         "",  # system
         [ChatMessage(role="user", content="hard")],  # non_system
+        _proxy._RouteProvenance(mode="cascade", explored=False),  # provenance
     )
 
     def _mock_client(self) -> MagicMock:
@@ -361,6 +623,7 @@ class TestEffortRouting:
             False,
             "",
             [ChatMessage(role="user", content="easy")],
+            _proxy._RouteProvenance(mode="cascade", explored=False),
         ),
     )
     @patch("pdp_router._proxy.get_client")
@@ -916,13 +1179,16 @@ class TestTrustCache:
         assert weights["claude-haiku-4-5-20251001"] == 0.72
         assert weights["gemini-2.5-flash"] == 0.65
 
-    def test_initializes_last_check_to_monotonic(self) -> None:
-        import time
+    def test_first_poll_is_not_throttled(self) -> None:
+        """The poll clock starts un-primed so the first read actually happens.
 
-        before = time.monotonic()
+        This previously asserted _last_check == monotonic(), which pinned the
+        cold-start bug in place: priming the clock to "now" made the 5-second
+        throttle swallow the first call and return the empty initial value.
+        """
         cache = TrustCache("/tmp/nonexistent.db")
-        after = time.monotonic()
-        assert before <= cache._last_check <= after
+        assert cache._last_poll == float("-inf")
+        assert cache._last_read == float("-inf")
 
     def test_expands_canonical_to_live_alias(self, tmp_path) -> None:
         """Post-S62 the table holds canonical keys; cache fans them back out
@@ -1853,7 +2119,9 @@ class TestSearchIntentGateAndFloor:
         assert _has_search_intent([]) is False
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
-    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
     @patch("pdp_router._proxy.get_client")
     def test_floor_haiku_to_sonnet(self, mock_get_client, _mock_cascade, _mock_ws, client) -> None:
         """Search intent + flag on + cascade picked Haiku -> floored to Sonnet."""
@@ -1874,7 +2142,7 @@ class TestSearchIntentGateAndFloor:
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch(
         "pdp_router._proxy.confidence_cascade",
-        return_value="meta/llama-4-scout-17b-16e-instruct-maas",
+        return_value=("meta/llama-4-scout-17b-16e-instruct-maas", False),
     )
     @patch("pdp_router._proxy.get_client")
     def test_floor_meta_llama_to_sonnet(
@@ -1898,7 +2166,9 @@ class TestSearchIntentGateAndFloor:
         assert resp.json()["model"] == "claude-sonnet-4-6"
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=False)
-    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
     @patch("pdp_router._proxy.get_client")
     def test_no_floor_when_web_search_off(
         self, mock_get_client, _mock_cascade, _mock_ws, client
@@ -1919,7 +2189,7 @@ class TestSearchIntentGateAndFloor:
         assert resp.json()["model"] == "claude-haiku-4-5-20251001"
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
-    @patch("pdp_router._proxy.confidence_cascade", return_value="gemini-2.5-pro")
+    @patch("pdp_router._proxy.confidence_cascade", return_value=("gemini-2.5-pro", False))
     @patch("pdp_router._proxy.get_client")
     def test_no_floor_when_already_searcher(
         self, mock_get_client, _mock_cascade, _mock_ws, client
@@ -1942,7 +2212,9 @@ class TestSearchIntentGateAndFloor:
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
     @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
-    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
     @patch("pdp_router._proxy.get_client")
     def test_search_intent_skips_panel_and_floors(
         self, mock_get_client, _mock_cascade, _mock_classify, _mock_panel, _mock_ws, client
@@ -2016,7 +2288,9 @@ class TestSearchIntentGateAndFloor:
         assert resp.json()["model"] == "claude-haiku-4-5-20251001"
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
-    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
     @patch("pdp_router._proxy.get_client")
     def test_routing_row_records_search_intent(
         self, mock_get_client, _mock_cascade, _mock_ws, client, inbox_dir
@@ -2041,7 +2315,7 @@ class TestSearchIntentGateAndFloor:
         assert _json.loads(rows[0]["context_json"])["search_intent"] is True
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
-    @patch("pdp_router._proxy.confidence_cascade", return_value="gemini-2.5-flash-lite")
+    @patch("pdp_router._proxy.confidence_cascade", return_value=("gemini-2.5-flash-lite", False))
     @patch("pdp_router._proxy.get_client")
     def test_floor_flash_lite_to_sonnet(
         self, mock_get_client, _mock_cascade, _mock_ws, client
@@ -2061,7 +2335,7 @@ class TestSearchIntentGateAndFloor:
         assert resp.json()["model"] == "claude-sonnet-4-6"
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
-    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-opus-4-8")
+    @patch("pdp_router._proxy.confidence_cascade", return_value=("claude-opus-4-8", False))
     @patch("pdp_router._proxy.get_client")
     def test_no_floor_when_opus(self, mock_get_client, _mock_cascade, _mock_ws, client) -> None:
         """A low-confidence Opus cascade pick already searches -> left untouched."""
@@ -2081,7 +2355,9 @@ class TestSearchIntentGateAndFloor:
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
     @patch("pdp_router._proxy._classify_request", return_value=(0.95, 1, 3))
-    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
     @patch("pdp_router._proxy.get_client")
     def test_floor_without_panel_when_low_panel_score(
         self, mock_get_client, _mock_cascade, _mock_classify, _mock_panel, _mock_ws, client
@@ -2105,7 +2381,9 @@ class TestSearchIntentGateAndFloor:
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
-    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
     @patch("pdp_router._proxy.get_client")
     def test_streaming_search_intent_floors_and_searches(
         self, mock_get_client, _mock_cascade, _mock_classify, _mock_streaming, _mock_ws, client
@@ -2136,7 +2414,9 @@ class TestSearchIntentGateAndFloor:
         assert "claude-sonnet-4-6" in resp.text
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
-    @patch("pdp_router._proxy.confidence_cascade", return_value="claude-haiku-4-5-20251001")
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
     @patch("pdp_router._proxy.get_client")
     def test_routing_row_records_search_intent_false(
         self, mock_get_client, _mock_cascade, _mock_ws, client, inbox_dir
