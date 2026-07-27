@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -729,6 +730,35 @@ async def _openai_error_handler(request: Request, exc: HTTPException) -> JSONRes
             error=ErrorDetail(message=str(detail), type=error_type)
         ).model_dump()
     return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def _openai_validation_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Render request-validation failures in the same OpenAI error envelope.
+
+    FastAPI's default emits {"detail": [ ... ]}, so without this the surface is
+    inconsistent: a client could parse a routing error but not a malformed-request
+    error. Real OpenAI returns the envelope for both. The field path is folded
+    into the message because that is the part worth reading, and the raw error
+    list has no place in an OpenAI-shaped body.
+    """
+    problems = []
+    for err in exc.errors():
+        # loc starts with "body"/"query"; drop it, the rest is the field path.
+        path = ".".join(str(p) for p in err.get("loc", ()) if p != "body")
+        msg = err.get("msg", "invalid value")
+        problems.append(f"{path}: {msg}" if path else msg)
+    return JSONResponse(
+        status_code=422,
+        content=ErrorResponse(
+            error=ErrorDetail(
+                message="; ".join(problems) or "invalid request",
+                type="invalid_request_error",
+            )
+        ).model_dump(),
+    )
 
 
 def _configured_providers(config: ProxyConfig) -> dict[str, bool]:

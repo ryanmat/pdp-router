@@ -421,6 +421,34 @@ class TestErrorResponseShape:
         assert body["error"]["type"] == "billing_error"
         assert "out of credits" in body["error"]["message"]
 
+    def test_validation_errors_are_openai_shaped_too(self, client) -> None:
+        """422s must carry the same {"error": {...}} envelope as every other error.
+
+        The HTTPException handler covered raise sites but not pydantic
+        validation, so a malformed request still returned FastAPI's
+        {"detail": [...]}. That left the surface inconsistent: an OpenAI client
+        could parse a routing error and not a bad-request error. Real OpenAI
+        returns the error envelope for both.
+        """
+        resp = client.post(
+            "/openai/v1/chat/completions",
+            json={"model": "pdp-auto", "messages": [{"role": "user", "content": None}]},
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "detail" not in body
+        assert body["error"]["type"] == "invalid_request_error"
+        assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+
+    def test_validation_error_message_keeps_the_field_path(self, client) -> None:
+        """Losing which field failed would make the envelope useless for debugging."""
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "pdp-auto", "messages": [{"role": "user"}]},
+        )
+        assert resp.status_code == 422
+        assert "content" in resp.json()["error"]["message"]
+
     def test_error_body_has_no_python_repr(self, client) -> None:
         """Regression guard: the old shape embedded "{'error': {'message': ...}}"."""
         resp = client.post(
