@@ -60,6 +60,18 @@ class CreditExhaustionError(Exception):
     """Raised when an LLM API indicates credit exhaustion or billing failure."""
 
 
+class UpstreamStreamError(Exception):
+    """Raised when a provider signals a failure inside an already-200 stream.
+
+    An OpenAI-compatible provider can accept a request, flush 200 headers, stream
+    several content deltas, then fail and say so as a `data: {"error": ...}`
+    frame. The status guard cannot catch it, because the status was 200 before
+    the failure happened, and the frame carries no `choices`, so a parser that
+    only reads choices drops it and the turn ends as though it had completed --
+    a truncated answer handed to the caller as a clean one.
+    """
+
+
 def canonicalize_model_id(model_id: str) -> str:
     """Map a raw or dated model alias to a stable canonical key.
 

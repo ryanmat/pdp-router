@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -19,7 +20,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError, model_validator
 
 from pdp_router._clients import CompletionResult, get_client
 from pdp_router._effort import level_for_score, supports_effort
@@ -27,7 +28,9 @@ from pdp_router._lineage import classify_lineage
 from pdp_router._models import (
     GEMINI_FLASH,
     GEMINI_PRO,
+    GPT_5_5,
     OPUS,
+    QWEN_3_7_PLUS,
     SONNET,
     CreditExhaustionError,
     expand_canonical_to_live,
@@ -42,7 +45,8 @@ from pdp_router._panel import (
 )
 from pdp_router._proxy_config import ProxyConfig
 from pdp_router._router import DEFAULT_REGISTRY, bandit_branch_active, confidence_cascade
-from pdp_router._tracing import init_tracing, shutdown_tracing
+from pdp_router._tools import StreamFinish, ToolCallDelta, ToolTranslationError
+from pdp_router._tracing import SERVICE_VERSION, init_tracing, shutdown_tracing
 from pdp_router._utils import strip_markdown_fences
 
 log = logging.getLogger(__name__)
@@ -176,6 +180,24 @@ def _panel_streaming_enabled() -> bool:
     )
 
 
+def _tool_passthrough_enabled() -> bool:
+    """Return True if pipeline.proxy_tool_passthrough_enabled is on (default False).
+
+    Gates OpenAI-compatible tool-call passthrough on the /openai/v1 faithful
+    surface: `tools`/`tool_choice` in, assistant `tool_calls` out, so a strict
+    agent client can run its own tools while the proxy still routes the model.
+    When off, /openai/v1 behaves exactly as it does today -- tool fields are
+    dropped and every request takes the plain path. Default OFF because turning
+    it on makes the surface tool-capable for any client, not just the one it was
+    built for. /v1 is never affected either way.
+    """
+    return _flag_enabled(
+        "pipeline.proxy_tool_passthrough_enabled",
+        "PROXY_TOOL_PASSTHROUGH_ENABLED",
+        default=False,
+    )
+
+
 # A model with a web_search/grounding tool attached still DECIDES whether to use
 # it; without an explicit nudge it often answers from training and claims it
 # cannot browse. Appended to the system prompt on the cascade path when web
@@ -237,6 +259,108 @@ class ErrorResponse(BaseModel):
     error: ErrorDetail
 
 
+# -- Tool-call models, used by the /openai/v1 faithful surface only --
+#
+# Subclasses rather than new fields on the models above, so /v1 keeps its exact
+# request contract and its responses stay incapable of carrying a tool field.
+# No ConfigDict anywhere in the chain, which keeps pydantic's extra="ignore" in
+# force: a strict agent client sends temperature/top_p/stream_options and must
+# keep getting them dropped rather than rejected.
+
+
+class FunctionCallSpec(BaseModel):
+    name: str
+    # Raw JSON text. Never parsed at the schema layer -- a payload truncated by
+    # max_tokens has to reach the translation layer, which owns that error,
+    # rather than failing here as a malformed request.
+    arguments: str
+
+
+class ToolCallSpec(BaseModel):
+    id: str
+    type: str = "function"
+    function: FunctionCallSpec
+
+
+class LenientToolChatMessage(ChatMessage):
+    """The message shape /openai/v1 binds: tool fields carried, not checked.
+
+    The endpoint cannot bind ToolChatMessage below, because FastAPI validates in
+    its dependency layer -- which runs before the passthrough flag is read. A
+    malformed tool call would then be refused even with passthrough OFF, where
+    those fields are dropped and the request has always been served. Carrying
+    them as Any preserves that answer; _validate_tool_request applies the strict
+    shape once the flag is on.
+    """
+
+    # Defaulted, not merely nullable: OpenAI clients omit the key entirely on a
+    # tool_calls turn rather than sending null.
+    content: str | None = None
+    tool_calls: Any = None
+    # Set on a role:"tool" turn to bind the result back to the call it answers.
+    tool_call_id: Any = None
+    name: Any = None
+
+    @model_validator(mode="after")
+    def _require_content_or_tool_calls(self) -> LenientToolChatMessage:
+        """Reject a message that carries neither text nor tool calls.
+
+        Widening content to nullable would otherwise let an empty turn through to
+        a provider, which rejects it less helpfully and a good deal later. The
+        message text is user-visible: both _openai_validation_handler and
+        _validate_tool_request prefix it with the field path, so it has to read
+        well as "messages.0: Value error, <this>" and has to name the field.
+        """
+        if self.content is None and not self.tool_calls:
+            raise ValueError("content is required unless the message carries tool_calls")
+        return self
+
+
+class ToolChatMessage(LenientToolChatMessage):
+    """The faithful message shape, applied when tool passthrough is on."""
+
+    tool_calls: list[ToolCallSpec] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
+
+
+class LenientToolChatCompletionRequest(ChatCompletionRequest):
+    """The request /openai/v1 binds. Same reason as LenientToolChatMessage."""
+
+    messages: list[LenientToolChatMessage]
+    tools: Any = None
+    tool_choice: Any = None
+    parallel_tool_calls: Any = None
+
+
+class ToolChatCompletionRequest(LenientToolChatCompletionRequest):
+    messages: list[ToolChatMessage]
+    # Passed through verbatim. Modelling the JSON-Schema internals would mean
+    # re-implementing a spec the provider already validates, and any gap between
+    # the two would reject tools that actually work.
+    tools: list[dict] | None = None
+    tool_choice: str | dict | None = None
+    parallel_tool_calls: bool | None = None
+
+
+class ToolResponseMessage(ChatMessage):
+    content: str | None = None
+    tool_calls: list[ToolCallSpec] | None = None
+
+
+class ToolChatCompletionChoice(ChatCompletionChoice):
+    # Narrowing this annotation is load-bearing, not tidiness. Pydantic serializes
+    # a field through its ANNOTATED type, so a ToolResponseMessage left in the
+    # inherited `message: ChatMessage` slot dumps without tool_calls -- silently,
+    # no error and no warning.
+    message: ToolResponseMessage
+
+
+class ToolChatCompletionResponse(ChatCompletionResponse):
+    # Same reason as the choice above, one level up.
+    choices: list[ToolChatCompletionChoice]
+
+
 # -- Web-search intent gating --
 
 # Models that reliably honor an attached web-search / grounding tool: Anthropic
@@ -287,7 +411,10 @@ def _has_search_intent(messages: list[ChatMessage]) -> bool:
     Mirrors the classifier's latest-user-only convention. Deterministic regex,
     not an LLM call, so it adds no latency, cost, or test-mock surface.
     """
-    user_msgs = [m.content for m in messages if m.role == "user"]
+    # `or ""` because a ToolChatMessage carrying tool_calls may omit content
+    # entirely, and this runs before the with-tools branch is reached. A no-op
+    # for /v1, whose model still requires a string.
+    user_msgs = [m.content or "" for m in messages if m.role == "user"]
     if not user_msgs:
         return False
     return bool(_SEARCH_INTENT_RE.search(user_msgs[-1][:2000]))
@@ -309,6 +436,120 @@ def _search_floor_model() -> str | None:
         if cap is not None and cap.available:
             return name
     return None
+
+
+# Tool-call driver floor: the arms tool requests are allowed to route to.
+# Membership is policy, not raw client capability: Gemini, Vertex-Llama and
+# Ollama raise NotImplementedError on any tool request; Haiku's client can
+# serve tools but the spec keeps it out (invariant 5: never receives tool
+# requests); DeepSeek's client can too, but _client_kwargs carries no DeepSeek
+# credential path. Live registry ids in preference order, mirroring
+# _RELIABLE_SEARCHERS.
+_TOOL_DRIVERS: tuple[str, ...] = (SONNET, OPUS, GPT_5_5, QWEN_3_7_PLUS)
+
+
+def _tool_shaped_history(messages: list[ChatMessage]) -> bool:
+    """True when the transcript carries tool results or assistant tool_calls.
+
+    Shared by the pre-route 422 guard and the tool branch so the two cannot
+    disagree about what counts as tool-shaped.
+    """
+    return any(m.role == "tool" or getattr(m, "tool_calls", None) for m in messages)
+
+
+def _first_user_text(messages: list[ChatMessage]) -> str:
+    """Content of the FIRST user message, stripped; "" when none exists.
+
+    The driver pin keys on the first user turn because it is stable for the
+    life of a conversation; the search gate's latest-user convention would
+    re-pin on every turn.
+    """
+    for message in messages:
+        if message.role == "user":
+            return (message.content or "").strip()
+    return ""
+
+
+def _is_usable_tool_driver(model_name: str, config: ProxyConfig) -> bool:
+    """A driver-set member that is neither retired in the registry nor
+    credential-less.
+
+    Composes the registry's availability kill switch with _has_credentials_for
+    -- the same two notions _search_floor_model and _build_client already route
+    by -- rather than inventing a third availability predicate.
+    """
+    if model_name not in _TOOL_DRIVERS:
+        return False
+    cap = DEFAULT_REGISTRY.get(model_name)
+    return cap is not None and cap.available and _has_credentials_for(model_name, config)
+
+
+def _tool_pin_digest(first_user_text: str) -> str:
+    """sha256 hexdigest of the conversation pin key.
+
+    The single source for both consumers: the driver walk indexes
+    int(digest, 16) % len(_TOOL_DRIVERS) and the routing row records
+    digest[:8] as tool_pin_key, so the two cannot drift apart.
+    """
+    return hashlib.sha256(first_user_text.encode("utf-8")).hexdigest()
+
+
+def _tool_driver_model(first_user_text: str, config: ProxyConfig) -> str | None:
+    """Return the pinned usable tool driver for this conversation, or None.
+
+    sha256 of the first user text picks a starting index into the FULL driver
+    tuple, then the walk moves forward with wrap-around past unusable drivers.
+    Indexing before filtering keeps the start index independent of driver
+    state: a conversation pinned to a usable driver never moves when OTHER
+    drivers gain or lose keys. (A conversation already walked past its pin is
+    degraded mode; its landing spot follows the rest of the roster.) None
+    means no driver is usable; the caller keeps the cascade pick and the
+    client's NotImplementedError surfaces on the existing faithful error path
+    rather than this floor inventing a dead route.
+    """
+    start = int(_tool_pin_digest(first_user_text), 16) % len(_TOOL_DRIVERS)
+    for offset in range(len(_TOOL_DRIVERS)):
+        model_name = _TOOL_DRIVERS[(start + offset) % len(_TOOL_DRIVERS)]
+        if _is_usable_tool_driver(model_name, config):
+            return model_name
+    return None
+
+
+def _tool_row_context(
+    request: ChatCompletionRequest,
+    non_system: list[ChatMessage],
+    *,
+    model_selected: str,
+    cascade_pick: str | None,
+) -> dict[str, Any]:
+    """Request-side observability fields for a tools routing row.
+
+    Everything rides inside context_json -- the drain takes explicit kwargs, so
+    top-level row keys are closed -- and every field is omit-when-absent (the
+    cascade_explored precedent): model_cascade_pick and tool_pin_key exist only
+    for routed picks (an explicit pin consulted neither), tool_choice only when
+    the caller sent one, and provider_path only for the two driver families (a
+    degraded no-driver pick has no translation path to name).
+    """
+    tools = getattr(request, "tools", None) or []
+    context: dict[str, Any] = {
+        "tools_present": bool(tools),
+        "tool_count": len(tools),
+        "loop_depth": sum(
+            1 for m in non_system if m.role == "assistant" and getattr(m, "tool_calls", None)
+        ),
+    }
+    tool_choice = getattr(request, "tool_choice", None)
+    if tool_choice is not None:
+        context["tool_choice"] = str(tool_choice)
+    if cascade_pick is not None:
+        context["model_cascade_pick"] = cascade_pick
+        context["tool_pin_key"] = _tool_pin_digest(_first_user_text(non_system))[:8]
+    if model_selected.startswith("claude-"):
+        context["provider_path"] = "anthropic-translated"
+    elif model_selected.startswith("openai/") or model_selected.startswith("qwen"):
+        context["provider_path"] = "openai-native"
+    return context
 
 
 # -- Classification --
@@ -405,7 +646,7 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
     # about) when history exceeds the cap. Caught empirically post-X.K
     # ship 2026-05-23: bot multi-turn DMs to a complex query were getting
     # panel_score=0 because the new query had been truncated out.
-    user_msgs = [m.content for m in messages if m.role == "user"]
+    user_msgs = [m.content or "" for m in messages if m.role == "user"]
     user_text = (user_msgs[-1] if user_msgs else "")[:2000]
     retries = int(os.getenv("PROXY_CLASSIFY_RETRIES", "2"))
     backoff = float(os.getenv("PROXY_CLASSIFY_RETRY_BACKOFF_S", "0.2"))
@@ -709,7 +950,9 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
         shutdown_tracing()
 
 
-app = FastAPI(title="PDP Router Proxy", version="0.1.0", lifespan=_lifespan)
+# Real package metadata, not a literal: the deploy gate reads /health's version
+# to prove which build is serving, so a hardcoded string here would lie.
+app = FastAPI(title="PDP Router Proxy", version=SERVICE_VERSION, lifespan=_lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -744,21 +987,33 @@ async def _openai_validation_handler(
     into the message because that is the part worth reading, and the raw error
     list has no place in an OpenAI-shaped body.
     """
-    problems = []
-    for err in exc.errors():
-        # loc starts with "body"/"query"; drop it, the rest is the field path.
-        path = ".".join(str(p) for p in err.get("loc", ()) if p != "body")
-        msg = err.get("msg", "invalid value")
-        problems.append(f"{path}: {msg}" if path else msg)
     return JSONResponse(
         status_code=422,
         content=ErrorResponse(
             error=ErrorDetail(
-                message="; ".join(problems) or "invalid request",
+                message=_fold_validation_problems(exc.errors()),
                 type="invalid_request_error",
             )
         ).model_dump(),
     )
+
+
+def _fold_validation_problems(errors: list[Any]) -> str:
+    """Fold pydantic error records into one OpenAI-shaped message string.
+
+    Shared so a validation failure reads the same whether FastAPI's dependency
+    layer raised it or _validate_tool_request did, which is what lets tool
+    validation move behind the flag without changing the body a client sees.
+    """
+    problems = []
+    for err in errors:
+        # loc starts with "body"/"query" from the dependency layer and with the
+        # field itself from a direct model_validate; dropping "body" makes both
+        # produce the same path.
+        path = ".".join(str(p) for p in err.get("loc", ()) if p != "body")
+        msg = err.get("msg", "invalid value")
+        problems.append(f"{path}: {msg}" if path else msg)
+    return "; ".join(problems) or "invalid request"
 
 
 def _configured_providers(config: ProxyConfig) -> dict[str, bool]:
@@ -804,6 +1059,7 @@ async def health() -> dict:
     config = _config if _config is not None else ProxyConfig()
     return {
         "status": "ok",
+        "version": SERVICE_VERSION,
         "models": len(DEFAULT_REGISTRY.available_models()),
         "providers": _configured_providers(config),
         "trust_db": _trust_db_status(config),
@@ -851,6 +1107,8 @@ async def list_models() -> dict:
 
 def _route_request(
     request: ChatCompletionRequest,
+    *,
+    for_tools: bool = False,
 ) -> tuple[str, float, int, int, bool, str, list[ChatMessage], _RouteProvenance]:
     """Apply classification and routing.
 
@@ -862,13 +1120,19 @@ def _route_request(
     provenance carries which policy actually produced the pick, so the routing
     row records the executed mode rather than a hardcoded guess.
 
+    for_tools suppresses the search-intent capability floor: a tools request
+    never attaches proxy web search (the tool branch returns above that), so
+    flooring its pick to a searcher would only override the driver pin for no
+    benefit. search_intent is still computed and recorded; only the model
+    rewrite is skipped.
+
     Raises HTTPException(400) on unknown explicit model.
     """
     assert _config is not None
     assert _trust_cache is not None
     assert _bandit_cache is not None
 
-    system_parts = [m.content for m in request.messages if m.role == "system"]
+    system_parts = [m.content or "" for m in request.messages if m.role == "system"]
     system = "\n".join(system_parts) if system_parts else ""
     non_system = [m for m in request.messages if m.role != "system"]
 
@@ -907,7 +1171,7 @@ def _route_request(
         # forcing a down model (that would defeat route_with_fallback's
         # availability contract).
         search_intent = _web_search_enabled() and _has_search_intent(non_system)
-        if search_intent and not _is_reliable_searcher(model_name):
+        if search_intent and not for_tools and not _is_reliable_searcher(model_name):
             floor_model = _search_floor_model()
             if floor_model is not None:
                 log.info(
@@ -1064,6 +1328,7 @@ def _make_routing_row(
     search_intent: bool = False,
     role: str | None = None,
     explored: bool | None = None,
+    tool_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one routing-decisions row matching pdp-tracker's record_routing_decision schema.
 
@@ -1086,6 +1351,10 @@ def _make_routing_row(
     not epsilon-greedy exploration (see confidence_cascade's return_debug).
     `explored=None` omits the key entirely, for rows where the concept does not
     apply at all -- panel members, the chair, and caller-pinned models.
+
+    `tool_context` merges the tools-request observability fields (built by
+    _tool_row_context, plus the post-completion fields on the non-stream leg)
+    into context_json; None keeps non-tool rows exactly as they are.
     """
     context: dict[str, Any] = {
         "chat_request_id": chat_request_id,
@@ -1095,6 +1364,8 @@ def _make_routing_row(
     }
     if role is not None:
         context["role"] = role
+    if tool_context is not None:
+        context.update(tool_context)
     row: dict[str, Any] = {
         "alert_id": f"chat-{chat_request_id}",
         "model_selected": model_selected,
@@ -1214,6 +1485,191 @@ def _execute_single(
                 index=0,
                 message=ChatMessage(role="assistant", content=content),
                 finish_reason="stop",
+            )
+        ],
+        usage=Usage(
+            prompt_tokens=result.input_tokens,
+            completion_tokens=result.output_tokens,
+            total_tokens=result.input_tokens + result.output_tokens,
+        ),
+    )
+
+
+def _reject_tool_shaped_messages(request: ChatCompletionRequest) -> None:
+    """Re-reject a tool_calls turn that carries no content, when passthrough is off.
+
+    Widening the /openai/v1 annotation is itself what changes flag-off behavior:
+    LenientToolChatMessage defaults content to None, so a shape that 422s under
+    the legacy models would start parsing, and the legacy path would drop its
+    tool_calls and hand the model a gutted transcript -- plausible output from a
+    request the caller never made. The ruling (2026-07-27) is to keep the legacy
+    answer exactly: 422, same envelope, before any routing happens.
+
+    Raised ahead of _route_request so a request that has never reached the
+    handler still costs no classifier call.
+    """
+    for index, message in enumerate(request.messages):
+        if getattr(message, "tool_calls", None) and message.content is None:
+            raise HTTPException(
+                status_code=422,
+                detail=ErrorResponse(
+                    error=ErrorDetail(
+                        message=(
+                            f"messages.{index}: content is required because tool "
+                            "passthrough is disabled on this proxy"
+                        ),
+                        type="invalid_request_error",
+                    )
+                ).model_dump(),
+            )
+
+
+def _validate_tool_request(request: ChatCompletionRequest) -> ToolChatCompletionRequest:
+    """Apply the faithful tool schema to a leniently-bound request.
+
+    /openai/v1 binds LenientToolChatCompletionRequest so that the flag-off answer
+    for a malformed tool-shaped payload stays what it has always been: the fields
+    are dropped and the request is served. Validating them at the annotation
+    instead would run in FastAPI's dependency layer, before the flag is read, and
+    turn those requests into 422s on a surface whose contract promises identity.
+
+    No strictness is lost -- it moves here, behind the flag, where it guards the
+    requests that actually carry tools to a provider. Every shape the annotation
+    refused is still refused, with the same status and the same envelope, and the
+    field path is folded by the same helper the dependency layer uses.
+
+    What does change is the pydantic message clause, which the contract excludes:
+    model_validate reports a mismatch as "or instance of ToolCallSpec" where the
+    dependency layer says "or object to extract fields from", and a payload that
+    already fails the lenient bind is refused there, so its tool-field problems
+    are never reached and the message lists fewer of them.
+
+    Raises:
+        HTTPException: 422, in the OpenAI error envelope, on a payload that does
+            not match the faithful shape.
+    """
+    try:
+        return ToolChatCompletionRequest.model_validate(request.model_dump())
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=ErrorResponse(
+                error=ErrorDetail(
+                    message=_fold_validation_problems(e.errors()),
+                    type="invalid_request_error",
+                )
+            ).model_dump(),
+        ) from e
+
+
+def _execute_single_with_tools(
+    *,
+    request: ChatCompletionRequest,
+    client: object,
+    model_name: str,
+    confidence: float,
+    score: int,
+    system: str,
+    non_system: list[ChatMessage],
+    start: float,
+    effort: str | None = None,
+) -> ChatCompletionResponse:
+    """Single-model execution for a request carrying tools or tool results.
+
+    A sibling of _execute_single rather than a mode on it: that path hardcodes
+    finish_reason "stop" and always emits a string content, and both have to
+    stay exactly as they are for /v1 and every non-tool request. Web search is
+    never attached here -- it would replace the caller's own tools.
+    """
+    # exclude_none drops an absent content key rather than sending null, which
+    # is the shape OpenAI clients themselves send on a tool_calls turn.
+    messages = [m.model_dump(exclude_none=True) for m in non_system]
+    try:
+        result: CompletionResult = client.complete_with_tools(  # type: ignore[attr-defined]
+            system=system,
+            messages=messages,
+            tools=getattr(request, "tools", None) or [],
+            tool_choice=getattr(request, "tool_choice", None),
+            max_tokens=request.max_tokens,
+            effort=effort,
+            parallel_tool_calls=getattr(request, "parallel_tool_calls", None),
+        )
+    except CreditExhaustionError as e:
+        raise HTTPException(
+            status_code=402,
+            detail=ErrorResponse(
+                error=ErrorDetail(message=str(e), type="billing_error")
+            ).model_dump(),
+        ) from e
+    except ToolTranslationError as e:
+        # The caller's payload cannot be expressed to this provider, which is a
+        # bad request rather than a proxy fault.
+        raise HTTPException(
+            status_code=400,
+            detail=ErrorResponse(
+                error=ErrorDetail(message=str(e), type="invalid_request_error")
+            ).model_dump(),
+        ) from e
+    except Exception as e:
+        log.exception("Tool completion failed on %s", model_name)
+        raise HTTPException(
+            status_code=503,
+            detail=ErrorResponse(
+                error=ErrorDetail(message=f"Completion failed: {e}", type="server_error")
+            ).model_dump(),
+        ) from e
+
+    elapsed = time.monotonic() - start
+    log.info(
+        "Routed (tools): score=%d conf=%.2f effort=%s model=%s finish=%s calls=%d "
+        "tokens=%d/%d cost=$%.6f latency=%.2fs",
+        score,
+        confidence,
+        effort or "-",
+        model_name,
+        result.finish_reason,
+        len(result.tool_calls),
+        result.input_tokens,
+        result.output_tokens,
+        result.estimated_cost_usd,
+        elapsed,
+    )
+
+    # Only on a turn that claims to have finished answering. A tool-only turn
+    # has no text by design, and warning on it would fire on every tool call.
+    if result.finish_reason == "stop" and not (result.text or "").strip():
+        log.warning(
+            "Empty content from %s (input_tokens=%d, output_tokens=%d) -- "
+            "likely safety filter or no-output condition. concerns.md item 27.",
+            model_name,
+            result.input_tokens,
+            result.output_tokens,
+        )
+
+    tool_calls = [
+        ToolCallSpec(
+            id=call.id,
+            type="function",
+            function=FunctionCallSpec(name=call.name, arguments=call.arguments),
+        )
+        for call in result.tool_calls
+    ]
+    return ToolChatCompletionResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        object="chat.completion",
+        created=int(time.time()),
+        model=model_name,
+        choices=[
+            ToolChatCompletionChoice(
+                index=0,
+                message=ToolResponseMessage(
+                    role="assistant",
+                    # null rather than "" on a tool-only turn: the OpenAI shape,
+                    # and what a strict client expects alongside tool_calls.
+                    content=result.text or None,
+                    tool_calls=tool_calls or None,
+                ),
+                finish_reason=result.finish_reason,
             )
         ],
         usage=Usage(
@@ -1553,6 +2009,34 @@ async def _handle_chat(
     response.headers["X-PDP-Prediction-Id"] = chat_request_id
 
     try:
+        tool_passthrough = openai_faithful and _tool_passthrough_enabled()
+        if tool_passthrough:
+            # Both branches run ahead of _route_request so a refused request
+            # still costs no classifier call.
+            request = _validate_tool_request(request)
+            if _tool_shaped_history(request.messages) and not getattr(request, "tools", None):
+                # Anthropic rejects tool blocks without a tools param, and the
+                # legacy path may never receive tool-shaped messages: fail loud
+                # here instead of leaking a confusing provider 400 downstream.
+                raise HTTPException(
+                    status_code=422,
+                    detail=ErrorResponse(
+                        error=ErrorDetail(
+                            message="tool history requires tools",
+                            type="invalid_request_error",
+                        )
+                    ).model_dump(),
+                )
+        elif openai_faithful:
+            _reject_tool_shaped_messages(request)
+
+        # A request that will take the tool branch is routed with the search
+        # floor suppressed: web search never attaches to a tools request, so
+        # flooring its pick to a searcher would only override the driver pin.
+        tools_active = tool_passthrough and (
+            bool(getattr(request, "tools", None)) or _tool_shaped_history(request.messages)
+        )
+
         (
             model_name,
             confidence,
@@ -1562,7 +2046,24 @@ async def _handle_chat(
             system,
             non_system,
             provenance,
-        ) = _route_request(request)
+        ) = _route_request(request, for_tools=tools_active)
+
+        # Deterministic effort dial (default off). Map the classifier complexity
+        # score to a reasoning-effort level for the arms that support one. Only for
+        # pdp-auto routed picks -- explicit-model requests carry no real score
+        # (score=0) -- and only when supports_effort gates the model in. None means
+        # "leave the knob unset" (the no-dial arms: Gemini, DeepSeek, Llama, Haiku).
+        effort_level: str | None = None
+        if (
+            _effort_routing_enabled()
+            and request.model in ("pdp-auto", "")
+            and supports_effort(model_name)
+        ):
+            effort_level = level_for_score(
+                score,
+                low_max=_config.effort_score_low_max,
+                high_min=_config.effort_score_high_min,
+            )
 
         effective_stream = request.stream and _streaming_enabled()
         panel_base = (
@@ -1570,6 +2071,180 @@ async def _handle_chat(
             and _autopanel_enabled()
             and panel_score >= int(os.getenv("PROXY_AUTOPANEL_THRESHOLD", "7"))
         )
+        # Tool passthrough pre-empts everything below: no panel (members are
+        # text-only forever) and no proxy web search (attaching it would replace
+        # the caller's tools). Keyed on tool-shaped HISTORY as well as a tools
+        # param, so a transcript carrying tool_calls or tool results can never
+        # fall down the legacy path and have those fields silently dropped.
+        if tool_passthrough:
+            tools_present = bool(getattr(request, "tools", None))
+            if tools_present or _tool_shaped_history(request.messages):
+                # The policy's own pick before any override or floor; None for
+                # an explicit request, where the caller picked and no cascade
+                # ran. Feeds model_cascade_pick/tool_pin_key on the routing row.
+                routed_pick: str | None = None
+                if request.model and request.model != "pdp-auto":
+                    # The caller's explicit pick is honored inside the driver
+                    # set and refused outside it -- routing must not silently
+                    # replace a model the caller named.
+                    if request.model not in _TOOL_DRIVERS:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=ErrorResponse(
+                                error=ErrorDetail(
+                                    message=(
+                                        f"{request.model} does not support tool calls on this proxy"
+                                    ),
+                                    type="invalid_request_error",
+                                )
+                            ).model_dump(),
+                        )
+                else:
+                    # Driver floor on the routed path: the pick came from
+                    # policy, so a pick that is not a usable driver is replaced,
+                    # never refused. PROXY_TOOL_MODEL is the operator override
+                    # and beats the pin and any driver pick; an unusable value
+                    # degrades to the pin walk instead of failing the request.
+                    routed_pick = model_name
+                    override = os.getenv("PROXY_TOOL_MODEL", "").strip()
+                    if override and _is_usable_tool_driver(override, _config):
+                        model_name = override
+                    else:
+                        if override:
+                            log.warning(
+                                "PROXY_TOOL_MODEL=%s is not a usable tool driver; ignoring",
+                                override,
+                            )
+                        # Usability, not bare membership: a driver that is
+                        # retired (available=False) or credential-less must also
+                        # be walked past, or it would be dispatched and fail.
+                        if not _is_usable_tool_driver(model_name, _config):
+                            driver = _tool_driver_model(_first_user_text(non_system), _config)
+                            if driver is not None:
+                                log.info(
+                                    "Tool-driver floor: %s -> %s (pick is not a usable "
+                                    "tool driver)",
+                                    model_name,
+                                    driver,
+                                )
+                                model_name = driver
+                            else:
+                                # No usable driver at all. Invariant 5 is the
+                                # router's to keep, not the client's: leaving a
+                                # non-driver pick here would dispatch a tool
+                                # request to whatever the cascade chose, and a
+                                # claude-* non-driver (Haiku) would SERVE it
+                                # rather than refuse. Refuse explicitly, before
+                                # any client build or routing row, so the
+                                # guarantee holds for every provider.
+                                log.warning(
+                                    "Tool request but no tool driver is usable; refusing "
+                                    "(cascade pick was %s)",
+                                    model_name,
+                                )
+                                raise HTTPException(
+                                    status_code=503,
+                                    detail=ErrorResponse(
+                                        error=ErrorDetail(
+                                            message=(
+                                                "No tool-capable model is currently available"
+                                            ),
+                                            type="server_error",
+                                        )
+                                    ).model_dump(),
+                                )
+                    if (
+                        model_name != routed_pick
+                        and _effort_routing_enabled()
+                        and supports_effort(model_name)
+                    ):
+                        # The dial ran against the pre-floor pick: a haiku or
+                        # gemini pick computed None while every driver supports
+                        # a level. The search floor gets its level naturally by
+                        # running before the dial; this floor runs after, so it
+                        # recomputes.
+                        effort_level = level_for_score(
+                            score,
+                            low_max=_config.effort_score_low_max,
+                            high_min=_config.effort_score_high_min,
+                        )
+                client = _build_client(model_name)
+                tool_context = _tool_row_context(
+                    request,
+                    non_system,
+                    model_selected=model_name,
+                    cascade_pick=routed_pick,
+                )
+                row_kwargs: dict[str, Any] = {
+                    "chat_request_id": chat_request_id,
+                    "model_selected": model_name,
+                    "routing_mode": provenance.mode,
+                    "context_bucket": "chat:cascade",
+                    "confidence": confidence,
+                    "score": score,
+                    "panel_score": panel_score,
+                    "search_intent": search_intent,
+                    "explored": provenance.explored,
+                }
+                if effective_stream:
+                    # The stream row is written before the body runs, so it
+                    # carries the request-side fields only; the outcome is not
+                    # knowable here.
+                    append_routing_decisions_jsonl(
+                        inbox_dir=_config.routing_inbox_dir,
+                        rows=[_make_routing_row(**row_kwargs, tool_context=tool_context)],
+                    )
+                    stream_response = await _build_tool_stream_response(
+                        model_name=model_name,
+                        client=client,
+                        request=request,
+                        system=system,
+                        non_system=non_system,
+                        score=score,
+                        effort=effort_level,
+                    )
+                    stream_response.headers["X-PDP-Prediction-Id"] = chat_request_id
+                    return stream_response
+                # The non-stream row is written after completion so it can
+                # carry finish_reason/tool_call_count/tool_names. A failed
+                # completion is still a real exposure: its row is written from
+                # the except path, without outcome fields it never produced.
+                try:
+                    tool_response = _execute_single_with_tools(
+                        request=request,
+                        client=client,
+                        model_name=model_name,
+                        confidence=confidence,
+                        score=score,
+                        system=system,
+                        non_system=non_system,
+                        start=start,
+                        effort=effort_level,
+                    )
+                except HTTPException:
+                    # Catches every executor failure because
+                    # _execute_single_with_tools wraps each raise in an
+                    # HTTPException (bare Exception -> 503); the regression
+                    # wall pins that a bare client raise still lands here
+                    # rather than silently dropping the exposure row.
+                    append_routing_decisions_jsonl(
+                        inbox_dir=_config.routing_inbox_dir,
+                        rows=[_make_routing_row(**row_kwargs, tool_context=tool_context)],
+                    )
+                    raise
+                choice = tool_response.choices[0]
+                calls = choice.message.tool_calls or []
+                tool_context.update(
+                    finish_reason=choice.finish_reason,
+                    tool_call_count=len(calls),
+                    tool_names=[call.function.name for call in calls[:8]],
+                )
+                append_routing_decisions_jsonl(
+                    inbox_dir=_config.routing_inbox_dir,
+                    rows=[_make_routing_row(**row_kwargs, tool_context=tool_context)],
+                )
+                return tool_response
+
         if panel_base and search_intent:
             log.info(
                 "Auto-panel skipped for search intent (panel_score=%d); routing to "
@@ -1633,23 +2308,6 @@ async def _handle_chat(
         # so this only reaches the single-model cascade -- the MVP scope.
         web_search_on = _web_search_enabled()
 
-        # Deterministic effort dial (default off). Map the classifier complexity
-        # score to a reasoning-effort level for the arms that support one. Only for
-        # pdp-auto routed picks -- explicit-model requests carry no real score
-        # (score=0) -- and only when supports_effort gates the model in. None means
-        # "leave the knob unset" (the no-dial arms: Gemini, DeepSeek, Llama, Haiku).
-        effort_level: str | None = None
-        if (
-            _effort_routing_enabled()
-            and request.model in ("pdp-auto", "")
-            and supports_effort(model_name)
-        ):
-            effort_level = level_for_score(
-                score,
-                low_max=_config.effort_score_low_max,
-                high_min=_config.effort_score_high_min,
-            )
-
         if request.stream and _streaming_enabled():
             stream_response = await _build_stream_response(
                 model_name=model_name,
@@ -1705,7 +2363,7 @@ async def chat_completions(
 
 @app.post("/openai/v1/chat/completions", response_model=None)
 async def chat_completions_openai(
-    request: ChatCompletionRequest,
+    request: LenientToolChatCompletionRequest,
     response: Response,
 ) -> ChatCompletionResponse | StreamingResponse:
     """OpenAI-faithful chat surface for strict agent clients (e.g. Crush). Streaming
@@ -1746,6 +2404,21 @@ def _chunk_event(
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }
     )
+
+
+def _route_footer_content(model_name: str, score: int, effort: str | None) -> str:
+    """Render the routing footer as a content delta.
+
+    Shared by the plain and with-tools faithful generators so a tool turn that
+    ends in text cannot drift into a different footer than a plain one.
+    """
+    tag = f"[routed: {model_name}"
+    if score:
+        tag += f" | score {score}"
+    if effort:
+        tag += f" | effort {effort}"
+    tag += "]"
+    return f"\n\n`{tag}`"
 
 
 async def _iter_sse(
@@ -1851,14 +2524,12 @@ async def _iter_sse(
             # renders only its configured model label, so append the concrete
             # routed model as a final content chunk before the stop. ASCII-only.
             if _route_footer_enabled():
-                tag = f"[routed: {model_name}"
-                if score:
-                    tag += f" | score {score}"
-                if effort:
-                    tag += f" | effort {effort}"
-                tag += "]"
                 yield _chunk_event(
-                    completion_id, created, model_name, {"content": f"\n\n`{tag}`"}, None
+                    completion_id,
+                    created,
+                    model_name,
+                    {"content": _route_footer_content(model_name, score, effort)},
+                    None,
                 )
             # Clean completion: terminal finish_reason chunk so a strict client
             # sees a well-formed end of turn.
@@ -1895,6 +2566,170 @@ async def _build_stream_response(
             max_tokens=max_tokens,
             enable_web_search=enable_web_search,
             openai_faithful=openai_faithful,
+            effort=effort,
+        ),
+        media_type="text/event-stream",
+    )
+
+
+def _tool_call_fragment(delta: ToolCallDelta) -> dict:
+    """Render one ToolCallDelta as an OpenAI streaming tool_calls fragment.
+
+    The announcing fragment of a call carries id, type and function.name; every
+    later fragment carries only argument text against the same index, which is
+    what ties the pieces of a call together when several stream in parallel.
+    """
+    if delta.id is not None or delta.name is not None:
+        return {
+            "index": delta.index,
+            "id": delta.id,
+            "type": "function",
+            "function": {"name": delta.name, "arguments": delta.arguments},
+        }
+    return {"index": delta.index, "function": {"arguments": delta.arguments}}
+
+
+async def _iter_sse_with_tools(
+    *,
+    model_name: str,
+    client: object,
+    request: ChatCompletionRequest,
+    system: str,
+    non_system: list[ChatMessage],
+    score: int,
+    effort: str | None = None,
+) -> AsyncGenerator[str, None]:
+    """Yield SSE events for a streaming turn that may call tools.
+
+    A sibling of _iter_sse rather than a mode on it, for the reason the clients
+    give: _iter_sse backs live plain streaming on BOTH surfaces and its emitted
+    bytes are pinned by a golden. This generator serves /openai/v1 only, because
+    tool passthrough is gated on the faithful surface, so it has no route_info
+    branch at all.
+
+    Shape: a leading assistant-role delta, then content deltas and tool-call
+    fragments in arrival order, then a terminal finish_reason chunk and [DONE].
+    On a mid-stream failure it emits an OpenAI {"error":...} frame and NO finish
+    chunk, the same convention as _iter_sse's faithful path -- a truncated tool
+    call read as a completed one is worse than an explicit failure, because the
+    caller would execute it.
+    """
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    yield _chunk_event(completion_id, created, model_name, {"role": "assistant"}, None)
+
+    # exclude_none drops an absent content key rather than sending null, the
+    # shape OpenAI clients themselves send on a tool_calls turn.
+    messages = [m.model_dump(exclude_none=True) for m in non_system]
+    # None until a StreamFinish arrives, so an absent reason stays tellable from
+    # a reported one. What the provider sends is passed through verbatim.
+    finish_reason: str | None = None
+    # What this generator actually put on the wire. The provider's label cannot
+    # answer "was this a tool turn": an Anthropic stop_reason outside
+    # _STOP_REASONS (pause_turn, refusal) maps to "stop" on a genuine tool turn,
+    # and a provider can stream calls and then end without any reason at all.
+    saw_tool_call = False
+    error_message: str | None = None
+    # Frame-type parity with the non-stream leg: once the stream is open the HTTP
+    # status is already 200, so a client-payload error can only be signalled by
+    # the error frame's type, not a 4xx. A translation failure is the caller's
+    # bad request there (400 invalid_request_error), so it says so here too.
+    error_type = "upstream_error"
+    try:
+        stream = client.stream_with_tools(  # type: ignore[attr-defined]
+            system=system,
+            messages=messages,
+            tools=getattr(request, "tools", None) or [],
+            tool_choice=getattr(request, "tool_choice", None),
+            max_tokens=request.max_tokens,
+            effort=effort,
+            parallel_tool_calls=getattr(request, "parallel_tool_calls", None),
+        )
+        async for event in stream:
+            if isinstance(event, ToolCallDelta):
+                saw_tool_call = True
+                yield _chunk_event(
+                    completion_id,
+                    created,
+                    model_name,
+                    {"tool_calls": [_tool_call_fragment(event)]},
+                    None,
+                )
+            elif isinstance(event, StreamFinish):
+                finish_reason = event.finish_reason
+            else:
+                yield _chunk_event(completion_id, created, model_name, {"content": event}, None)
+    except CreditExhaustionError as e:
+        log.warning(
+            "Credit exhaustion mid-tool-stream on %s (completion_id=%s): %s",
+            model_name,
+            completion_id,
+            e,
+        )
+        error_message = str(e)
+    except ToolTranslationError as e:
+        # The caller's payload cannot be expressed to this provider -- a bad
+        # request, classified the same as the non-stream leg's 400.
+        log.warning(
+            "Tool translation failed mid-stream on %s (completion_id=%s): %s",
+            model_name,
+            completion_id,
+            e,
+        )
+        error_message = str(e)
+        error_type = "invalid_request_error"
+    except Exception as e:
+        # log.exception before the swallow: the error frame below is the only
+        # client-visible signal, so the server-side record has to be complete.
+        log.exception("Tool stream failed on %s (completion_id=%s)", model_name, completion_id)
+        error_message = f"Stream failed: {e}"
+
+    if error_message is not None:
+        yield _sse_event({"error": {"message": error_message, "type": error_type}})
+    else:
+        # Only the INVENTED reason is inferred; a reported one rides through
+        # verbatim (d926aa8 pinned that). A provider that streamed calls and then
+        # ended without a reason produced a tool turn, not a text one.
+        if finish_reason is None:
+            finish_reason = "tool_calls" if saw_tool_call else "stop"
+        # Footer only on a turn that emitted no tool call, keyed on what this
+        # generator sent rather than on the provider's label. It is display text
+        # the model never wrote, and appending it to a turn whose payload is a
+        # call corrupts the caller's agent loop -- the client is not rendering
+        # prose, it is about to execute the call.
+        if not saw_tool_call and finish_reason == "stop" and _route_footer_enabled():
+            yield _chunk_event(
+                completion_id,
+                created,
+                model_name,
+                {"content": _route_footer_content(model_name, score, effort)},
+                None,
+            )
+        yield _chunk_event(completion_id, created, model_name, {}, finish_reason)
+
+    yield "data: [DONE]\n\n"
+
+
+async def _build_tool_stream_response(
+    *,
+    model_name: str,
+    client: object,
+    request: ChatCompletionRequest,
+    system: str,
+    non_system: list[ChatMessage],
+    score: int,
+    effort: str | None = None,
+) -> StreamingResponse:
+    """Wrap _iter_sse_with_tools in a FastAPI StreamingResponse."""
+    return StreamingResponse(
+        _iter_sse_with_tools(
+            model_name=model_name,
+            client=client,
+            request=request,
+            system=system,
+            non_system=non_system,
+            score=score,
             effort=effort,
         ),
         media_type="text/event-stream",

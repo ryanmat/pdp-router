@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 import anthropic
@@ -18,7 +18,15 @@ from pdp_router._effort import (
     is_anthropic_effort_model,
     openrouter_reasoning_body,
 )
-from pdp_router._models import CreditExhaustionError
+from pdp_router._models import CreditExhaustionError, UpstreamStreamError
+from pdp_router._tools import (
+    StreamFinish,
+    ToolCall,
+    ToolCallDelta,
+    anthropic_stop_reason_to_finish_reason,
+    openai_messages_to_anthropic,
+    openai_tools_to_anthropic,
+)
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +65,14 @@ class CompletionResult:
     # exposes it best-effort via candidate grounding_metadata. 0 when web search
     # was off or the model chose not to search. Used for cost visibility.
     web_search_requests: int = 0
+    # Tool calls the model asked for, in the order the provider returned them.
+    # Empty on every plain completion, which is why the existing construction
+    # sites are untouched by this field existing.
+    tool_calls: tuple[ToolCall, ...] = ()
+    # Why the turn ended: "stop", "tool_calls", or "length". Defaulted because
+    # only the with-tools paths have ever needed it -- the plain paths always
+    # produced a completed turn and hardcoded the equivalent downstream.
+    finish_reason: str = "stop"
 
 
 class LLMClient(Protocol):
@@ -233,6 +249,78 @@ class AnthropicClient:
         )
         return self._process_response(message)
 
+    def complete_with_tools(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str | dict | None = None,
+        max_tokens: int = 1024,
+        effort: str | None = None,
+        parallel_tool_calls: bool | None = None,
+    ) -> CompletionResult:
+        """Send a completion that may call tools, translating in both directions.
+
+        Deliberately a sibling of complete_multi rather than a mode on it:
+        complete_multi is on the live path for every other surface and its
+        request body has to stay byte-identical. Web search is never attached
+        here either -- doing so would replace the caller's tools with the search
+        tool.
+
+        Args:
+            system: System prompt.
+            messages: OpenAI-shaped transcript, including any tool history.
+            tools: OpenAI tool definitions.
+            tool_choice: OpenAI tool_choice, string or named-function form.
+            max_tokens: Maximum tokens to generate.
+            effort: Reasoning-effort level, applied as on the plain paths.
+            parallel_tool_calls: False suppresses parallel tool use.
+
+        Raises:
+            ToolTranslationError: On a tool payload that cannot be expressed.
+            CreditExhaustionError: On HTTP 402 or billing-related errors.
+        """
+        anthropic_tools, anthropic_choice = openai_tools_to_anthropic(
+            tools, tool_choice, parallel_tool_calls
+        )
+
+        extra_kwargs: dict = {}
+        if anthropic_tools is not None:
+            extra_kwargs["tools"] = anthropic_tools
+        if anthropic_choice is not None:
+            extra_kwargs["tool_choice"] = anthropic_choice
+        if effort and is_anthropic_effort_model(self._model):
+            extra_kwargs["output_config"] = anthropic_output_config(effort)
+
+        message = self._make_api_call(
+            system=system,
+            messages=openai_messages_to_anthropic(messages),
+            max_tokens=max_tokens,
+            **extra_kwargs,
+        )
+        return self._process_tool_response(message)
+
+    def _process_tool_response(self, message: anthropic.types.Message) -> CompletionResult:
+        """Add tool calls and the finish reason to an otherwise plain result.
+
+        Built on _process_response so the text join, usage, cost and span
+        attributes stay in one place and cannot drift between the two paths.
+        Arguments are re-serialised from the parsed input, so key order may
+        differ from what the model emitted; the ids never do.
+        """
+        tool_calls = tuple(
+            ToolCall(id=block.id, name=block.name, arguments=json.dumps(block.input or {}))
+            for block in message.content
+            if getattr(block, "type", None) == "tool_use"
+        )
+        return replace(
+            self._process_response(message),
+            tool_calls=tool_calls,
+            finish_reason=anthropic_stop_reason_to_finish_reason(
+                getattr(message, "stop_reason", None)
+            ),
+        )
+
     def _make_api_call(self, **kwargs: object) -> anthropic.types.Message:
         """Call the Anthropic messages API, converting billing errors."""
         try:
@@ -366,6 +454,112 @@ class AnthropicClient:
                         text = getattr(event.delta, "text", "")
                         if text:
                             yield text
+        except anthropic.APIStatusError as e:
+            error_msg = str(e).lower()
+            if e.status_code == 402 or any(
+                kw in error_msg for kw in ("credit", "billing", "insufficient")
+            ):
+                span = trace.get_current_span()
+                span.set_attribute("pdp_router.credit_exhaustion", True)
+                raise CreditExhaustionError(
+                    f"Anthropic API credit/billing error (HTTP {e.status_code}): {e}"
+                ) from e
+            raise
+
+    async def stream_with_tools(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str | dict | None = None,
+        max_tokens: int = 1024,
+        effort: str | None = None,
+        parallel_tool_calls: bool | None = None,
+    ) -> AsyncIterator[str | ToolCallDelta | StreamFinish]:
+        """Stream a completion that may call tools, translating the request.
+
+        A sibling of _stream rather than a mode on it: _stream backs plain
+        streaming on both surfaces, so both its request body and its
+        AsyncIterator[str] contract have to stay exactly as they are. Web search
+        is never attached, for the reason complete_with_tools gives.
+
+        Yields text as str, tool-call fragments as ToolCallDelta, and one
+        StreamFinish when the turn ends.
+
+        Raises:
+            ToolTranslationError: On a tool payload that cannot be expressed.
+            CreditExhaustionError: On HTTP 402 or billing-related errors.
+        """
+        anthropic_tools, anthropic_choice = openai_tools_to_anthropic(
+            tools, tool_choice, parallel_tool_calls
+        )
+        stream_kwargs: dict = {}
+        if anthropic_tools is not None:
+            stream_kwargs["tools"] = anthropic_tools
+        if anthropic_choice is not None:
+            stream_kwargs["tool_choice"] = anthropic_choice
+        if effort and is_anthropic_effort_model(self._model):
+            stream_kwargs["output_config"] = anthropic_output_config(effort)
+
+        client = self._get_async_client()
+        # Anthropic indexes stream events by CONTENT block; OpenAI indexes tool
+        # call fragments by their ordinal among tool calls alone. A leading text
+        # block takes content index 0, so the two disagree from the first tool
+        # call onward and the fragments have to be remapped, not passed through.
+        tool_ordinals: dict[int, int] = {}
+        # Ordinals whose fragments so far concatenate to nothing. Anthropic sends a
+        # single input_json_delta carrying "" for a tool that takes no parameters,
+        # and "" is not parseable JSON, so those calls are repaired at the end of
+        # the turn to match what the non-stream sibling already emits.
+        empty_argument_calls: set[int] = set()
+        try:
+            async with client.messages.stream(
+                model=self._model,
+                system=system,
+                messages=openai_messages_to_anthropic(messages),  # type: ignore[arg-type]
+                max_tokens=max_tokens,
+                **stream_kwargs,
+            ) as stream:
+                async for event in stream:
+                    # Dispatch on the event type strings only. Alongside each raw
+                    # event the SDK also emits a synthesized one carrying the same
+                    # payload (text, input_json), so matching on the presence of an
+                    # attribute instead would yield every fragment twice.
+                    event_type = getattr(event, "type", None)
+                    if event_type == "content_block_start":
+                        block = getattr(event, "content_block", None)
+                        if getattr(block, "type", None) == "tool_use":
+                            ordinal = len(tool_ordinals)
+                            tool_ordinals[event.index] = ordinal
+                            empty_argument_calls.add(ordinal)
+                            yield ToolCallDelta(
+                                index=ordinal,
+                                id=getattr(block, "id", None),
+                                name=getattr(block, "name", None),
+                            )
+                    elif event_type == "content_block_delta":
+                        delta_type = getattr(event.delta, "type", None)
+                        if delta_type == "text_delta":
+                            text = getattr(event.delta, "text", "")
+                            if text:
+                                yield text
+                        elif delta_type == "input_json_delta":
+                            ordinal = tool_ordinals.get(getattr(event, "index", -1))
+                            # A fragment with no tool_use start belongs to a
+                            # server-side block (web search). Dropping it is what
+                            # keeps it out of an unrelated call's arguments.
+                            if ordinal is not None:
+                                fragment = getattr(event.delta, "partial_json", "")
+                                if fragment:
+                                    empty_argument_calls.discard(ordinal)
+                                yield ToolCallDelta(index=ordinal, arguments=fragment)
+                    elif event_type == "message_delta":
+                        stop_reason = getattr(event.delta, "stop_reason", None)
+                        if stop_reason is not None:
+                            for ordinal in sorted(empty_argument_calls):
+                                yield ToolCallDelta(index=ordinal, arguments="{}")
+                            empty_argument_calls.clear()
+                            yield StreamFinish(anthropic_stop_reason_to_finish_reason(stop_reason))
         except anthropic.APIStatusError as e:
             error_msg = str(e).lower()
             if e.status_code == 402 or any(
@@ -550,6 +744,12 @@ class GeminiClient:
             web_search_requests=web_search_requests,
         )
 
+    def complete_with_tools(self, *_args: object, **_kwargs: object) -> CompletionResult:
+        raise NotImplementedError(f"{self._model} does not support tool calls on this proxy")
+
+    def stream_with_tools(self, *_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        raise NotImplementedError(f"{self._model} does not support tool calls on this proxy")
+
     async def stream_complete(
         self,
         system: str,
@@ -629,6 +829,19 @@ class GeminiClient:
                 span.set_attribute("pdp_router.credit_exhaustion", True)
                 raise CreditExhaustionError(f"Gemini API quota/billing error: {e}") from e
             raise
+
+
+def _raise_on_error_frame(chunk: dict, label: str) -> None:
+    """Raise if an SSE chunk is a provider error envelope rather than content.
+
+    Truthiness rather than key presence: providers send "error": null on healthy
+    chunks, and treating that as a failure would kill every stream they serve.
+    """
+    error = chunk.get("error")
+    if not error:
+        return
+    message = error.get("message") or json.dumps(error) if isinstance(error, dict) else str(error)
+    raise UpstreamStreamError(f"{label} stream error: {message}")
 
 
 class OpenAICompatibleClient:
@@ -720,16 +933,54 @@ class OpenAICompatibleClient:
         full_messages = [{"role": "system", "content": system}, *messages]
         return self._call(messages=full_messages, max_tokens=max_tokens, effort=effort)
 
+    def complete_with_tools(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str | dict | None = None,
+        max_tokens: int = 1024,
+        effort: str | None = None,
+        parallel_tool_calls: bool | None = None,
+    ) -> CompletionResult:
+        """Send a completion that may call tools, passing the payload through.
+
+        These endpoints already speak OpenAI, so nothing is translated in either
+        direction: the tool definitions ride verbatim and the ids and argument
+        strings come back untouched.
+
+        Raises:
+            CreditExhaustionError: On HTTP 402 or billing-related errors.
+        """
+        tools_body: dict = {"tools": tools}
+        if tool_choice is not None:
+            tools_body["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            tools_body["parallel_tool_calls"] = parallel_tool_calls
+        return self._call(
+            messages=[{"role": "system", "content": system}, *messages],
+            max_tokens=max_tokens,
+            effort=effort,
+            tools_body=tools_body,
+        )
+
     def _call(
         self,
         messages: list[dict[str, str]],
         max_tokens: int,
         effort: str | None = None,
+        tools_body: dict | None = None,
     ) -> CompletionResult:
-        """Make the API call and process the response."""
+        """Make the API call and process the response.
+
+        tools_body defaults to None, which is what keeps every plain caller's
+        request body and response handling exactly as they were.
+        """
         body: dict = {"model": self._model, "messages": messages, "max_tokens": max_tokens}
         if effort and self._supports_reasoning_effort:
             body.update(openrouter_reasoning_body(effort))
+        if tools_body is not None:
+            body.update(tools_body)
         response = self._client.post(self._chat_url, json=body)
 
         if response.status_code == 402 or (
@@ -747,7 +998,26 @@ class OpenAICompatibleClient:
         response.raise_for_status()
         data = response.json()
 
-        text = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        tool_calls: tuple[ToolCall, ...] = ()
+        finish_reason = "stop"
+        if tools_body is None:
+            text = choice["message"]["content"]
+        else:
+            message = choice["message"]
+            # A tool-only turn returns content null. The plain path above can keep
+            # subscripting straight through because a plain turn always has text.
+            text = message.get("content") or ""
+            tool_calls = tuple(
+                ToolCall(
+                    id=call["id"],
+                    name=call["function"]["name"],
+                    arguments=call["function"]["arguments"],
+                )
+                for call in message.get("tool_calls") or ()
+            )
+            finish_reason = choice.get("finish_reason") or "stop"
+
         usage = data.get("usage", {})
         input_tokens = usage.get("prompt_tokens", 0)
         output_tokens = usage.get("completion_tokens", 0)
@@ -766,6 +1036,8 @@ class OpenAICompatibleClient:
             output_tokens=output_tokens,
             model=self._model,
             estimated_cost_usd=cost,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
         )
 
     async def stream_complete(
@@ -823,13 +1095,18 @@ class OpenAICompatibleClient:
             self._chat_url,
             json=body,
         ) as response:
-            if response.status_code == 402 or (
-                response.status_code >= 400
-                and any(
-                    kw in (await response.aread()).decode("utf-8", "replace").lower()
-                    for kw in ("insufficient", "billing", "quota", "credit")
+            # The body read is a separate statement rather than part of the
+            # any(...): an await inside a generator expression makes it an ASYNC
+            # generator, which any() cannot consume, so the guard would raise
+            # TypeError before reaching the billing check -- and would take
+            # raise_for_status below out of reach for every error status.
+            billing_error = response.status_code == 402
+            if not billing_error and response.status_code >= 400:
+                body_text = (await response.aread()).decode("utf-8", "replace").lower()
+                billing_error = any(
+                    kw in body_text for kw in ("insufficient", "billing", "quota", "credit")
                 )
-            ):
+            if billing_error:
                 span = trace.get_current_span()
                 span.set_attribute("pdp_router.credit_exhaustion", True)
                 raise CreditExhaustionError(
@@ -848,6 +1125,10 @@ class OpenAICompatibleClient:
                     chunk = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
+                # Ahead of the choices check, which is what used to swallow it:
+                # an error frame carries no choices, so `continue` dropped it and
+                # the stream ended looking like a clean finish.
+                _raise_on_error_frame(chunk, self._label)
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
@@ -855,6 +1136,104 @@ class OpenAICompatibleClient:
                 content = delta.get("content")
                 if content:
                     yield content
+
+    async def stream_with_tools(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str | dict | None = None,
+        max_tokens: int = 1024,
+        effort: str | None = None,
+        parallel_tool_calls: bool | None = None,
+    ) -> AsyncIterator[str | ToolCallDelta | StreamFinish]:
+        """Stream a completion that may call tools, passing the payload through.
+
+        A sibling of _stream rather than a mode on it, for the reason the
+        Anthropic client gives: _stream serves plain streaming on both surfaces
+        and its body and yield type have to stay as they are. The duplicated
+        prologue is the price of leaving that live path untouched.
+
+        Yields text as str, tool-call fragments as ToolCallDelta, and one
+        StreamFinish when the turn ends.
+
+        Raises:
+            CreditExhaustionError: On HTTP 402 or billing-related errors.
+        """
+        client = self._get_async_client()
+        body: dict = {
+            "model": self._model,
+            "messages": [{"role": "system", "content": system}, *messages],
+            "max_tokens": max_tokens,
+            "stream": True,
+            "tools": tools,
+        }
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            body["parallel_tool_calls"] = parallel_tool_calls
+        if effort and self._supports_reasoning_effort:
+            body.update(openrouter_reasoning_body(effort))
+        async with client.stream(  # type: ignore[attr-defined]
+            "POST",
+            self._chat_url,
+            json=body,
+        ) as response:
+            # The body read is hoisted out of the any(...) deliberately. An await
+            # inside a generator expression makes it an ASYNC generator, which
+            # any() cannot consume: the guard then raises TypeError instead of
+            # ever reaching the billing check.
+            billing_error = response.status_code == 402
+            if not billing_error and response.status_code >= 400:
+                body_text = (await response.aread()).decode("utf-8", "replace").lower()
+                billing_error = any(
+                    kw in body_text for kw in ("insufficient", "billing", "quota", "credit")
+                )
+            if billing_error:
+                span = trace.get_current_span()
+                span.set_attribute("pdp_router.credit_exhaustion", True)
+                raise CreditExhaustionError(
+                    f"{self._label} API billing error (HTTP {response.status_code})"
+                )
+            response.raise_for_status()
+
+            async for raw_line in response.aiter_lines():
+                line = raw_line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                _raise_on_error_frame(chunk, self._label)
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    yield content
+                # These indices are already tool-call ordinals, unlike Anthropic's
+                # content-block indices, so they pass through unrewritten.
+                for fragment in delta.get("tool_calls") or ():
+                    function = fragment.get("function") or {}
+                    yield ToolCallDelta(
+                        index=fragment.get("index", 0),
+                        id=fragment.get("id"),
+                        name=function.get("name"),
+                        arguments=function.get("arguments") or "",
+                    )
+                finish_reason = choice.get("finish_reason")
+                if finish_reason:
+                    # After this chunk's own content, because some arms attach the
+                    # finish reason to the last content-bearing chunk instead of
+                    # sending it alone. Not a break either: a usage-only chunk can
+                    # follow it, and [DONE] is what ends the stream.
+                    yield StreamFinish(finish_reason)
 
 
 class DeepSeekClient(OpenAICompatibleClient):
@@ -903,6 +1282,12 @@ class OllamaClient:
         effort: str | None = None,
     ) -> CompletionResult:
         raise RuntimeError(f"Ollama not yet available -- Mac Studio pending. Model: {self._model}")
+
+    def complete_with_tools(self, *_args: object, **_kwargs: object) -> CompletionResult:
+        raise NotImplementedError(f"{self._model} does not support tool calls on this proxy")
+
+    def stream_with_tools(self, *_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        raise NotImplementedError(f"{self._model} does not support tool calls on this proxy")
 
     async def stream_complete(
         self,

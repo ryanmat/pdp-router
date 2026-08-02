@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,6 +30,7 @@ from pdp_router._proxy import (
     app,
 )
 from pdp_router._proxy_config import ProxyConfig
+from pdp_router._tools import ToolCall, ToolTranslationError
 
 
 @pytest.fixture()
@@ -58,6 +62,16 @@ class TestHealthEndpoint:
         data = resp.json()
         assert data["status"] == "ok"
         assert data["models"] > 0
+
+    def test_health_reports_the_real_package_version(self, client) -> None:
+        """The deploy gate reads /health's version to prove which build is
+        serving, so it must be the installed package metadata, never a
+        hardcoded literal that survives a release bump."""
+        import importlib.metadata
+
+        resp = client.get("/health")
+        assert resp.json()["version"] == importlib.metadata.version("pdp-router")
+        assert _proxy.app.version == importlib.metadata.version("pdp-router")
 
     def test_reports_configured_providers(self, client) -> None:
         """`models: 11` is a static registry count and says nothing about reachability.
@@ -577,6 +591,34 @@ class TestFlagEnvFallback:
         monkeypatch.setattr(_proxy, "_clawflag", _FakeFlag())
         monkeypatch.setenv("PROXY_AUTOPANEL_ENABLED", "1")
         assert _proxy._autopanel_enabled() is False
+
+    def test_tool_passthrough_defaults_off(self, monkeypatch) -> None:
+        """Default OFF is the whole safety story for the tool-passthrough work:
+        until it is deliberately enabled, /openai/v1 behaves exactly as it does
+        today for every existing client."""
+        monkeypatch.setattr(_proxy, "_clawflag", None)
+        monkeypatch.delenv("PROXY_TOOL_PASSTHROUGH_ENABLED", raising=False)
+        assert _proxy._tool_passthrough_enabled() is False
+
+    def test_tool_passthrough_env_fallback_enables(self, monkeypatch) -> None:
+        monkeypatch.setattr(_proxy, "_clawflag", None)
+        monkeypatch.setenv("PROXY_TOOL_PASSTHROUGH_ENABLED", "1")
+        assert _proxy._tool_passthrough_enabled() is True
+
+    def test_tool_passthrough_reads_its_own_clawflag_key(self, monkeypatch) -> None:
+        """Guards against a copy-paste of a neighbouring helper's flag key, which
+        would silently tie tool passthrough to another feature's kill-switch."""
+        seen: list[str] = []
+
+        class _RecordingFlag:
+            @staticmethod
+            def get_bool(key: str, default: bool = False) -> bool:
+                seen.append(key)
+                return True
+
+        monkeypatch.setattr(_proxy, "_clawflag", _RecordingFlag())
+        assert _proxy._tool_passthrough_enabled() is True
+        assert seen == ["pipeline.proxy_tool_passthrough_enabled"]
 
 
 class TestEffortRouting:
@@ -1114,6 +1156,682 @@ class TestChatCompletions:
         )
 
         assert resp.status_code == 503
+
+
+_TOOLS_PARAM = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run",
+            "description": "Run a shell command",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        },
+    }
+]
+
+_A_CALL = ToolCall(id="call_abc", name="run", arguments='{"cmd": "ls -la"}')
+
+
+def _tool_completion(
+    text: str = "",
+    tool_calls: tuple[ToolCall, ...] = (_A_CALL,),
+    finish_reason: str = "tool_calls",
+) -> CompletionResult:
+    return CompletionResult(
+        text=text,
+        input_tokens=50,
+        output_tokens=20,
+        model="claude-sonnet-4-6",
+        estimated_cost_usd=0.0001,
+        tool_calls=tool_calls,
+        finish_reason=finish_reason,
+    )
+
+
+class TestToolPassthroughNonStream:
+    """Prompt 6: /openai/v1 takes tools and returns assistant tool_calls.
+
+    The flag is patched explicitly in every test rather than left to its
+    default. _flag_enabled reads the developer's real flags.toml, so a test
+    that relies on the default passes for the wrong reason today and flips the
+    day the flag is turned on in production.
+    """
+
+    @staticmethod
+    def _route(non_system: list | None = None) -> tuple:
+        """The fixed 8-tuple. Patching _route_request rather than the classifier
+        keeps the pick deterministic (the cascade's explore step is random) and
+        keeps the classifier's network call out of the suite."""
+        return (
+            "claude-sonnet-4-6",
+            0.5,
+            4,
+            0,
+            False,
+            "",
+            non_system
+            if non_system is not None
+            else [ChatMessage(role="user", content="list files")],
+            _proxy._RouteProvenance(mode="cascade", explored=False),
+        )
+
+    @staticmethod
+    def _mock(result: CompletionResult | None = None) -> MagicMock:
+        m = MagicMock()
+        m.complete_with_tools.return_value = result or _tool_completion()
+        m.complete.return_value = _mock_completion("plain")
+        m.complete_multi.return_value = _mock_completion("plain")
+        return m
+
+    def _body(self, **overrides) -> dict:
+        body: dict = {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "list files"}],
+            "tools": _TOOLS_PARAM,
+        }
+        body.update(overrides)
+        return body
+
+    # -- behavior: the with-tools branch --
+
+    def test_tool_calls_reach_the_response_in_openai_shape(self, client) -> None:
+        """Asserted on the TOP-LEVEL response body on purpose. Pydantic
+        serializes through the ANNOTATED type, so a ToolResponseMessage sitting
+        in an un-narrowed slot drops tool_calls with no error; dumping the
+        message alone or the choice alone both pass regardless."""
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=self._body())
+
+        assert resp.status_code == 200
+        message = resp.json()["choices"][0]["message"]
+        assert message["tool_calls"] == [
+            {
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "run", "arguments": '{"cmd": "ls -la"}'},
+            }
+        ]
+        assert message["content"] is None
+        assert resp.json()["choices"][0]["finish_reason"] == "tool_calls"
+        assert resp.json()["usage"]["total_tokens"] == 70
+        assert resp.headers["X-PDP-Prediction-Id"]
+
+    def test_text_and_tool_calls_both_survive(self, client) -> None:
+        mock_llm = self._mock(_tool_completion(text="Let me look."))
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=self._body())
+
+        message = resp.json()["choices"][0]["message"]
+        assert message["content"] == "Let me look."
+        assert len(message["tool_calls"]) == 1
+
+    def test_tools_ride_verbatim_to_the_client(self, client) -> None:
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            client.post(
+                "/openai/v1/chat/completions",
+                json=self._body(tool_choice="auto", parallel_tool_calls=False),
+            )
+
+        kwargs = mock_llm.complete_with_tools.call_args.kwargs
+        assert kwargs["tools"] == _TOOLS_PARAM
+        assert kwargs["tool_choice"] == "auto"
+        assert kwargs["parallel_tool_calls"] is False
+
+    def test_second_round_transcript_reaches_the_client(self, client) -> None:
+        """The round trip that makes tool calling work at all: the assistant
+        turn goes back out carrying tool_calls and NO content key (omitted, not
+        null -- that is the shape OpenAI clients send), and the result turn
+        keeps the tool_call_id that binds it to its call."""
+        history = [
+            _proxy.ToolChatMessage(role="user", content="list files"),
+            _proxy.ToolChatMessage(
+                role="assistant",
+                tool_calls=[
+                    _proxy.ToolCallSpec(
+                        id="call_abc",
+                        function=_proxy.FunctionCallSpec(name="run", arguments='{"cmd": "ls"}'),
+                    )
+                ],
+            ),
+            _proxy.ToolChatMessage(role="tool", tool_call_id="call_abc", content="a.txt"),
+        ]
+        mock_llm = self._mock(_tool_completion(text="Done.", tool_calls=(), finish_reason="stop"))
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route(history)),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=self._body())
+
+        assert resp.status_code == 200
+        sent = mock_llm.complete_with_tools.call_args.kwargs["messages"]
+        assert sent[0] == {"role": "user", "content": "list files"}
+        assert "content" not in sent[1]
+        assert sent[1]["tool_calls"][0]["id"] == "call_abc"
+        assert sent[1]["tool_calls"][0]["function"]["arguments"] == '{"cmd": "ls"}'
+        assert sent[2] == {"role": "tool", "content": "a.txt", "tool_call_id": "call_abc"}
+
+    def test_no_empty_content_warning_on_a_tool_only_turn(self, client, caplog) -> None:
+        """A tool-only turn legitimately has no text. The plain path's warning
+        exists to flag a safety-filtered empty answer and would fire on every
+        single tool call if it were reused here."""
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+            caplog.at_level(logging.WARNING),
+        ):
+            client.post("/openai/v1/chat/completions", json=self._body())
+
+        assert "Empty content" not in caplog.text
+
+    def test_empty_stop_turn_still_warns(self, client, caplog) -> None:
+        """The counterpart: a turn that ended with "stop" and no text is the
+        condition the warning was written for, and it must survive the move."""
+        mock_llm = self._mock(_tool_completion(text="", tool_calls=(), finish_reason="stop"))
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+            caplog.at_level(logging.WARNING),
+        ):
+            client.post("/openai/v1/chat/completions", json=self._body())
+
+        assert "Empty content" in caplog.text
+
+    def test_tool_request_writes_one_routing_row(self, client) -> None:
+        """The router exists to learn from its picks; a branch that skips the
+        row would silently stop feeding the bandit for every tool request."""
+        inbox = Path(os.environ["PROXY_ROUTING_INBOX_DIR"])
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            client.post("/openai/v1/chat/completions", json=self._body())
+
+        rows = [
+            json.loads(line)
+            for path in sorted(inbox.glob("*.jsonl"))
+            for line in path.read_text().splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["model_selected"] == "claude-sonnet-4-6"
+        assert rows[0]["routing_mode"] == "cascade"
+
+    def test_streaming_tool_request_writes_exactly_one_routing_row(self, client) -> None:
+        """A streaming tool turn is a real exposure and has to feed the bandit
+        exactly once, like its non-streaming sibling above.
+
+        This replaces the Prompt 6 interim pair (a 501 for the streaming leg, and
+        no row written for that refusal). The wire shape now served is pinned in
+        test_proxy_streaming.py::TestToolStreaming; what matters here is that
+        adding the branch neither skipped the row nor doubled it.
+        """
+        inbox = Path(os.environ["PROXY_ROUTING_INBOX_DIR"])
+        mock_llm = self._mock()
+
+        async def _stream(*_args: object, **_kwargs: object):
+            yield "the answer"
+
+        mock_llm.stream_with_tools = _stream
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._streaming_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=self._body(stream=True))
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        rows = [
+            json.loads(line)
+            for path in sorted(inbox.glob("*.jsonl"))
+            for line in path.read_text().splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == 1
+        assert rows[0]["model_selected"] == "claude-sonnet-4-6"
+
+    def test_plain_request_still_takes_the_legacy_path(self, client) -> None:
+        """Flag on but no tools and no tool history: nothing changes."""
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+            )
+
+        assert resp.status_code == 200
+        assert mock_llm.complete_with_tools.call_count == 0
+        assert mock_llm.complete.call_count == 1
+
+    # -- guards: the flag-off contract, which the annotation switch endangers --
+
+    def test_flag_off_rejects_tool_calls_with_null_content(self, client) -> None:
+        """Ruling 2026-07-27. Widening the endpoint annotation is itself what
+        makes this shape parse: ToolChatMessage defaults content to None, so
+        without an explicit re-reject a transcript that 422s today would start
+        flowing down the legacy path with its tool_calls silently dropped.
+        """
+        mock_route = MagicMock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=False),
+            patch("pdp_router._proxy._route_request", mock_route),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_abc",
+                                    "type": "function",
+                                    "function": {"name": "run", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                    ],
+                },
+            )
+
+        assert resp.status_code == 422
+        assert "detail" not in resp.json()
+        assert resp.json()["error"]["type"] == "invalid_request_error"
+        assert "content" in resp.json()["error"]["message"]
+        assert mock_route.call_count == 0
+
+    def test_flag_off_omitted_content_with_tool_calls_is_also_rejected(self, client) -> None:
+        """The omitted-key form is what real OpenAI clients send, and it reaches
+        the same defaulted None as an explicit null."""
+        with patch("pdp_router._proxy._tool_passthrough_enabled", return_value=False):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_abc",
+                                    "type": "function",
+                                    "function": {"name": "run", "arguments": "{}"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 422
+
+    def test_flag_off_tool_role_message_still_reaches_the_provider(self, client) -> None:
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=False),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "tool", "tool_call_id": "call_abc", "content": "a.txt"},
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_llm.complete_with_tools.call_count == 0
+
+    def test_flag_off_assistant_tool_calls_with_text_proceeds_without_tools(self, client) -> None:
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=False),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": "thinking",
+                            "tool_calls": [
+                                {
+                                    "id": "call_abc",
+                                    "type": "function",
+                                    "function": {"name": "run", "arguments": "{}"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_llm.complete_with_tools.call_count == 0
+
+    def test_flag_off_bare_tools_param_is_stripped(self, client) -> None:
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=False),
+            patch("pdp_router._proxy._route_request", return_value=self._route()),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=self._body())
+
+        assert resp.status_code == 200
+        assert mock_llm.complete_with_tools.call_count == 0
+        assert mock_llm.complete.call_count == 1
+
+    def test_content_null_without_tool_calls_is_still_422(self, client) -> None:
+        """Shape 1 of the flag-off contract, and the one existing assertion the
+        annotation switch could quietly change."""
+        with patch("pdp_router._proxy._tool_passthrough_enabled", return_value=False):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={"model": "pdp-auto", "messages": [{"role": "user", "content": None}]},
+            )
+
+        assert resp.status_code == 422
+        assert "content" in resp.json()["error"]["message"]
+
+    def test_v1_never_grows_a_tool_surface(self, client) -> None:
+        """/v1 keeps the original models forever: tool_calls with null content
+        stays a 422 there whatever the flag says, because the annotation is
+        never widened."""
+        with patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_abc",
+                                    "type": "function",
+                                    "function": {"name": "run", "arguments": "{}"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status_code == 422
+
+
+_USER_TURN = {"role": "user", "content": "hi"}
+_GOOD_FUNCTION = {"name": "run", "arguments": "{}"}
+
+
+def _assistant_with_call(call: dict) -> dict:
+    """An assistant turn whose content is a real string, so the turn itself is
+    never the shape-5 rejection -- only the tool call inside it is malformed."""
+    return {"role": "assistant", "content": "thinking", "tool_calls": [call]}
+
+
+# Payloads whose tool-shaped fields are malformed while role and content stay
+# valid strings. Every one parses under the legacy models, because the malformed
+# part sits in a field ChatCompletionRequest drops as an extra.
+_MALFORMED_TOOL_SHAPES: dict[str, dict] = {
+    "call_type_custom_without_function": {
+        "messages": [_USER_TURN, _assistant_with_call({"id": "call_1", "type": "custom"})]
+    },
+    "call_omits_arguments": {
+        "messages": [
+            _USER_TURN,
+            _assistant_with_call({"id": "call_1", "type": "function", "function": {"name": "run"}}),
+        ]
+    },
+    "arguments_sent_as_an_object": {
+        "messages": [
+            _USER_TURN,
+            _assistant_with_call(
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "run", "arguments": {"cmd": "ls"}},
+                }
+            ),
+        ]
+    },
+    "call_id_null": {
+        "messages": [
+            _USER_TURN,
+            _assistant_with_call({"id": None, "type": "function", "function": _GOOD_FUNCTION}),
+        ]
+    },
+    "call_id_missing": {
+        "messages": [
+            _USER_TURN,
+            _assistant_with_call({"type": "function", "function": _GOOD_FUNCTION}),
+        ]
+    },
+    "call_id_int": {
+        "messages": [
+            _USER_TURN,
+            _assistant_with_call({"id": 7, "type": "function", "function": _GOOD_FUNCTION}),
+        ]
+    },
+    "tool_calls_sent_as_an_object": {
+        "messages": [
+            _USER_TURN,
+            {
+                "role": "assistant",
+                "content": "thinking",
+                "tool_calls": {"id": "call_1", "type": "function", "function": _GOOD_FUNCTION},
+            },
+        ]
+    },
+    "tool_call_id_non_string": {
+        "messages": [_USER_TURN, {"role": "tool", "content": "a.txt", "tool_call_id": 7}]
+    },
+    "message_name_non_string": {"messages": [{"role": "user", "content": "hi", "name": 7}]},
+    "tools_sent_as_an_object": {
+        "messages": [_USER_TURN],
+        "tools": {"type": "function", "function": {"name": "run"}},
+    },
+    "tool_choice_sent_as_a_bool": {
+        "messages": [_USER_TURN],
+        "tools": _TOOLS_PARAM,
+        "tool_choice": True,
+    },
+    "parallel_tool_calls_non_bool": {
+        "messages": [_USER_TURN],
+        "tools": _TOOLS_PARAM,
+        # Not "yes"/"no": pydantic reads those as booleans, so they would prove
+        # nothing about a field that rejects non-bools.
+        "parallel_tool_calls": "maybe",
+    },
+}
+
+_MALFORMED_PARAMS = [pytest.param(body, id=name) for name, body in _MALFORMED_TOOL_SHAPES.items()]
+
+
+class TestFlagOffMalformedToolShapes:
+    """Malformed tool-shaped payloads keep the answer they have always had.
+
+    Validating the tool schema at the endpoint annotation puts it in FastAPI's
+    dependency layer, which runs before the flag is ever read: a payload that has
+    always been parsed-and-dropped-and-served would start answering 422 with
+    passthrough OFF, where the contract promises behavior identical to today.
+    The strictness lives behind the flag instead, and applies to exactly the
+    requests that carry tools to a provider.
+
+    None of these are shapes a real client sends -- Crush and the OpenAI SDKs
+    send canonical function calls, which is why every passthrough test above
+    misses this and why the suite stayed green through the break.
+    """
+
+    _MODEL = "claude-haiku-4-5-20251001"
+
+    def _post(self, client, shape: dict, *, flag: bool, path: str = "/openai/v1/chat/completions"):
+        """Post a shape with the flag forced. The model is explicit so the real
+        _route_request runs and skips the classifier, leaving the provider client
+        as the only mock."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion()
+        mock_llm.complete_multi.return_value = _mock_completion()
+        mock_llm.complete_with_tools.return_value = _tool_completion()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=flag),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post(path, json={"model": self._MODEL, **shape})
+        return resp, mock_llm
+
+    @pytest.mark.parametrize("shape", _MALFORMED_PARAMS)
+    def test_flag_off_serves_every_malformed_shape(self, shape, client) -> None:
+        resp, mock_llm = self._post(client, shape, flag=False)
+
+        assert resp.status_code == 200
+        assert mock_llm.complete_with_tools.call_count == 0
+
+    @pytest.mark.parametrize("shape", _MALFORMED_PARAMS)
+    def test_flag_on_refuses_every_malformed_shape(self, shape, client) -> None:
+        """The other half of the contract: turning the flag on must not turn the
+        strict schema off. These are the 422s the annotation used to produce."""
+        resp, _ = self._post(client, shape, flag=True)
+
+        assert resp.status_code == 422
+
+    @pytest.mark.parametrize("shape", _MALFORMED_PARAMS)
+    def test_legacy_models_parse_every_malformed_shape(self, shape) -> None:
+        """What makes "identical to today" measurable rather than asserted.
+
+        Today's flag-off answer IS whatever ChatCompletionRequest does with the
+        payload, and /v1 keeps that model forever (invariant 1). A clean parse
+        here is why the 200 above is the right expectation; if one of these ever
+        stops parsing, its flag-off expectation has to move with it.
+        """
+        request = _proxy.ChatCompletionRequest.model_validate({"model": self._MODEL, **shape})
+
+        assert request.model_extra is None
+
+    @pytest.mark.parametrize("shape", _MALFORMED_PARAMS)
+    def test_v1_serves_every_malformed_shape_whatever_the_flag(self, shape, client) -> None:
+        resp, _ = self._post(client, shape, flag=True, path="/v1/chat/completions")
+
+        assert resp.status_code == 200
+
+    @pytest.mark.parametrize("shape", _MALFORMED_PARAMS)
+    def test_v1_serves_every_malformed_shape_with_the_flag_off(self, shape, client) -> None:
+        """The other flag state: /v1 is provably flag-independent in both
+        directions (invariant 1's regression wall)."""
+        resp, _ = self._post(client, shape, flag=False, path="/v1/chat/completions")
+
+        assert resp.status_code == 200
+
+    def test_flag_on_rejection_is_openai_shaped_and_keeps_the_field_path(self, client) -> None:
+        """Moving validation out of the dependency layer must not change the
+        body a client reads: same envelope, same folded field path, no `detail`."""
+        resp, _ = self._post(
+            client, _MALFORMED_TOOL_SHAPES["arguments_sent_as_an_object"], flag=True
+        )
+
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "detail" not in body
+        assert body["error"]["type"] == "invalid_request_error"
+        # startswith and single-line, not a substring match: raw str(ValidationError)
+        # also CONTAINS the path, so a substring assertion passes even if the fold
+        # is dropped and pydantic's multi-line dump reaches the client verbatim.
+        message = body["error"]["message"]
+        assert message.startswith("messages.1.tool_calls.0.function.arguments: ")
+        assert "\n" not in message
+
+    def test_flag_on_rejection_precedes_routing(self, client) -> None:
+        """No classifier spend on a payload that never reaches a provider -- the
+        ordering _reject_tool_shaped_messages already holds on the flag-off side."""
+        mock_route = MagicMock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", mock_route),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={"model": "pdp-auto", **_MALFORMED_TOOL_SHAPES["arguments_sent_as_an_object"]},
+            )
+
+        assert resp.status_code == 422
+        assert mock_route.call_count == 0
+
+    def test_flag_on_canonical_second_round_reaches_the_provider(self, client) -> None:
+        """The payload the whole feature exists for, posted as a real client sends it.
+
+        An OpenAI client's second round omits the content key on the tool_calls
+        turn rather than sending null. Every other tool test either sends content
+        or injects the history through a mocked _route_request, so without this
+        one nothing POSTs the primary shape through the endpoint with the flag on.
+
+        The call omits `type` to make the rebind observable: ToolCallSpec defaults
+        it to "function", so the provider sees that default only if the strictly
+        validated request is what reaches the tools path. Asserting on names alone
+        cannot tell a parsed call from the raw dict, because both dump the same.
+        """
+        shape = {
+            # Overrides the class's haiku: the Prompt 8 driver floor answers an
+            # explicit non-driver + tools with a 400, and this test is about the
+            # rebind reaching the provider, so it names a driver. Still explicit
+            # (real _route_request, no classifier), still one mock.
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                _USER_TURN,
+                {"role": "assistant", "tool_calls": [{"id": "call_1", "function": _GOOD_FUNCTION}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"},
+            ],
+            "tools": _TOOLS_PARAM,
+            "tool_choice": "auto",
+        }
+        resp, mock_llm = self._post(client, shape, flag=True)
+
+        assert resp.status_code == 200
+        kwargs = mock_llm.complete_with_tools.call_args.kwargs
+        assert kwargs["tools"] == _TOOLS_PARAM
+        assert kwargs["tool_choice"] == "auto"
+        assistant = kwargs["messages"][1]
+        assert "content" not in assistant
+        assert assistant["tool_calls"] == [
+            {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}
+        ]
+        assert kwargs["messages"][2]["tool_call_id"] == "call_1"
 
 
 class TestExplicitModel:
@@ -2586,3 +3304,932 @@ class TestWebSearchGate:
         for m in created:
             for call in m.complete.call_args_list:
                 assert call.kwargs.get("enable_web_search", False) is False
+
+
+# -- Prompt 8: tool-driver floor, pin, and refusals --
+
+
+@contextlib.contextmanager
+def _credential_overrides(**fields):
+    """Temporarily override credential fields on the live frozen config.
+
+    The inbox_dir fixture's object.__setattr__ idiom, generalized: _config is a
+    frozen dataclass built during lifespan, so per-test credential states go
+    through the freeze bypass with a guaranteed restore.
+    """
+    assert _proxy._config is not None
+    originals = {name: getattr(_proxy._config, name) for name in fields}
+    for name, value in fields.items():
+        object.__setattr__(_proxy._config, name, value)
+    try:
+        yield
+    finally:
+        for name, value in originals.items():
+            object.__setattr__(_proxy._config, name, value)
+
+
+class TestToolDriverModelUnit:
+    """_tool_driver_model: sha256 pin over the FULL driver tuple + usability walk.
+
+    Expected drivers are hardcoded from the formula (utf-8 encode, hexdigest,
+    int base 16, mod 4) computed at authoring time, so these pin the exact
+    arithmetic: "open the pod bay doors" -> 0, "what is the capital of
+    france" -> 1, "run the test suite" -> 2, "list the files in the repo" -> 3,
+    "" -> 1.
+    """
+
+    @staticmethod
+    def _cfg(anthropic: str = "", openrouter: str = "") -> ProxyConfig:
+        return ProxyConfig(
+            anthropic_api_key=anthropic,
+            gemini_api_key="",
+            openrouter_api_key=openrouter,
+        )
+
+    def test_pin_lands_on_the_hashed_index_when_every_driver_is_usable(self) -> None:
+        cfg = self._cfg(anthropic="sk-a", openrouter="or-b")
+        assert _proxy._tool_driver_model("open the pod bay doors", cfg) == "claude-sonnet-4-6"
+        assert _proxy._tool_driver_model("run the test suite", cfg) == "openai/gpt-5.5"
+
+    def test_walk_skips_credential_less_drivers(self) -> None:
+        """Pin index 0 with no Anthropic key: past sonnet AND opus to gpt-5.5."""
+        cfg = self._cfg(anthropic="", openrouter="or-b")
+        assert _proxy._tool_driver_model("open the pod bay doors", cfg) == "openai/gpt-5.5"
+
+    def test_walk_wraps_past_the_end_of_the_tuple(self) -> None:
+        """Pin index 3 (qwen) with no OpenRouter key wraps to index 0 (sonnet)."""
+        cfg = self._cfg(anthropic="sk-a", openrouter="")
+        assert _proxy._tool_driver_model("list the files in the repo", cfg) == "claude-sonnet-4-6"
+
+    def test_empty_pin_key_still_returns_a_driver(self) -> None:
+        """The empty string is the documented no-user-message key (spec:
+        system-only requests must route, not 500)."""
+        cfg = self._cfg(anthropic="sk-a")
+        assert _proxy._tool_driver_model("", cfg) == "claude-opus-4-8"
+
+    def test_returns_none_when_no_driver_is_usable(self) -> None:
+        assert _proxy._tool_driver_model("open the pod bay doors", self._cfg()) is None
+
+    def test_retired_driver_is_skipped_by_the_walk(self) -> None:
+        """The registry kill switch (available=False) retires an arm from the
+        tool floor even while its credential is still set -- the walk predicate
+        composes BOTH notions, not credentials alone. ModelCapability is a
+        frozen dataclass, so the flip goes through the object.__setattr__
+        bypass with a guaranteed restore."""
+        from pdp_router._router import DEFAULT_REGISTRY
+
+        cap = DEFAULT_REGISTRY.get("claude-sonnet-4-6")
+        assert cap is not None and cap.available is True
+        object.__setattr__(cap, "available", False)
+        try:
+            cfg = self._cfg(anthropic="sk-a")
+            # Pin index 0 ("open the pod bay doors") starts on the retired
+            # sonnet; the walk must move to opus despite the live key.
+            assert _proxy._tool_driver_model("open the pod bay doors", cfg) == "claude-opus-4-8"
+        finally:
+            object.__setattr__(cap, "available", True)
+
+    def test_first_user_text_takes_the_first_user_turn_stripped(self) -> None:
+        """The pin key convention: FIRST user turn (stable per conversation),
+        not the latest (the search gate's convention), stripped."""
+        messages = [
+            ChatMessage(role="user", content="  what is the capital of france  "),
+            ChatMessage(role="assistant", content="Paris."),
+            ChatMessage(role="user", content="hello"),
+        ]
+        assert _proxy._first_user_text(messages) == "what is the capital of france"
+        assert _proxy._first_user_text([ChatMessage(role="assistant", content="x")]) == ""
+        assert _proxy._first_user_text([]) == ""
+
+
+class TestToolDriverFloorAndPin:
+    """Prompt 8 endpoint policy: floor, pin, override, and the two refusals.
+
+    _route_request is patched with the 8-tuple to keep picks deterministic; the
+    floor runs after it in the handler, so the dispatched model is read off
+    get_client. The client fixture holds Anthropic+Gemini keys only, so the
+    usable drivers are {sonnet, opus} unless a test grants the OpenRouter key.
+    """
+
+    _mock = staticmethod(TestToolPassthroughNonStream._mock)
+
+    @staticmethod
+    def _route(
+        model: str = "claude-haiku-4-5-20251001",
+        non_system: list | None = None,
+        score: int = 4,
+        panel_score: int = 0,
+    ) -> tuple:
+        return (
+            model,
+            0.5,
+            score,
+            panel_score,
+            False,
+            "",
+            non_system
+            if non_system is not None
+            else [ChatMessage(role="user", content="what is the capital of france")],
+            _proxy._RouteProvenance(mode="cascade", explored=False),
+        )
+
+    def _post_auto(self, client, *, route: tuple, mock_llm: MagicMock | None = None):
+        """POST a canonical tools request on /openai/v1 with the flag on."""
+        mock_llm = mock_llm or self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=route),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm) as mock_get_client,
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [{"role": "user", "content": "what is the capital of france"}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        return resp, mock_llm, mock_get_client
+
+    # -- the floor --
+
+    def test_non_driver_pick_is_floored_to_the_pinned_driver(self, client) -> None:
+        """Haiku pick + tools: the dispatched model is the pin for the first
+        user turn ("what is the capital of france" -> opus), not the pick."""
+        resp, mock_llm, mock_gc = self._post_auto(client, route=self._route())
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        mock_llm.complete_with_tools.assert_called_once()
+
+    def test_driver_pick_is_kept(self, client) -> None:
+        """Sonnet pick stays sonnet even though the pin for this turn is opus:
+        the walk only runs for picks outside the driver set."""
+        resp, _, mock_gc = self._post_auto(client, route=self._route(model="claude-sonnet-4-6"))
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "claude-sonnet-4-6"
+
+    def test_same_first_user_message_pins_the_same_driver(self, client) -> None:
+        picks = []
+        for _ in range(2):
+            _, _, mock_gc = self._post_auto(client, route=self._route())
+            picks.append(mock_gc.call_args[0][0])
+        assert picks == ["claude-opus-4-8", "claude-opus-4-8"]
+
+    def test_different_first_user_messages_can_pin_different_drivers(self, client) -> None:
+        """Deterministic spread, no random nonces: "hello" pins index 0
+        (sonnet) and "what is the capital of france" pins index 1 (opus)."""
+        _, _, gc_a = self._post_auto(
+            client,
+            route=self._route(non_system=[ChatMessage(role="user", content="hello")]),
+        )
+        _, _, gc_b = self._post_auto(client, route=self._route())
+        assert gc_a.call_args[0][0] == "claude-sonnet-4-6"
+        assert gc_b.call_args[0][0] == "claude-opus-4-8"
+
+    def test_pin_keys_on_the_first_user_turn_not_the_latest(self, client) -> None:
+        """A later user turn that would pin differently ("hello" -> sonnet)
+        must not move the driver; only first-turn rewrites re-pin (spec's
+        accepted history-compaction edge)."""
+        non_system = [
+            ChatMessage(role="user", content="what is the capital of france"),
+            ChatMessage(role="assistant", content="Paris."),
+            ChatMessage(role="user", content="hello"),
+        ]
+        _, _, mock_gc = self._post_auto(client, route=self._route(non_system=non_system))
+        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+
+    def test_system_only_request_routes_on_the_empty_pin_key(self, client) -> None:
+        """No user message anywhere: pin key "" (-> opus), 200, not a 500."""
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._route(non_system=[])),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm) as mock_gc,
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [{"role": "system", "content": "You are a tool runner."}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+
+    def test_no_usable_driver_refuses_rather_than_serving_the_pick(self, client, caplog) -> None:
+        """Every key empty: the floor refuses with a router-level 503 before any
+        dispatch, rather than leaving a non-driver pick that a claude-* client
+        would serve (invariant 5). The degraded state is logged loudly and no
+        client is built."""
+        with (
+            caplog.at_level(logging.WARNING, logger="pdp_router._proxy"),
+            _credential_overrides(anthropic_api_key="", gemini_api_key="", openrouter_api_key=""),
+        ):
+            resp, _, mock_gc = self._post_auto(client, route=self._route())
+        assert resp.status_code == 503
+        assert resp.json()["error"]["message"] == "No tool-capable model is currently available"
+        mock_gc.assert_not_called()
+        assert "no tool driver is usable" in caplog.text
+
+    # -- PROXY_TOOL_MODEL --
+
+    def test_env_override_beats_the_pin_and_a_driver_pick(self, client, monkeypatch) -> None:
+        monkeypatch.setenv("PROXY_TOOL_MODEL", "claude-opus-4-8")
+        resp, _, mock_gc = self._post_auto(
+            client,
+            route=self._route(
+                model="claude-sonnet-4-6",
+                non_system=[ChatMessage(role="user", content="hello")],
+            ),
+        )
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            pytest.param("gemini-2.5-pro", id="non_driver"),
+            pytest.param("openai/gpt-5.5", id="credential_less_driver"),
+        ],
+    )
+    def test_unusable_env_override_degrades_to_the_pin_walk(
+        self, override, client, monkeypatch, caplog
+    ) -> None:
+        """A bad operator value must not fail requests: warn and pin-walk."""
+        monkeypatch.setenv("PROXY_TOOL_MODEL", override)
+        with caplog.at_level(logging.WARNING, logger="pdp_router._proxy"):
+            resp, _, mock_gc = self._post_auto(client, route=self._route())
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        assert any("PROXY_TOOL_MODEL" in r.message for r in caplog.records)
+
+    # -- the explicit-model contract --
+
+    def test_explicit_driver_model_is_honored_and_beats_the_env_override(
+        self, client, monkeypatch
+    ) -> None:
+        """The caller's named driver survives both the floor and the operator
+        override; the real _route_request runs (explicit path, classifier-free)."""
+        monkeypatch.setenv("PROXY_TOOL_MODEL", "claude-opus-4-8")
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm) as mock_gc,
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role": "user", "content": "run it"}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "claude-sonnet-4-6"
+
+    def test_explicit_non_driver_model_with_tools_is_a_400(self, client, inbox_dir) -> None:
+        """Registry-valid but outside the driver set: refuse with the client
+        wording, in the OpenAI envelope, before any client build or routing row."""
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm) as mock_gc,
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "messages": [{"role": "user", "content": "run it"}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "detail" not in body
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["message"] == (
+            "claude-haiku-4-5-20251001 does not support tool calls on this proxy"
+        )
+        assert resp.headers["X-PDP-Prediction-Id"]
+        mock_gc.assert_not_called()
+        assert list(inbox_dir.glob("proxy-*.jsonl")) == []
+
+    def test_explicit_non_driver_400_holds_for_stream_requests(self, client) -> None:
+        """stream:true changes nothing: the refusal is a JSON 400, not SSE --
+        it fires before any stream dispatch."""
+        with patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "run it"}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 400
+        assert resp.headers["content-type"].startswith("application/json")
+        assert resp.json()["error"]["message"] == (
+            "claude-haiku-4-5-20251001 does not support tool calls on this proxy"
+        )
+
+    def test_explicit_driver_is_honored_on_membership_not_credentials(self, client) -> None:
+        """Honored-if-in-the-driver-set is membership, not usability: an
+        explicit OpenRouter driver with no OpenRouter key still dispatches
+        verbatim, so the provider-side failure stays the caller's faithful
+        error surface instead of a proxy 400."""
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm) as mock_gc,
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "openai/gpt-5.5",
+                    "messages": [{"role": "user", "content": "run it"}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "openai/gpt-5.5"
+
+    # -- tool history without tools --
+
+    @pytest.mark.parametrize(
+        "history",
+        [
+            pytest.param(
+                [
+                    {"role": "user", "content": "run it"},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+                ],
+                id="tool_result_turn",
+            ),
+            pytest.param(
+                [
+                    {"role": "user", "content": "run it"},
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "run", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                ],
+                id="assistant_tool_calls_turn",
+            ),
+        ],
+    )
+    def test_tool_history_without_tools_is_a_422_before_routing(
+        self, history, client, inbox_dir
+    ) -> None:
+        """Anthropic rejects tool blocks without a tools param and the legacy
+        path may never see tool-shaped messages, so fail loud -- and ahead of
+        _route_request, so the refusal costs no classifier call."""
+        mock_route = MagicMock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", mock_route),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={"model": "pdp-auto", "messages": history},
+            )
+        assert resp.status_code == 422
+        body = resp.json()
+        assert body["error"]["message"] == "tool history requires tools"
+        assert body["error"]["type"] == "invalid_request_error"
+        assert resp.headers["X-PDP-Prediction-Id"]
+        assert mock_route.call_count == 0
+        assert list(inbox_dir.glob("proxy-*.jsonl")) == []
+
+    def test_empty_tools_array_with_tool_history_is_still_a_422(self, client) -> None:
+        """tools: [] counts as absent: Anthropic rejects tool blocks without a
+        usable tools param, so an explicit empty array refuses the same way."""
+        with patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "tools": [],
+                    "messages": [
+                        {"role": "user", "content": "run it"},
+                        {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+                    ],
+                },
+            )
+        assert resp.status_code == 422
+        assert resp.json()["error"]["message"] == "tool history requires tools"
+
+    def test_tool_history_422_holds_for_stream_requests(self, client) -> None:
+        """stream:true changes nothing: the refusal is a JSON 422, not SSE."""
+        with patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "stream": True,
+                    "messages": [
+                        {"role": "user", "content": "run it"},
+                        {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+                    ],
+                },
+            )
+        assert resp.status_code == 422
+        assert resp.headers["content-type"].startswith("application/json")
+        assert resp.json()["error"]["message"] == "tool history requires tools"
+
+    # -- structure pins: panel skip + web-search suppression (Prompt 8 ruling 1:
+    # the tool branch returns before the panel guard and the web-search binding,
+    # so these pin that position instead of asserting dead guard terms) --
+
+    def test_panel_worthy_tools_request_takes_the_single_model_tool_path(self, client) -> None:
+        """panel_score over the threshold + autopanel on: tools still pre-empt
+        the panel. Pins the tool branch's position above the panel guard."""
+        panel_spy = MagicMock()
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._autopanel_enabled", return_value=True),
+            patch("pdp_router._proxy._execute_panel_with_synth", panel_spy),
+            patch("pdp_router._proxy._route_request", return_value=self._route(panel_score=9)),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [{"role": "user", "content": "what is the capital of france"}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 200
+        assert "pdp-panel" not in resp.json()["model"]
+        panel_spy.assert_not_called()
+        mock_llm.complete_with_tools.assert_called_once()
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
+    @patch("pdp_router._proxy.get_client")
+    def test_tools_suppress_web_search_even_on_a_search_intent_turn(
+        self, mock_get_client, _mock_cascade, _mock_classify, _mock_ws, client
+    ) -> None:
+        """Real _route_request with a haiku pick: the tool dispatch carries no
+        web-search kwarg at all (attaching it would replace the caller's own
+        tools). The dispatched model is the tool-driver floor's pick, and the
+        search floor is suppressed for tools (see the pin-preservation test)."""
+        mock_llm = self._mock()
+        mock_get_client.return_value = mock_llm
+        with patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [
+                        {"role": "user", "content": "search the web for the latest AI news"}
+                    ],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 200
+        mock_llm.complete.assert_not_called()
+        mock_llm.complete_multi.assert_not_called()
+        mock_llm.complete_with_tools.assert_called_once()
+        assert "enable_web_search" not in mock_llm.complete_with_tools.call_args.kwargs
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
+    @patch("pdp_router._proxy.get_client")
+    def test_search_intent_does_not_override_the_tool_pin(
+        self, mock_get_client, _mock_cascade, _mock_classify, _mock_ws, client
+    ) -> None:
+        """The search floor is suppressed for a tools request, so the driver pin
+        wins. "look that up online now" has search intent AND pins to opus; the
+        old behavior flipped the haiku pick to the searcher Sonnet, overriding
+        the pin. Asserting opus proves the pin is honored, not the search floor."""
+        mock_llm = self._mock()
+        mock_get_client.return_value = mock_llm
+        with patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [{"role": "user", "content": "look that up online now"}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 200
+        assert mock_get_client.call_args[0][0] == "claude-opus-4-8"
+        mock_llm.complete_with_tools.assert_called_once()
+
+    # -- effort + rows --
+
+    def test_effort_recomputes_for_the_floored_driver(self, client) -> None:
+        """The dial ran against the haiku pick (None); the floored opus supports
+        a level, so score 4 must arrive as "high", not None."""
+        mock_llm = self._mock()
+        with patch("pdp_router._proxy._effort_routing_enabled", return_value=True):
+            resp, _, _ = self._post_auto(client, route=self._route(score=4), mock_llm=mock_llm)
+        assert resp.status_code == 200
+        assert mock_llm.complete_with_tools.call_args.kwargs["effort"] == "high"
+
+    def test_effort_recomputes_when_the_override_changes_the_model(
+        self, client, monkeypatch
+    ) -> None:
+        """The other half of the recompute contract: PROXY_TOOL_MODEL replacing
+        a no-dial pick must also re-run the dial, not just the pin walk."""
+        monkeypatch.setenv("PROXY_TOOL_MODEL", "claude-opus-4-8")
+        mock_llm = self._mock()
+        with patch("pdp_router._proxy._effort_routing_enabled", return_value=True):
+            resp, _, mock_gc = self._post_auto(
+                client, route=self._route(score=4), mock_llm=mock_llm
+            )
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        assert mock_llm.complete_with_tools.call_args.kwargs["effort"] == "high"
+
+    def test_floored_request_carries_no_effort_when_the_dial_is_off(self, client) -> None:
+        """The recompute stays behind the effort flag: floor fires, dial off ->
+        the driver receives effort=None, never an uninvited level."""
+        mock_llm = self._mock()
+        with patch("pdp_router._proxy._effort_routing_enabled", return_value=False):
+            resp, _, mock_gc = self._post_auto(
+                client, route=self._route(score=4), mock_llm=mock_llm
+            )
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        assert mock_llm.complete_with_tools.call_args.kwargs["effort"] is None
+
+    def test_floored_row_records_the_driver_without_touching_routing_mode(
+        self, client, inbox_dir
+    ) -> None:
+        """model_selected holds what ran; routing_mode stays the policy
+        ("cascade") -- the floor is a constraint, not a policy (spec.md)."""
+        resp, _, _ = self._post_auto(client, route=self._route())
+        assert resp.status_code == 200
+        rows = _read_inbox_rows(inbox_dir)
+        assert len(rows) == 1
+        assert rows[0]["model_selected"] == "claude-opus-4-8"
+        assert rows[0]["routing_mode"] == "cascade"
+
+
+# -- Prompt 9: tools-request routing-row observability --
+
+
+def _row_context(row: dict) -> dict:
+    return json.loads(row["context_json"])
+
+
+class TestToolRowObservability:
+    """Prompt 9: tools-request rows carry the observability fields.
+
+    Everything rides inside context_json, never as a top-level key (the drain
+    takes explicit kwargs, so top-level is closed), and every field is
+    omit-when-absent. The non-stream row is written after completion so it can
+    carry finish_reason/tool_call_count/tool_names; the stream row keeps its
+    pre-stream timing and carries request-side fields only.
+    """
+
+    _route = staticmethod(TestToolDriverFloorAndPin._route)
+    _mock = staticmethod(TestToolPassthroughNonStream._mock)
+
+    def _post_tools(
+        self,
+        client,
+        inbox_dir,
+        *,
+        route: tuple | None = None,
+        mock_llm: MagicMock | None = None,
+        body: dict | None = None,
+    ):
+        mock_llm = mock_llm or self._mock()
+        body = body or {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "what is the capital of france"}],
+            "tools": _TOOLS_PARAM,
+        }
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True)
+            )
+            stack.enter_context(patch("pdp_router._proxy.get_client", return_value=mock_llm))
+            if route is not None:
+                stack.enter_context(patch("pdp_router._proxy._route_request", return_value=route))
+            resp = client.post("/openai/v1/chat/completions", json=body)
+        rows = _read_inbox_rows(inbox_dir) if list(inbox_dir.glob("proxy-*.jsonl")) else []
+        return resp, rows, mock_llm
+
+    # -- request-side fields --
+
+    def test_tool_row_carries_the_request_side_fields(self, client, inbox_dir) -> None:
+        """The drain-side joins in one place: what policy wanted vs what ran,
+        the conversation pin, and the request shape."""
+        resp, rows, _ = self._post_tools(client, inbox_dir, route=self._route())
+        assert resp.status_code == 200
+        assert len(rows) == 1
+        assert rows[0]["model_selected"] == "claude-opus-4-8"
+        context = _row_context(rows[0])
+        assert context["tools_present"] is True
+        assert context["tool_count"] == 1
+        assert context["loop_depth"] == 0
+        assert context["model_cascade_pick"] == "claude-haiku-4-5-20251001"
+        # sha256("what is the capital of france").hexdigest()[:8]
+        assert context["tool_pin_key"] == "d832be57"
+        assert context["provider_path"] == "anthropic-translated"
+        assert "tool_choice" not in context
+
+    def test_tool_choice_is_recorded_in_str_form(self, client, inbox_dir) -> None:
+        """spec: tool_choice rides as its str form, whatever shape the caller
+        sent -- one column type for the drain."""
+        body = {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "what is the capital of france"}],
+            "tools": _TOOLS_PARAM,
+            "tool_choice": "auto",
+        }
+        _, rows, _ = self._post_tools(client, inbox_dir, route=self._route(), body=body)
+        assert _row_context(rows[0])["tool_choice"] == "auto"
+
+    def test_dict_tool_choice_is_still_a_string_in_the_row(self, client, inbox_dir) -> None:
+        body = {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "what is the capital of france"}],
+            "tools": _TOOLS_PARAM,
+            "tool_choice": {"type": "function", "function": {"name": "run"}},
+        }
+        _, rows, _ = self._post_tools(client, inbox_dir, route=self._route(), body=body)
+        recorded = _row_context(rows[0])["tool_choice"]
+        assert isinstance(recorded, str)
+        assert "function" in recorded
+
+    def test_loop_depth_counts_assistant_tool_call_turns(self, client, inbox_dir) -> None:
+        """Two completed tool rounds in the incoming transcript -> 2. Explicit
+        driver model so the real _route_request builds non_system from the
+        posted history, classifier-free."""
+        call = {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}
+        call2 = {**call, "id": "call_2"}
+        body = {
+            "model": "claude-sonnet-4-6",
+            "tools": _TOOLS_PARAM,
+            "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+                {"role": "assistant", "tool_calls": [call2]},
+                {"role": "tool", "tool_call_id": "call_2", "content": "ok"},
+            ],
+        }
+        _, rows, _ = self._post_tools(client, inbox_dir, body=body)
+        assert _row_context(rows[0])["loop_depth"] == 2
+
+    def test_driver_pick_kept_still_records_pick_and_pin(self, client, inbox_dir) -> None:
+        """model_cascade_pick equals model_selected when the floor kept the
+        pick -- the drain should not have to infer "kept" from key absence."""
+        _, rows, _ = self._post_tools(
+            client, inbox_dir, route=self._route(model="claude-sonnet-4-6")
+        )
+        context = _row_context(rows[0])
+        assert context["model_cascade_pick"] == "claude-sonnet-4-6"
+        assert rows[0]["model_selected"] == "claude-sonnet-4-6"
+        assert context["tool_pin_key"] == "d832be57"
+
+    # -- post-completion fields (non-stream only) --
+
+    def test_post_completion_fields_land_on_the_non_stream_row(self, client, inbox_dir) -> None:
+        _, rows, _ = self._post_tools(client, inbox_dir, route=self._route())
+        context = _row_context(rows[0])
+        assert context["finish_reason"] == "tool_calls"
+        assert context["tool_call_count"] == 1
+        assert context["tool_names"] == ["run"]
+
+    def test_tool_names_are_capped_at_eight(self, client, inbox_dir) -> None:
+        calls = tuple(ToolCall(id=f"c{i}", name=f"t{i}", arguments="{}") for i in range(9))
+        mock_llm = self._mock(_tool_completion(tool_calls=calls))
+        _, rows, _ = self._post_tools(client, inbox_dir, route=self._route(), mock_llm=mock_llm)
+        context = _row_context(rows[0])
+        assert context["tool_call_count"] == 9
+        assert context["tool_names"] == [f"t{i}" for i in range(8)]
+
+    def test_stream_row_carries_request_side_fields_only(self, client, inbox_dir) -> None:
+        """The stream row is written before the body runs, so the outcome
+        fields cannot exist on it -- absent, not null."""
+        mock_llm = self._mock()
+
+        async def _stream(*_args: object, **_kwargs: object):
+            yield "the answer"
+
+        mock_llm.stream_with_tools = _stream
+        body = {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "what is the capital of france"}],
+            "tools": _TOOLS_PARAM,
+            "stream": True,
+        }
+        with patch("pdp_router._proxy._streaming_enabled", return_value=True):
+            resp, rows, _ = self._post_tools(
+                client, inbox_dir, route=self._route(), mock_llm=mock_llm, body=body
+            )
+        assert resp.status_code == 200
+        assert len(rows) == 1
+        context = _row_context(rows[0])
+        assert context["tool_pin_key"] == "d832be57"
+        assert context["model_cascade_pick"] == "claude-haiku-4-5-20251001"
+        assert "finish_reason" not in context
+        assert "tool_call_count" not in context
+        assert "tool_names" not in context
+
+    def test_failed_tool_completion_still_writes_one_row(self, client, inbox_dir) -> None:
+        """A 402 is a real exposure the bandit must see; the failure row keeps
+        the request-side fields and carries no outcome it never produced."""
+        mock_llm = self._mock()
+        mock_llm.complete_with_tools.side_effect = CreditExhaustionError("credit balance too low")
+        resp, rows, _ = self._post_tools(client, inbox_dir, route=self._route(), mock_llm=mock_llm)
+        assert resp.status_code == 402
+        assert len(rows) == 1
+        context = _row_context(rows[0])
+        assert context["tools_present"] is True
+        assert context["model_cascade_pick"] == "claude-haiku-4-5-20251001"
+        assert "finish_reason" not in context
+        assert "tool_names" not in context
+
+    # -- omit-when-absent boundaries --
+
+    def test_explicit_tool_row_omits_pick_and_pin(self, client, inbox_dir) -> None:
+        """No cascade ran and no pin was consulted for a caller-pinned model;
+        absent keys, not nulls (the cascade_explored precedent)."""
+        body = {
+            "model": "claude-sonnet-4-6",
+            "tools": _TOOLS_PARAM,
+            "messages": [{"role": "user", "content": "run it"}],
+        }
+        _, rows, _ = self._post_tools(client, inbox_dir, body=body)
+        assert rows[0]["routing_mode"] == "explicit"
+        context = _row_context(rows[0])
+        assert context["tools_present"] is True
+        assert "model_cascade_pick" not in context
+        assert "tool_pin_key" not in context
+        assert context["provider_path"] == "anthropic-translated"
+
+    def test_openrouter_driver_records_openai_native_path(self, client, inbox_dir) -> None:
+        body = {
+            "model": "openai/gpt-5.5",
+            "tools": _TOOLS_PARAM,
+            "messages": [{"role": "user", "content": "run it"}],
+        }
+        _, rows, _ = self._post_tools(client, inbox_dir, body=body)
+        assert _row_context(rows[0])["provider_path"] == "openai-native"
+
+    def test_provider_path_omitted_for_a_non_driver_model(self) -> None:
+        """provider_path names only the two driver families; a non-driver
+        model_selected omits it rather than mislabeling. Pinned at the builder
+        level: the floor now refuses before a non-driver is ever served, so
+        this defensive branch has no endpoint path to reach."""
+        req = _proxy.ToolChatCompletionRequest(
+            model="pdp-auto",
+            messages=[_proxy.ToolChatMessage(role="user", content="hi")],
+            tools=_TOOLS_PARAM,
+        )
+        context = _proxy._tool_row_context(
+            req,
+            [ChatMessage(role="user", content="hi")],
+            model_selected="gemini-2.5-pro",
+            cascade_pick="gemini-2.5-pro",
+        )
+        assert "provider_path" not in context
+        anthropic = _proxy._tool_row_context(
+            req,
+            [ChatMessage(role="user", content="hi")],
+            model_selected="claude-sonnet-4-6",
+            cascade_pick=None,
+        )
+        assert anthropic["provider_path"] == "anthropic-translated"
+
+    def test_non_tool_rows_gain_no_new_keys(self, client, inbox_dir) -> None:
+        """The byte-identity wall: a flag-on request WITHOUT tools takes the
+        legacy path and its context keys are exactly the pre-tool set."""
+        body = {"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]}
+        resp, rows, _ = self._post_tools(
+            client, inbox_dir, route=self._route(model="claude-sonnet-4-6"), body=body
+        )
+        assert resp.status_code == 200
+        assert len(rows) == 1
+        assert set(_row_context(rows[0])) == {
+            "chat_request_id",
+            "complexity",
+            "panel_score",
+            "search_intent",
+        }
+
+
+class TestToolNonStreamHardening:
+    """Pre-flip mutation-gap closures for the non-stream tool leg: what the
+    branch is responsible for handing the client and the exact response
+    envelope, none of which had a discriminating wall."""
+
+    _route = staticmethod(TestToolDriverFloorAndPin._route)
+    _mock = staticmethod(TestToolPassthroughNonStream._mock)
+
+    def _post(self, client, *, body: dict, route: tuple, mock_llm: MagicMock | None = None):
+        mock_llm = mock_llm or self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=route),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=body)
+        return resp, mock_llm
+
+    def test_system_prompt_reaches_the_client(self, client) -> None:
+        """A non-empty system turn must be threaded to complete_with_tools;
+        the empty-system fixtures elsewhere let a dropped system pass."""
+        body = {
+            "model": "pdp-auto",
+            "messages": [
+                {"role": "system", "content": "You are a careful tool runner."},
+                {"role": "user", "content": "run it"},
+            ],
+            "tools": _TOOLS_PARAM,
+        }
+        base = self._route()
+        route = (*base[:5], "You are a careful tool runner.", *base[6:])
+        resp, mock_llm = self._post(client, body=body, route=route)
+        assert resp.status_code == 200
+        assert mock_llm.complete_with_tools.call_args.kwargs["system"] == (
+            "You are a careful tool runner."
+        )
+
+    def test_max_tokens_reaches_the_client(self, client) -> None:
+        """The token budget is the client's to honor; a dropped max_tokens would
+        silently cap output. The stream leg walls this; the non-stream did not."""
+        body = {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "run it"}],
+            "tools": _TOOLS_PARAM,
+            "max_tokens": 1234,
+        }
+        resp, mock_llm = self._post(client, body=body, route=self._route())
+        assert resp.status_code == 200
+        assert mock_llm.complete_with_tools.call_args.kwargs["max_tokens"] == 1234
+
+    def test_response_envelope_reports_the_run_model_and_object(self, client) -> None:
+        """The response must name what ran (the floored driver) and the OpenAI
+        object type, so a client is not told a pdp-auto placeholder served it."""
+        body = {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "what is the capital of france"}],
+            "tools": _TOOLS_PARAM,
+        }
+        resp, _ = self._post(client, body=body, route=self._route())
+        data = resp.json()
+        assert data["object"] == "chat.completion"
+        assert data["model"] == "claude-opus-4-8"
+
+    def test_translation_error_is_a_400_invalid_request(self, client) -> None:
+        """A caller payload the provider cannot express is a 400
+        invalid_request_error, not a 503 server fault -- the non-stream sibling
+        of the stream leg's frame classification."""
+        mock_llm = self._mock()
+        mock_llm.complete_with_tools.side_effect = ToolTranslationError(
+            "tool call c1 has unparseable arguments"
+        )
+        body = {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "run it"}],
+            "tools": _TOOLS_PARAM,
+        }
+        resp, _ = self._post(client, body=body, route=self._route(), mock_llm=mock_llm)
+        assert resp.status_code == 400
+        body_json = resp.json()
+        assert body_json["error"]["type"] == "invalid_request_error"
+        assert "unparseable arguments" in body_json["error"]["message"]
+
+    def test_unknown_model_with_tools_wins_over_the_driver_400(self, client) -> None:
+        """Ordering: an unknown model + tools hits the registry check inside
+        _route_request first, so it is the 'Unknown model' 400, not the
+        driver-set 'does not support tool calls' 400."""
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy.get_client") as mock_get_client,
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "gpt-9-turbo",
+                    "messages": [{"role": "user", "content": "run it"}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 400
+        assert resp.json()["error"]["message"] == "Unknown model: gpt-9-turbo"
+        mock_get_client.assert_not_called()

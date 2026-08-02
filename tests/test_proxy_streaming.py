@@ -15,8 +15,16 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from pdp_router import _proxy
 from pdp_router._clients import CompletionResult
-from pdp_router._proxy import ChatCompletionRequest, ChatMessage, _iter_sse, app
+from pdp_router._proxy import (
+    ChatCompletionRequest,
+    ChatMessage,
+    _iter_sse,
+    _RouteProvenance,
+    app,
+)
+from pdp_router._tools import StreamFinish, ToolCallDelta, ToolTranslationError
 
 
 @pytest.fixture()
@@ -504,11 +512,586 @@ class TestOpenAIFaithfulSurface:
         assert "pdp-auto" in ids
 
 
+class TestFaithfulPlainStreamGolden:
+    """The exact wire sequence /openai/v1 emits for a plain (no-tools) turn.
+
+    A characterization wall rather than a behavior test: it asserts the whole
+    frame in one literal so that any future change to the faithful surface has
+    to be deliberate. The tool-passthrough work adds a sibling generator for
+    tool turns, and the plain path is required to come through it byte-identical;
+    a golden captured afterwards could only compare the new code against itself,
+    which is why this lands before any of it.
+
+    `id` and `created` are the only per-request values and are asserted for shape
+    and stability instead of content.
+
+    _route_request is patched rather than _classify_request: the cascade's
+    epsilon-greedy explore step can pick a different arm on any given run, so
+    patching only the classifier leaves `model` free to vary and the golden
+    intermittently red. Same reason and same 8-tuple shape as
+    test_proxy.py::TestEffortRouting._ROUTE.
+    """
+
+    _ROUTE = (
+        "claude-sonnet-4-6",  # model_name
+        0.55,  # confidence
+        3,  # score
+        0,  # panel_score
+        False,  # search_intent
+        "",  # system
+        [ChatMessage(role="user", content="hi")],  # non_system
+        _RouteProvenance(mode="cascade", explored=False),  # provenance
+    )
+
+    @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
+    @patch("pdp_router._proxy._route_request", return_value=_ROUTE)
+    @patch("pdp_router._proxy.get_client")
+    def test_plain_stream_chunk_sequence_is_unchanged(
+        self, mock_get_client, _route, _footer, client
+    ) -> None:
+        mock_get_client.return_value = _make_streaming_mock_client(["hello", " world"])
+
+        resp = client.post(
+            "/openai/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+
+        events = _parse_sse(resp.text)
+        assert events[-1] == "[DONE]"
+        chunks = [json.loads(e) for e in events[:-1]]
+
+        # One id for the whole turn, OpenAI-prefixed; created is a unix stamp.
+        ids = {c.pop("id") for c in chunks}
+        assert len(ids) == 1
+        assert ids.pop().startswith("chatcmpl-")
+        assert all(isinstance(c.pop("created"), int) for c in chunks)
+
+        assert chunks == [
+            {
+                "object": "chat.completion.chunk",
+                "model": "claude-sonnet-4-6",
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+                ],
+            },
+            {
+                "object": "chat.completion.chunk",
+                "model": "claude-sonnet-4-6",
+                "choices": [
+                    {"index": 0, "delta": {"content": "hello"}, "finish_reason": None}
+                ],
+            },
+            {
+                "object": "chat.completion.chunk",
+                "model": "claude-sonnet-4-6",
+                "choices": [
+                    {"index": 0, "delta": {"content": " world"}, "finish_reason": None}
+                ],
+            },
+            {
+                "object": "chat.completion.chunk",
+                "model": "claude-sonnet-4-6",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+
+    @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
+    @patch("pdp_router._proxy._route_request", return_value=_ROUTE)
+    @patch("pdp_router._proxy.get_client")
+    def test_plain_stream_framing_is_unchanged(
+        self, mock_get_client, _route, _footer, client
+    ) -> None:
+        """SSE framing, not payloads: `data: ` prefix, blank-line separator, [DONE] last.
+
+        _parse_sse strips all of that away, so the chunk-sequence golden above
+        would still pass if the separator or the terminator changed.
+        """
+        mock_get_client.return_value = _make_streaming_mock_client(["hello", " world"])
+
+        resp = client.post(
+            "/openai/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
+
+        assert resp.text.endswith("data: [DONE]\n\n")
+        frames = resp.text.split("\n\n")
+        assert frames[-1] == ""
+        frames = frames[:-1]
+        assert len(frames) == 5
+        assert all(f.startswith("data: ") for f in frames)
+        assert all("\n" not in f for f in frames)
+
+
 class TestIterSseSymbol:
     """Smoke check that the streaming helper is importable for downstream tooling."""
 
     def test_iter_sse_is_callable(self) -> None:
         assert callable(_iter_sse)
+
+
+_TOOLS_PARAM = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run",
+            "description": "Run a shell command",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        },
+    }
+]
+
+
+def _make_tool_streaming_mock_client(events: list, raise_at: int | None = None) -> MagicMock:
+    """Build a MagicMock whose stream_with_tools yields the given events.
+
+    The sibling of _make_streaming_mock_client for the with-tools leg. Events are
+    the client's yield union: str for text, ToolCallDelta for a call fragment,
+    StreamFinish to end the turn. raise_at=N raises after the Nth event.
+    """
+    mock_client = MagicMock()
+
+    async def _stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        for i, event in enumerate(events):
+            yield event
+            if raise_at is not None and (i + 1) == raise_at:
+                raise RuntimeError("backend exploded")
+
+    mock_client.stream_with_tools = _stream
+    return mock_client
+
+
+class TestToolStreaming:
+    """Prompt 7: /openai/v1 streams a turn that calls tools.
+
+    The tool leg gets its own generator rather than a mode on _iter_sse, for the
+    reason the clients give: _iter_sse backs live plain streaming on both
+    surfaces and its bytes are pinned by TestFaithfulPlainStreamGolden.
+    """
+
+    _ROUTE = (
+        "claude-sonnet-4-6",
+        0.55,
+        3,
+        0,
+        False,
+        "",
+        [ChatMessage(role="user", content="list files")],
+        _RouteProvenance(mode="cascade", explored=False),
+    )
+
+    def _body(self, **overrides) -> dict:
+        body: dict = {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "list files"}],
+            "tools": _TOOLS_PARAM,
+            "stream": True,
+        }
+        body.update(overrides)
+        return body
+
+    def _post(self, client, events: list, *, raise_at: int | None = None, footer: bool = False):
+        mock_llm = _make_tool_streaming_mock_client(events, raise_at=raise_at)
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_footer_enabled", return_value=footer),
+            patch("pdp_router._proxy._route_request", return_value=self._ROUTE),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            return client.post("/openai/v1/chat/completions", json=self._body())
+
+    @staticmethod
+    def _chunks(resp) -> list[dict]:
+        events = _parse_sse(resp.text)
+        assert events[-1] == "[DONE]"
+        return [json.loads(e) for e in events[:-1]]
+
+    @staticmethod
+    def _deltas(chunks: list[dict]) -> list[dict]:
+        return [c["choices"][0]["delta"] for c in chunks if "choices" in c]
+
+    def test_tool_call_stream_emits_the_openai_fragment_sequence(self, client) -> None:
+        """The wire shape an agent client reassembles: the first fragment of a
+        call carries id/type/function.name, later fragments carry only argument
+        text against the same index, and the turn ends on tool_calls."""
+        events = [
+            ToolCallDelta(index=0, id="call_1", name="run"),
+            ToolCallDelta(index=0, arguments='{"cmd"'),
+            ToolCallDelta(index=0, arguments=': "ls"}'),
+            StreamFinish("tool_calls"),
+        ]
+        resp = self._post(client, events)
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        chunks = self._chunks(resp)
+        assert self._deltas(chunks) == [
+            {"role": "assistant"},
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "run", "arguments": ""},
+                    }
+                ]
+            },
+            {"tool_calls": [{"index": 0, "function": {"arguments": '{"cmd"'}}]},
+            {"tool_calls": [{"index": 0, "function": {"arguments": ': "ls"}'}}]},
+            {},
+        ]
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+        assert all(c["choices"][0]["finish_reason"] is None for c in chunks[:-1])
+
+    def test_arguments_concatenate_to_the_original_json(self, client) -> None:
+        """Fragments are transported, never reassembled or reparsed here, so the
+        client's join has to reproduce the argument string exactly."""
+        events = [
+            ToolCallDelta(index=0, id="call_1", name="run"),
+            ToolCallDelta(index=0, arguments='{"cmd": "ls '),
+            ToolCallDelta(index=0, arguments='-la /tmp"}'),
+            StreamFinish("tool_calls"),
+        ]
+        chunks = self._chunks(self._post(client, events))
+
+        joined = "".join(
+            frag["function"].get("arguments", "")
+            for delta in self._deltas(chunks)
+            for frag in delta.get("tool_calls", ())
+        )
+        assert joined == '{"cmd": "ls -la /tmp"}'
+
+    def test_parallel_calls_keep_their_own_indices(self, client) -> None:
+        events = [
+            ToolCallDelta(index=0, id="call_1", name="run"),
+            ToolCallDelta(index=1, id="call_2", name="read"),
+            ToolCallDelta(index=0, arguments='{"cmd": "ls"}'),
+            ToolCallDelta(index=1, arguments='{"path": "a"}'),
+            StreamFinish("tool_calls"),
+        ]
+        chunks = self._chunks(self._post(client, events))
+
+        by_index: dict[int, list] = {}
+        for delta in self._deltas(chunks):
+            for frag in delta.get("tool_calls", ()):
+                by_index.setdefault(frag["index"], []).append(frag)
+        assert set(by_index) == {0, 1}
+        assert by_index[0][0]["id"] == "call_1"
+        assert by_index[1][0]["id"] == "call_2"
+        assert by_index[0][1]["function"]["arguments"] == '{"cmd": "ls"}'
+        assert by_index[1][1]["function"]["arguments"] == '{"path": "a"}'
+
+    def test_text_and_tool_calls_interleave_in_arrival_order(self, client) -> None:
+        """Content sits BETWEEN two fragments on purpose. With text first, a
+        generator that buffered every fragment to the end of the turn would emit
+        a byte-identical stream and this test could not tell the difference."""
+        events = [
+            ToolCallDelta(index=0, id="call_1", name="run"),
+            "Let me look. ",
+            ToolCallDelta(index=0, arguments="{}"),
+            StreamFinish("tool_calls"),
+        ]
+        deltas = self._deltas(self._chunks(self._post(client, events)))
+
+        assert deltas[1]["tool_calls"][0]["id"] == "call_1"
+        assert deltas[2] == {"content": "Let me look. "}
+        assert deltas[3]["tool_calls"][0]["function"]["arguments"] == "{}"
+
+    def test_pure_text_through_the_tool_path_finishes_stop(self, client) -> None:
+        """A tools request whose model answers in prose is a normal turn and has
+        to close like one, or a client waits forever for a call that never comes."""
+        events = ["hello", " world", StreamFinish("stop")]
+        chunks = self._chunks(self._post(client, events))
+
+        assert self._deltas(chunks) == [
+            {"role": "assistant"},
+            {"content": "hello"},
+            {"content": " world"},
+            {},
+        ]
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+    def test_no_footer_on_a_tool_calls_turn(self, client) -> None:
+        """The footer is display text. Appending it to a turn whose payload is a
+        tool call corrupts the agent's loop, so it is suppressed there even with
+        the flag on."""
+        events = [
+            ToolCallDelta(index=0, id="call_1", name="run"),
+            ToolCallDelta(index=0, arguments="{}"),
+            StreamFinish("tool_calls"),
+        ]
+        chunks = self._chunks(self._post(client, events, footer=True))
+
+        assert not any("routed:" in (d.get("content") or "") for d in self._deltas(chunks))
+
+    def test_footer_still_rides_a_plain_stop_turn_through_the_tool_path(self, client) -> None:
+        events = ["hello", StreamFinish("stop")]
+        chunks = self._chunks(self._post(client, events, footer=True))
+
+        contents = [d.get("content", "") for d in self._deltas(chunks)]
+        # The exact payload, not a substring: this is the shared
+        # _route_footer_content, so drift here also moves the live plain path.
+        assert "\n\n`[routed: claude-sonnet-4-6 | score 3]`" in contents
+
+    def test_no_footer_when_the_provider_labels_a_tool_turn_stop(self, client) -> None:
+        """The footer guard cannot key on the provider's label.
+
+        A provider can stream tool calls and still report "stop", and the default
+        Anthropic arm does it routinely: _STOP_REASONS maps only four reasons, so
+        a real stop_reason outside it (pause_turn, refusal) becomes "stop" on a
+        genuine tool turn. Appending display text there hands the agent loop a
+        turn the model never wrote.
+        """
+        events = [
+            ToolCallDelta(index=0, id="call_1", name="run"),
+            ToolCallDelta(index=0, arguments="{}"),
+            StreamFinish("stop"),
+        ]
+        chunks = self._chunks(self._post(client, events, footer=True))
+
+        assert not any("routed:" in (d.get("content") or "") for d in self._deltas(chunks))
+        # The reported reason still rides through verbatim; only the footer is
+        # decided by what this generator actually emitted.
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+    def test_a_tool_turn_with_no_reported_reason_closes_on_tool_calls(self, client) -> None:
+        """A provider that streams calls and then just stops has produced a tool
+        turn. Inventing "stop" for it labels a call as finished prose, and with
+        the footer on it would also collect display text."""
+        events = [
+            ToolCallDelta(index=0, id="call_1", name="run"),
+            ToolCallDelta(index=0, arguments="{}"),
+        ]
+        chunks = self._chunks(self._post(client, events, footer=True))
+
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+        assert not any("routed:" in (d.get("content") or "") for d in self._deltas(chunks))
+
+    def test_a_text_turn_with_no_reported_reason_still_closes_on_stop(self, client) -> None:
+        """The other half of the inferred default: no fragments means prose."""
+        chunks = self._chunks(self._post(client, ["hello"]))
+
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+    def test_mid_stream_error_emits_an_error_frame_and_no_finish_chunk(self, client) -> None:
+        """Same convention as the plain faithful path: a failure ends the turn
+        with an error frame and NO finish_reason chunk, so a strict client reads
+        a failure rather than a truncated call as a completed one."""
+        events = [
+            ToolCallDelta(index=0, id="call_1", name="run"),
+            ToolCallDelta(index=0, arguments='{"cm'),
+        ]
+        resp = self._post(client, events, raise_at=2)
+
+        events_out = _parse_sse(resp.text)
+        assert events_out[-1] == "[DONE]"
+        payloads = [json.loads(e) for e in events_out[:-1]]
+        errors = [p for p in payloads if "error" in p]
+        assert len(errors) == 1
+        assert errors[0]["error"]["type"] == "upstream_error"
+        assert "backend exploded" in errors[0]["error"]["message"]
+        assert not any(
+            p.get("choices", [{}])[0].get("finish_reason") for p in payloads if "choices" in p
+        )
+
+    def test_no_route_info_event_on_the_tool_stream(self, client) -> None:
+        """The tool surface is /openai/v1 only, and Crush rejects route_info."""
+        events = [ToolCallDelta(index=0, id="call_1", name="run"), StreamFinish("tool_calls")]
+        chunks = self._chunks(self._post(client, events))
+
+        assert all(c.get("object") == "chat.completion.chunk" for c in chunks)
+
+    def test_tools_ride_verbatim_to_the_streaming_client(self, client) -> None:
+        mock_llm = _make_tool_streaming_mock_client([StreamFinish("stop")])
+        seen: dict = {}
+
+        async def _capture(*args: object, **kwargs: object):
+            seen.update(kwargs)
+            seen["args"] = args
+            for event in (StreamFinish("stop"),):
+                yield event
+
+        mock_llm.stream_with_tools = _capture
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._ROUTE),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            client.post(
+                "/openai/v1/chat/completions",
+                json=self._body(tool_choice="auto", parallel_tool_calls=False),
+            )
+
+        assert seen["tools"] == _TOOLS_PARAM
+        assert seen["tool_choice"] == "auto"
+        assert seen["parallel_tool_calls"] is False
+        # The rest of what the branch is responsible for handing the client.
+        # Asserting only the tool trio leaves the system prompt, the token
+        # budget and the routed effort droppable with the suite green.
+        assert seen["system"] == ""
+        assert seen["max_tokens"] == 4096
+        # Effort flag is off here, so the routed level is None; the flag-on
+        # value is pinned in test_routed_effort_value_reaches_the_stream_client.
+        assert seen["effort"] is None
+
+    def test_a_tool_shaped_transcript_reaches_the_streaming_client(self, client) -> None:
+        """Pins the exclude_none dump on this leg: the assistant turn goes out
+        carrying tool_calls and NO content key, which is the shape OpenAI clients
+        send, and the result turn keeps the id binding it to its call."""
+        history = [
+            ChatMessage(role="user", content="list files"),
+            _proxy.ToolChatMessage(
+                role="assistant",
+                tool_calls=[
+                    _proxy.ToolCallSpec(
+                        id="call_abc",
+                        function=_proxy.FunctionCallSpec(name="run", arguments='{"cmd": "ls"}'),
+                    )
+                ],
+            ),
+            _proxy.ToolChatMessage(role="tool", tool_call_id="call_abc", content="a.txt"),
+        ]
+        route = (*self._ROUTE[:6], history, self._ROUTE[7])
+        mock_llm = _make_tool_streaming_mock_client([StreamFinish("stop")])
+        seen: dict = {}
+
+        async def _capture(*_args: object, **kwargs: object):
+            seen.update(kwargs)
+            for event in (StreamFinish("stop"),):
+                yield event
+
+        mock_llm.stream_with_tools = _capture
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=route),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            client.post("/openai/v1/chat/completions", json=self._body())
+
+        assistant = seen["messages"][1]
+        assert "content" not in assistant
+        assert assistant["tool_calls"][0]["id"] == "call_abc"
+        assert seen["messages"][2]["tool_call_id"] == "call_abc"
+
+    def test_the_stream_response_carries_the_prediction_id(self, client) -> None:
+        """It is what ties the SSE response back to the routing row just written."""
+        events = [ToolCallDelta(index=0, id="call_1", name="run"), StreamFinish("tool_calls")]
+        resp = self._post(client, events)
+
+        assert resp.headers["X-PDP-Prediction-Id"]
+
+    def test_routed_effort_value_reaches_the_stream_client(self, client) -> None:
+        """The routed effort LEVEL, not just the key, must reach the client. The
+        _ROUTE score is 3 and sonnet supports the dial, so with the effort flag
+        on it arrives as "medium"; asserting only key presence let effort=None
+        pass."""
+        mock_llm = _make_tool_streaming_mock_client([StreamFinish("stop")])
+        seen: dict = {}
+
+        async def _capture(*_args: object, **kwargs: object):
+            seen.update(kwargs)
+            yield StreamFinish("stop")
+
+        mock_llm.stream_with_tools = _capture
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._effort_routing_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._ROUTE),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            client.post("/openai/v1/chat/completions", json=self._body())
+
+        assert seen["effort"] == "medium"
+
+    def test_system_prompt_reaches_the_stream_client(self, client) -> None:
+        """A non-empty system turn is threaded to stream_with_tools; the
+        empty-system route in the sibling tests let a dropped system pass."""
+        route = (*self._ROUTE[:5], "You are a careful tool runner.", *self._ROUTE[6:])
+        mock_llm = _make_tool_streaming_mock_client([StreamFinish("stop")])
+        seen: dict = {}
+
+        async def _capture(*_args: object, **kwargs: object):
+            seen.update(kwargs)
+            yield StreamFinish("stop")
+
+        mock_llm.stream_with_tools = _capture
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=route),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            client.post("/openai/v1/chat/completions", json=self._body())
+
+        assert seen["system"] == "You are a careful tool runner."
+
+    def test_completion_id_is_stable_across_every_chunk(self, client) -> None:
+        """One id per turn: an agent client correlates a streamed turn by its id,
+        so a fresh id on any chunk would fragment the turn."""
+        events = [
+            ToolCallDelta(index=0, id="call_1", name="run"),
+            ToolCallDelta(index=0, arguments='{"cmd": "ls"}'),
+            StreamFinish("tool_calls"),
+        ]
+        chunks = self._chunks(self._post(client, events))
+        ids = {c["id"] for c in chunks}
+        assert len(ids) == 1
+
+    def test_no_footer_on_a_truncated_text_turn(self, client) -> None:
+        """The footer rides only a clean stop turn. A turn that emitted no tool
+        call but ended on "length" (truncated) must not gain the footer, or the
+        footer half of the guard is untested -- the finish_reason conjunct."""
+        events = ["partial answer", StreamFinish("length")]
+        chunks = self._chunks(self._post(client, events, footer=True))
+        contents = [
+            c["choices"][0]["delta"].get("content")
+            for c in chunks
+            if c.get("choices") and "content" in c["choices"][0]["delta"]
+        ]
+        assert contents == ["partial answer"]
+        assert not any("routed:" in (t or "") for t in contents)
+        assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+
+    def test_translation_error_frame_matches_the_non_stream_classification(self, client) -> None:
+        """A ToolTranslationError cannot be a 400 once the stream is open (status
+        already flushed), so it rides an error frame -- but with the same
+        invalid_request_error type the non-stream leg returns, not the generic
+        upstream_error used for backend failures."""
+        mock_llm = MagicMock()
+
+        async def _raise(*_args: object, **_kwargs: object):
+            raise ToolTranslationError("tool call c1 has unparseable arguments")
+            yield  # pragma: no cover -- makes this an async generator
+
+        mock_llm.stream_with_tools = _raise
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_footer_enabled", return_value=False),
+            patch("pdp_router._proxy._route_request", return_value=self._ROUTE),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=self._body())
+
+        assert resp.status_code == 200
+        events = _parse_sse(resp.text)
+        assert events[-1] == "[DONE]"
+        chunks = [json.loads(e) for e in events[:-1]]
+        errors = [c for c in chunks if "error" in c]
+        assert len(errors) == 1
+        assert errors[0]["error"]["type"] == "invalid_request_error"
+        assert "unparseable arguments" in errors[0]["error"]["message"]
+        # No finish chunk after an error frame.
+        assert all(c["choices"][0]["finish_reason"] is None for c in chunks if "choices" in c)
 
 
 # -- panel-into-Crush: streaming the auto-panel chair synthesis on /openai/v1 --
@@ -1461,3 +2044,81 @@ class TestPanelTranscriptStreaming:
         assert rec["synthesis_text"] == "synth "  # only the first token was pulled
         assert len(rec["members"]) == 3
         assert all(m["text"] == "member answer" for m in rec["members"])
+
+
+class TestToolStreamingDriverFloor:
+    """Prompt 8: the driver floor sits upstream of the stream dispatch too."""
+
+    _NON_DRIVER_ROUTE = (
+        "claude-haiku-4-5-20251001",
+        0.55,
+        3,
+        0,
+        False,
+        "",
+        [ChatMessage(role="user", content="what is the capital of france")],
+        _RouteProvenance(mode="cascade", explored=False),
+    )
+
+    _EVENTS = (
+        ToolCallDelta(index=0, id="call_1", name="run"),
+        StreamFinish("tool_calls"),
+    )
+
+    def _stream_body(self) -> dict:
+        return {
+            "model": "pdp-auto",
+            "messages": [{"role": "user", "content": "what is the capital of france"}],
+            "tools": _TOOLS_PARAM,
+            "stream": True,
+        }
+
+    def test_floored_driver_reaches_the_stream_chunks(self, client) -> None:
+        """A non-driver cascade pick is replaced before the stream opens: every
+        chunk's model field is the pinned driver ("what is the capital of
+        france" -> claude-opus-4-8), proving the floor runs upstream of
+        _build_tool_stream_response rather than only on the non-stream leg."""
+        mock_llm = _make_tool_streaming_mock_client(list(self._EVENTS))
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._route_footer_enabled", return_value=False),
+            patch("pdp_router._proxy._route_request", return_value=self._NON_DRIVER_ROUTE),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm) as mock_gc,
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=self._stream_body())
+
+        assert resp.status_code == 200
+        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        events = _parse_sse(resp.text)
+        assert events[-1] == "[DONE]"
+        chunks = [json.loads(e) for e in events[:-1]]
+        assert chunks and all(c["model"] == "claude-opus-4-8" for c in chunks)
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_panel_worthy_stream_with_tools_takes_the_tool_path(self, client) -> None:
+        """panel_score over the threshold + autopanel + panel streaming all on:
+        a tools request still gets the tool stream. Pins the tool branch's
+        position ABOVE the panel guard -- if the branch ever moves below it,
+        this dispatches the panel builder and fails loudly."""
+        route = (*self._NON_DRIVER_ROUTE[:3], 9, *self._NON_DRIVER_ROUTE[4:])
+        mock_llm = _make_tool_streaming_mock_client(list(self._EVENTS))
+        panel_spy = MagicMock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._autopanel_enabled", return_value=True),
+            patch("pdp_router._proxy._route_footer_enabled", return_value=False),
+            patch("pdp_router._proxy._build_panel_stream_response", panel_spy),
+            patch("pdp_router._proxy._route_request", return_value=route),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=self._stream_body())
+
+        assert resp.status_code == 200
+        panel_spy.assert_not_called()
+        events = _parse_sse(resp.text)
+        assert events[-1] == "[DONE]"
+        chunks = [json.loads(e) for e in events[:-1]]
+        deltas = [c["choices"][0]["delta"] for c in chunks]
+        assert deltas[0] == {"role": "assistant"}
+        assert any("tool_calls" in d for d in deltas)
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"

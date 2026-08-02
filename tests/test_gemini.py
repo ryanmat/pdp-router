@@ -236,6 +236,27 @@ class TestGeminiWebSearch:
         assert not self._config_of(mock_client).tools
 
 
+class TestGeminiToolBackstop:
+    """Gemini never receives tool requests -- the driver floor guarantees it.
+
+    These stubs exist so a routing mistake surfaces as a clean provider error
+    rather than an AttributeError deep in the handler, which would reach the
+    client as a hang or a 500 instead of an error frame.
+    """
+
+    def _client(self) -> GeminiClient:
+        with patch("google.genai.Client"):
+            return GeminiClient("gemini-2.5-flash", api_key="test-key")
+
+    def test_complete_with_tools_raises_not_implemented(self) -> None:
+        with pytest.raises(NotImplementedError):
+            self._client().complete_with_tools("sys", [{"role": "user", "content": "hi"}], [])
+
+    def test_stream_with_tools_raises_not_implemented(self) -> None:
+        with pytest.raises(NotImplementedError):
+            self._client().stream_with_tools("sys", [{"role": "user", "content": "hi"}], [])
+
+
 class TestGetClientGemini:
     def test_gemini_prefix_returns_gemini_client(self) -> None:
         with patch("google.genai.Client"):

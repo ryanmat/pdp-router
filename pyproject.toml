@@ -3,7 +3,7 @@
 
 [project]
 name = "pdp-router"
-version = "0.5.0"
+version = "0.6.0"
 description = "Outcome-fed routing across heterogeneous AI models: confidence cascade, Thompson Sampling bandit, multi-model panel"
 readme = "README.md"
 license = { text = "Apache-2.0" }
