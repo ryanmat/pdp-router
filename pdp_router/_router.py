@@ -305,8 +305,11 @@ def route_request(
     Cascade thresholds (strict >, adjusted by model trust weights):
         conf > 0.85 -> Haiku (synthesis skip recommended)
         conf > 0.70 AND agreement >= 4 -> Haiku
-        conf > 0.40 -> Sonnet
-        conf <= 0.40 -> Opus (frontier)
+        conf > 0.40 -> Sonnet 5 (standard)
+        conf <= 0.40 -> Opus 5 (frontier)
+
+    The standard/frontier tiers dispatch to the 5 generation; the 4-generation
+    arms stay registered as explicit-call and fallback targets.
 
     Args:
         confidence: Pre-calculated confidence score (0.10 to 0.95).
