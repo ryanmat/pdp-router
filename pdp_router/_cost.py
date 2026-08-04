@@ -8,6 +8,16 @@ from __future__ import annotations
 # false matches (e.g., "gemini-2.5-flash-lite" before "gemini-2.5-flash").
 _MODEL_PRICING: list[tuple[str, dict[str, float]]] = [
     ("claude-haiku", {"input": 0.25, "output": 1.25}),
+    # The 5-generation rows carry the same list rates as the 4-generation rows
+    # below and would resolve correctly through those generic prefixes today.
+    # They are pinned explicitly anyway: without them the 5-generation arms are
+    # priced by coincidence, and a reprice of the 4-generation row would drag
+    # them along silently. Sonnet 5 also has introductory pricing of $2/$10 per
+    # MTok through 2026-08-31 -- list is encoded instead, because this table has
+    # no notion of a date and an expired promotion would under-price forever,
+    # whereas list merely over-estimates until the promotion lapses.
+    ("claude-sonnet-5", {"input": 3.00, "output": 15.00}),
+    ("claude-opus-5", {"input": 5.00, "output": 25.00}),
     ("claude-sonnet", {"input": 3.00, "output": 15.00}),
     ("claude-opus", {"input": 5.00, "output": 25.00}),
     ("deepseek-", {"input": 0.28, "output": 0.42}),

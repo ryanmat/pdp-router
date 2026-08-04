@@ -15,7 +15,9 @@ from pdp_router._models import (
     LLAMA_MAVERICK,
     LLAMA_SCOUT,
     OPUS,
+    OPUS_5,
     SONNET,
+    SONNET_5,
     CreditExhaustionError,
     canonicalize_model_id,
     expand_canonical_to_live,
@@ -65,7 +67,9 @@ class TestModelConstants:
         for model in (
             HAIKU,
             SONNET,
+            SONNET_5,
             OPUS,
+            OPUS_5,
             DEEPSEEK,
             GEMINI_PRO,
             GEMINI_FLASH,
@@ -103,7 +107,10 @@ class TestCanonicalizeModelId:
             ("claude-haiku-4-5-20251001", "claude-haiku-4"),
             ("claude-haiku-4-5", "claude-haiku-4"),
             ("claude-haiku-4-1", "claude-haiku-4"),
-            # Future major bumps land on a fresh canonical key.
+            # Major bumps land on a fresh canonical key. The bare 5-generation
+            # ids are the live roster entries and canonicalize to themselves.
+            ("claude-opus-5", "claude-opus-5"),
+            ("claude-sonnet-5", "claude-sonnet-5"),
             ("claude-opus-5-1", "claude-opus-5"),
             ("claude-sonnet-5-20260101", "claude-sonnet-5"),
             ("claude-haiku-5-1", "claude-haiku-5"),
@@ -142,12 +149,28 @@ class TestCanonicalizeModelId:
         assert canonicalize_model_id(SONNET) == "claude-sonnet-4"
         assert canonicalize_model_id(HAIKU) == "claude-haiku-4"
 
+    def test_new_generation_is_a_distinct_arm_from_old(self) -> None:
+        # ADD-never-REPLACE rests on this: the 5-generation ids must NOT collapse
+        # onto the 4-generation canonical keys, or the new arms would inherit the
+        # old posteriors instead of starting fresh.
+        assert canonicalize_model_id(OPUS_5) != canonicalize_model_id(OPUS)
+        assert canonicalize_model_id(SONNET_5) != canonicalize_model_id(SONNET)
+        assert canonicalize_model_id(OPUS_5) == "claude-opus-5"
+        assert canonicalize_model_id(SONNET_5) == "claude-sonnet-5"
+
 
 class TestExpandCanonicalToLive:
     def test_anthropic_canonical_expands_to_current_alias(self) -> None:
         assert expand_canonical_to_live("claude-opus-4") == [OPUS]
         assert expand_canonical_to_live("claude-sonnet-4") == [SONNET]
         assert expand_canonical_to_live("claude-haiku-4") == [HAIKU]
+
+    def test_new_generation_canonical_expands_to_its_own_alias(self) -> None:
+        # Without a LIVE_REGISTRY entry these fall through to the bare canonical
+        # id, which no registry model uses -- trust rows would then never reach
+        # the arm and it would report the 0.5 default forever.
+        assert expand_canonical_to_live("claude-opus-5") == [OPUS_5]
+        assert expand_canonical_to_live("claude-sonnet-5") == [SONNET_5]
 
     def test_anthropic_canonical_expands_to_multiple_when_registry_has_multiple(
         self,

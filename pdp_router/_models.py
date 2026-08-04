@@ -14,6 +14,15 @@ SONNET = "claude-sonnet-4-6"
 # keeps the shared bandit posterior + trust history intact (no arm fork).
 OPUS = "claude-opus-4-8"
 
+# 5-generation Anthropic arms. These canonicalize to claude-sonnet-5 / claude-opus-5,
+# which are NOT the 4-generation keys -- so they enter the bandit as fresh arms with
+# their own posteriors rather than inheriting the 4-generation history. That fork is
+# the intended behaviour: a generation bump is a different arm, not a new alias for
+# the same one. Both generations stay in the roster; the 4-generation entries are
+# retired by flipping ModelCapability.available, never by deletion.
+SONNET_5 = "claude-sonnet-5"
+OPUS_5 = "claude-opus-5"
+
 # DeepSeek (OpenAI-compatible API)
 DEEPSEEK = "deepseek-chat"
 
@@ -39,7 +48,9 @@ QWEN_3_7_PLUS = "qwen/qwen3.7-plus"
 LIVE_REGISTRY: tuple[str, ...] = (
     HAIKU,
     SONNET,
+    SONNET_5,
     OPUS,
+    OPUS_5,
     DEEPSEEK,
     GEMINI_PRO,
     GEMINI_FLASH,

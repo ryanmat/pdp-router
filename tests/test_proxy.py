@@ -2195,7 +2195,7 @@ class TestPanelTranscriptCapture:
         transcript_dir,
         client,
     ) -> None:
-        # Chair (claude-sonnet-4-6) returns empty -> the proxy substitutes the
+        # Chair (claude-sonnet-5) returns empty -> the proxy substitutes the
         # first-survivor text into the client response, but the transcript must record
         # synthesis_text='' (chair.text), status chair_empty -- NOT the survivor text.
         mock_compose.return_value = ["claude-opus-4-7", "gemini-2.5-pro", "deepseek-chat"]
@@ -2203,7 +2203,7 @@ class TestPanelTranscriptCapture:
         def make_client(model_id, *_a, **_k):
             m = MagicMock()
             m.complete.return_value = _mock_completion(
-                "" if model_id == "claude-sonnet-4-6" else "member text"
+                "" if model_id == "claude-sonnet-5" else "member text"
             )
             return m
 
@@ -2313,7 +2313,7 @@ class TestAutoPanelGate:
         assert resp.status_code == 200
         data = resp.json()
         assert data["model"].startswith("pdp-panel-")
-        assert "claude-sonnet-4-6" in data["model"]
+        assert "claude-sonnet-5" in data["model"]
         # 3 panel members + 1 chair = 4 get_client calls.
         assert mock_get_client.call_count == 4
 
@@ -2883,7 +2883,7 @@ class TestSearchIntentGateAndFloor:
             },
         )
         assert resp.status_code == 200
-        assert resp.json()["model"] == "claude-sonnet-4-6"
+        assert resp.json()["model"] == "claude-sonnet-5"
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch(
@@ -2909,7 +2909,7 @@ class TestSearchIntentGateAndFloor:
             },
         )
         assert resp.status_code == 200
-        assert resp.json()["model"] == "claude-sonnet-4-6"
+        assert resp.json()["model"] == "claude-sonnet-5"
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=False)
     @patch(
@@ -2981,7 +2981,7 @@ class TestSearchIntentGateAndFloor:
         assert resp.status_code == 200
         data = resp.json()
         assert "pdp-panel" not in data["model"]
-        assert data["model"] == "claude-sonnet-4-6"
+        assert data["model"] == "claude-sonnet-5"
         mock_llm.complete.assert_called_once()
         assert mock_llm.complete.call_args.kwargs.get("enable_web_search") is True
 
@@ -3078,7 +3078,7 @@ class TestSearchIntentGateAndFloor:
             },
         )
         assert resp.status_code == 200
-        assert resp.json()["model"] == "claude-sonnet-4-6"
+        assert resp.json()["model"] == "claude-sonnet-5"
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy.confidence_cascade", return_value=("claude-opus-4-8", False))
@@ -3122,7 +3122,7 @@ class TestSearchIntentGateAndFloor:
         assert resp.status_code == 200
         data = resp.json()
         assert "pdp-panel" not in data["model"]
-        assert data["model"] == "claude-sonnet-4-6"
+        assert data["model"] == "claude-sonnet-5"
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._streaming_enabled", return_value=True)
@@ -3155,9 +3155,9 @@ class TestSearchIntentGateAndFloor:
         )
         assert resp.status_code == 200
         _ = resp.text  # drain so the stream generator runs
-        assert mock_get_client.call_args.args[0] == "claude-sonnet-4-6"
+        assert mock_get_client.call_args.args[0] == "claude-sonnet-5"
         assert captured.get("enable_web_search") is True
-        assert "claude-sonnet-4-6" in resp.text
+        assert "claude-sonnet-5" in resp.text
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch(
@@ -3332,10 +3332,12 @@ class TestToolDriverModelUnit:
     """_tool_driver_model: sha256 pin over the FULL driver tuple + usability walk.
 
     Expected drivers are hardcoded from the formula (utf-8 encode, hexdigest,
-    int base 16, mod 4) computed at authoring time, so these pin the exact
-    arithmetic: "open the pod bay doors" -> 0, "what is the capital of
-    france" -> 1, "run the test suite" -> 2, "list the files in the repo" -> 3,
-    "" -> 1.
+    int base 16, mod len(_TOOL_DRIVERS)) computed at authoring time, so these
+    pin the exact arithmetic. The tuple is 6 long, so: "open the pod bay
+    doors" -> 2, "what is the capital of france" -> 1, "run the test
+    suite" -> 0, "list the files in the repo" -> 5, "" -> 1. Growing the tuple
+    remaps every pin -- that is stateless and harmless, but it does mean these
+    constants have to be recomputed whenever a driver is added or removed.
     """
 
     @staticmethod
@@ -3349,23 +3351,23 @@ class TestToolDriverModelUnit:
     def test_pin_lands_on_the_hashed_index_when_every_driver_is_usable(self) -> None:
         cfg = self._cfg(anthropic="sk-a", openrouter="or-b")
         assert _proxy._tool_driver_model("open the pod bay doors", cfg) == "claude-sonnet-4-6"
-        assert _proxy._tool_driver_model("run the test suite", cfg) == "openai/gpt-5.5"
+        assert _proxy._tool_driver_model("run the test suite", cfg) == "claude-sonnet-5"
 
     def test_walk_skips_credential_less_drivers(self) -> None:
-        """Pin index 0 with no Anthropic key: past sonnet AND opus to gpt-5.5."""
+        """Pin index 2 with no Anthropic key: past both Anthropic arms to gpt-5.5."""
         cfg = self._cfg(anthropic="", openrouter="or-b")
         assert _proxy._tool_driver_model("open the pod bay doors", cfg) == "openai/gpt-5.5"
 
     def test_walk_wraps_past_the_end_of_the_tuple(self) -> None:
-        """Pin index 3 (qwen) with no OpenRouter key wraps to index 0 (sonnet)."""
+        """Pin index 5 (qwen) with no OpenRouter key wraps to index 0 (sonnet 5)."""
         cfg = self._cfg(anthropic="sk-a", openrouter="")
-        assert _proxy._tool_driver_model("list the files in the repo", cfg) == "claude-sonnet-4-6"
+        assert _proxy._tool_driver_model("list the files in the repo", cfg) == "claude-sonnet-5"
 
     def test_empty_pin_key_still_returns_a_driver(self) -> None:
         """The empty string is the documented no-user-message key (spec:
         system-only requests must route, not 500)."""
         cfg = self._cfg(anthropic="sk-a")
-        assert _proxy._tool_driver_model("", cfg) == "claude-opus-4-8"
+        assert _proxy._tool_driver_model("", cfg) == "claude-opus-5"
 
     def test_returns_none_when_no_driver_is_usable(self) -> None:
         assert _proxy._tool_driver_model("open the pod bay doors", self._cfg()) is None
@@ -3383,8 +3385,8 @@ class TestToolDriverModelUnit:
         object.__setattr__(cap, "available", False)
         try:
             cfg = self._cfg(anthropic="sk-a")
-            # Pin index 0 ("open the pod bay doors") starts on the retired
-            # sonnet; the walk must move to opus despite the live key.
+            # Pin index 2 ("open the pod bay doors") starts on the retired
+            # sonnet 4.6; the walk must move on despite the live key.
             assert _proxy._tool_driver_model("open the pod bay doors", cfg) == "claude-opus-4-8"
         finally:
             object.__setattr__(cap, "available", True)
@@ -3458,7 +3460,7 @@ class TestToolDriverFloorAndPin:
         user turn ("what is the capital of france" -> opus), not the pick."""
         resp, mock_llm, mock_gc = self._post_auto(client, route=self._route())
         assert resp.status_code == 200
-        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        assert mock_gc.call_args[0][0] == "claude-opus-5"
         mock_llm.complete_with_tools.assert_called_once()
 
     def test_driver_pick_is_kept(self, client) -> None:
@@ -3473,7 +3475,7 @@ class TestToolDriverFloorAndPin:
         for _ in range(2):
             _, _, mock_gc = self._post_auto(client, route=self._route())
             picks.append(mock_gc.call_args[0][0])
-        assert picks == ["claude-opus-4-8", "claude-opus-4-8"]
+        assert picks == ["claude-opus-5", "claude-opus-5"]
 
     def test_different_first_user_messages_can_pin_different_drivers(self, client) -> None:
         """Deterministic spread, no random nonces: "hello" pins index 0
@@ -3483,8 +3485,8 @@ class TestToolDriverFloorAndPin:
             route=self._route(non_system=[ChatMessage(role="user", content="hello")]),
         )
         _, _, gc_b = self._post_auto(client, route=self._route())
-        assert gc_a.call_args[0][0] == "claude-sonnet-4-6"
-        assert gc_b.call_args[0][0] == "claude-opus-4-8"
+        assert gc_a.call_args[0][0] == "claude-sonnet-5"
+        assert gc_b.call_args[0][0] == "claude-opus-5"
 
     def test_pin_keys_on_the_first_user_turn_not_the_latest(self, client) -> None:
         """A later user turn that would pin differently ("hello" -> sonnet)
@@ -3496,7 +3498,7 @@ class TestToolDriverFloorAndPin:
             ChatMessage(role="user", content="hello"),
         ]
         _, _, mock_gc = self._post_auto(client, route=self._route(non_system=non_system))
-        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        assert mock_gc.call_args[0][0] == "claude-opus-5"
 
     def test_system_only_request_routes_on_the_empty_pin_key(self, client) -> None:
         """No user message anywhere: pin key "" (-> opus), 200, not a 500."""
@@ -3515,7 +3517,7 @@ class TestToolDriverFloorAndPin:
                 },
             )
         assert resp.status_code == 200
-        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        assert mock_gc.call_args[0][0] == "claude-opus-5"
 
     def test_no_usable_driver_refuses_rather_than_serving_the_pick(self, client, caplog) -> None:
         """Every key empty: the floor refuses with a router-level 503 before any
@@ -3561,7 +3563,7 @@ class TestToolDriverFloorAndPin:
         with caplog.at_level(logging.WARNING, logger="pdp_router._proxy"):
             resp, _, mock_gc = self._post_auto(client, route=self._route())
         assert resp.status_code == 200
-        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        assert mock_gc.call_args[0][0] == "claude-opus-5"
         assert any("PROXY_TOOL_MODEL" in r.message for r in caplog.records)
 
     # -- the explicit-model contract --
@@ -3830,7 +3832,7 @@ class TestToolDriverFloorAndPin:
                 },
             )
         assert resp.status_code == 200
-        assert mock_get_client.call_args[0][0] == "claude-opus-4-8"
+        assert mock_get_client.call_args[0][0] == "claude-opus-5"
         mock_llm.complete_with_tools.assert_called_once()
 
     # -- effort + rows --
@@ -3868,7 +3870,7 @@ class TestToolDriverFloorAndPin:
                 client, route=self._route(score=4), mock_llm=mock_llm
             )
         assert resp.status_code == 200
-        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        assert mock_gc.call_args[0][0] == "claude-opus-5"
         assert mock_llm.complete_with_tools.call_args.kwargs["effort"] is None
 
     def test_floored_row_records_the_driver_without_touching_routing_mode(
@@ -3880,7 +3882,7 @@ class TestToolDriverFloorAndPin:
         assert resp.status_code == 200
         rows = _read_inbox_rows(inbox_dir)
         assert len(rows) == 1
-        assert rows[0]["model_selected"] == "claude-opus-4-8"
+        assert rows[0]["model_selected"] == "claude-opus-5"
         assert rows[0]["routing_mode"] == "cascade"
 
 
@@ -3938,7 +3940,7 @@ class TestToolRowObservability:
         resp, rows, _ = self._post_tools(client, inbox_dir, route=self._route())
         assert resp.status_code == 200
         assert len(rows) == 1
-        assert rows[0]["model_selected"] == "claude-opus-4-8"
+        assert rows[0]["model_selected"] == "claude-opus-5"
         context = _row_context(rows[0])
         assert context["tools_present"] is True
         assert context["tool_count"] == 1
@@ -4193,7 +4195,7 @@ class TestToolNonStreamHardening:
         resp, _ = self._post(client, body=body, route=self._route())
         data = resp.json()
         assert data["object"] == "chat.completion"
-        assert data["model"] == "claude-opus-4-8"
+        assert data["model"] == "claude-opus-5"
 
     def test_translation_error_is_a_400_invalid_request(self, client) -> None:
         """A caller payload the provider cannot express is a 400

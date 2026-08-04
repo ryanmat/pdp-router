@@ -17,8 +17,10 @@ from pdp_router._models import (
     LLAMA_MAVERICK,
     LLAMA_SCOUT,
     OPUS,
+    OPUS_5,
     QWEN_3_7_PLUS,
     SONNET,
+    SONNET_5,
 )
 
 log = logging.getLogger(__name__)
@@ -67,6 +69,14 @@ class ModelRegistry:
 DEFAULT_REGISTRY = ModelRegistry(
     {
         # Tier 1: Frontier
+        OPUS_5: ModelCapability(
+            name=OPUS_5,
+            tier=1,
+            cost_per_mtok_in=5.0,
+            cost_per_mtok_out=25.0,
+            provider="anthropic",
+            available=True,
+        ),
         OPUS: ModelCapability(
             name=OPUS,
             tier=1,
@@ -82,6 +92,17 @@ DEFAULT_REGISTRY = ModelRegistry(
             cost_per_mtok_in=1.25,
             cost_per_mtok_out=10.0,
             provider="gemini",
+            available=True,
+        ),
+        SONNET_5: ModelCapability(
+            name=SONNET_5,
+            tier=2,
+            # List rates. Introductory pricing of $2/$10 per MTok runs through
+            # 2026-08-31; list is carried so cost-efficiency weighting does not
+            # over-favour this arm once the promotion lapses.
+            cost_per_mtok_in=3.0,
+            cost_per_mtok_out=15.0,
+            provider="anthropic",
             available=True,
         ),
         SONNET: ModelCapability(
@@ -300,7 +321,9 @@ def route_request(
     """
     tw = trust_weights or {}
     haiku_trust = tw.get(HAIKU, _DEFAULT_TRUST)
-    sonnet_trust = tw.get(SONNET, _DEFAULT_TRUST)
+    # Reads the trust of the arm this threshold actually gates -- the standard
+    # tier dispatches to SONNET_5, so SONNET's history must not move it.
+    sonnet_trust = tw.get(SONNET_5, _DEFAULT_TRUST)
 
     skip_thresh = _adjust_threshold(0.85, haiku_trust)
     if confidence > skip_thresh:
@@ -326,13 +349,13 @@ def route_request(
     standard_thresh = _adjust_threshold(0.40, sonnet_trust)
     if confidence > standard_thresh:
         return ModelSelection(
-            model=SONNET,
+            model=SONNET_5,
             tier=2,
             reason=f"conf={confidence:.2f}>{standard_thresh:.2f}: standard tier",
         )
 
     return ModelSelection(
-        model=OPUS,
+        model=OPUS_5,
         tier=1,
         reason=f"conf={confidence:.2f}<={standard_thresh:.2f}: frontier tier",
     )

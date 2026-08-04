@@ -15,8 +15,10 @@ from pdp_router._models import (
     GPT_5_5,
     HAIKU,
     OPUS,
+    OPUS_5,
     QWEN_3_7_PLUS,
     SONNET,
+    SONNET_5,
 )
 from pdp_router._router import (
     DEFAULT_REGISTRY,
@@ -98,22 +100,22 @@ class TestRouteRequest:
 
     def test_medium_confidence_without_agreement_selects_sonnet(self) -> None:
         sel = route_request(0.75, agreement_level=2)
-        assert sel.model == SONNET
+        assert sel.model == SONNET_5
         assert sel.tier == 2
 
     def test_moderate_confidence_selects_sonnet(self) -> None:
         sel = route_request(0.50)
-        assert sel.model == SONNET
+        assert sel.model == SONNET_5
         assert sel.tier == 2
 
     def test_low_confidence_selects_opus(self) -> None:
         sel = route_request(0.30)
-        assert sel.model == OPUS
+        assert sel.model == OPUS_5
         assert sel.tier == 1
 
     def test_zero_confidence_selects_opus(self) -> None:
         sel = route_request(0.0)
-        assert sel.model == OPUS
+        assert sel.model == OPUS_5
         assert sel.tier == 1
 
     def test_trust_weight_lowers_threshold(self) -> None:
@@ -133,7 +135,7 @@ class TestRouteRequest:
 class TestRouteWithFallback:
     def test_available_model_returned_directly(self) -> None:
         sel = route_with_fallback(0.50)
-        assert sel.model == SONNET
+        assert sel.model == SONNET_5
 
     def test_unavailable_model_falls_back(self) -> None:
         """If preferred model is unavailable, fall back to cheapest available."""
@@ -163,7 +165,7 @@ class TestConfidenceCascade:
     def test_returns_model_name_string(self) -> None:
         model = confidence_cascade(0.50)
         assert isinstance(model, str)
-        assert model == SONNET
+        assert model == SONNET_5
 
     def test_budget_downgrade(self) -> None:
         model = confidence_cascade(0.30, budget_action="downgrade")
@@ -172,7 +174,7 @@ class TestConfidenceCascade:
 
     def test_no_budget_action(self) -> None:
         model = confidence_cascade(0.30, budget_action=None)
-        assert model == OPUS
+        assert model == OPUS_5
 
 
 class TestNextCheaper:
@@ -286,7 +288,7 @@ class TestEpsilonGreedy:
         """With explore_rate=0.0, cascade is always deterministic."""
         for _ in range(20):
             model = confidence_cascade(0.50, explore_rate=0.0)
-            assert model == SONNET
+            assert model == SONNET_5
 
     def test_explore_rate_one_always_explores(self) -> None:
         """With explore_rate=1.0, every call picks a random available model."""
@@ -314,8 +316,8 @@ class TestEpsilonGreedy:
         for _ in range(100):
             cascade_only.add(confidence_cascade(0.50, explore_rate=0.0))
             explored.add(confidence_cascade(0.50, explore_rate=1.0, _rng=rng))
-        # Cascade at conf=0.50 always picks SONNET. Exploration should find others.
-        assert cascade_only == {SONNET}
+        # Cascade at conf=0.50 always picks Sonnet 5. Exploration finds others.
+        assert cascade_only == {SONNET_5}
         assert len(explored) > 1
 
     def test_deterministic_with_seed(self) -> None:
@@ -392,9 +394,9 @@ class TestDynamicExploreRate:
             cascade_picks.add(
                 confidence_cascade(0.50, agreement_level=8, explore_rate=0.10, _rng=rng)
             )
-        # At conf=0.50 cascade picks SONNET deterministically. With effective rate 0.02,
-        # roughly 4 of 200 calls explore. The dominant outcome must still be SONNET.
-        assert SONNET in cascade_picks
+        # At conf=0.50 cascade picks Sonnet 5 deterministically. With effective rate
+        # 0.02, ~4 of 200 calls explore. The dominant outcome must still be Sonnet 5.
+        assert SONNET_5 in cascade_picks
 
     def test_cascade_low_agreement_explores_more(self) -> None:
         """agreement_level=0 -> effective rate 0.25, exploration fires often."""
@@ -405,12 +407,12 @@ class TestDynamicExploreRate:
         for _ in range(400):
             if (
                 confidence_cascade(0.50, agreement_level=8, explore_rate=0.10, _rng=rng_high)
-                != SONNET
+                != SONNET_5
             ):
                 high_agreement_explores += 1
             if (
                 confidence_cascade(0.50, agreement_level=0, explore_rate=0.10, _rng=rng_low)
-                != SONNET
+                != SONNET_5
             ):
                 low_agreement_explores += 1
         # Expected: high agreement ~2% explore rate, low agreement ~25%.
@@ -423,7 +425,7 @@ class TestDynamicExploreRate:
         for _ in range(100):
             model = confidence_cascade(0.50, agreement_level=0, explore_rate=0.0, _rng=rng)
             # Deterministic cascade pick at conf=0.50, never explored.
-            assert model == SONNET
+            assert model == SONNET_5
 
     def test_cascade_flat_rate_preserved_when_none(self) -> None:
         """Flat rate behavior matches pre-S54 when agreement_level is None."""
@@ -433,7 +435,7 @@ class TestDynamicExploreRate:
         explored = 0
         for _ in range(1000):
             model = confidence_cascade(0.50, agreement_level=None, explore_rate=0.30, _rng=rng_flat)
-            if model != SONNET:
+            if model != SONNET_5:
                 explored += 1
         # Expected ~300 explores; tolerance for RNG variance.
         assert 220 <= explored <= 380
@@ -441,11 +443,11 @@ class TestDynamicExploreRate:
     def test_cascade_with_int_agreement_activates_dynamic(self) -> None:
         """Passing any int (even 0) activates dynamic rate, overriding explore_rate as the flat."""
         # At explore_rate=1.0 and agreement_level=9, effective rate is 0.02 (not 1.0).
-        # Over 200 calls, cascade pick (SONNET) should dominate.
+        # Over 200 calls, cascade pick (Sonnet 5) should dominate.
         rng = random.Random(11)
         sonnet_count = 0
         for _ in range(200):
-            if confidence_cascade(0.50, agreement_level=9, explore_rate=1.0, _rng=rng) == SONNET:
+            if confidence_cascade(0.50, agreement_level=9, explore_rate=1.0, _rng=rng) == SONNET_5:
                 sonnet_count += 1
         assert sonnet_count >= 180  # ~98% at 0.02 explore rate
 
@@ -524,8 +526,8 @@ class TestComputeRoutingPicks:
             explore_rate=0.0,
             _rng=rng,
         )
-        # confidence=0.50 -> cascade picks SONNET (>0.40 threshold).
-        assert picks.cascade_pick == SONNET
+        # confidence=0.50 -> cascade picks Sonnet 5 (>0.40 threshold).
+        assert picks.cascade_pick == SONNET_5
         # Bandit Thompson with mu=0.9/sigma=0.01 vs mu=0.4/sigma=0.01 -> OPUS.
         assert picks.shadow_pick == OPUS
         assert picks.cascade_explored is False
@@ -545,7 +547,7 @@ class TestComputeRoutingPicks:
         assert picks.shadow_pick_mu is None
         assert picks.shadow_pick_n_obs is None
         # Cascade pick still resolves.
-        assert picks.cascade_pick == SONNET
+        assert picks.cascade_pick == SONNET_5
 
     def test_shadow_none_when_bandit_states_empty(self) -> None:
         picks = compute_routing_picks(
@@ -566,7 +568,7 @@ class TestComputeRoutingPicks:
         """cascade_pick_mu and shadow_pick_mu match bandit_states[pick].mu."""
         states = {
             OPUS: BanditState(mu=0.9, sigma=0.01, n_obs=200),
-            SONNET: BanditState(mu=0.42, sigma=0.05, n_obs=120),
+            SONNET_5: BanditState(mu=0.42, sigma=0.05, n_obs=120),
         }
         rng = random.Random(7)
         picks = compute_routing_picks(
@@ -580,7 +582,7 @@ class TestComputeRoutingPicks:
             explore_rate=0.0,
             _rng=rng,
         )
-        assert picks.cascade_pick == SONNET
+        assert picks.cascade_pick == SONNET_5
         assert picks.cascade_pick_mu == pytest.approx(0.42)
         assert picks.cascade_pick_n_obs == 120
         assert picks.shadow_pick == OPUS
@@ -589,7 +591,7 @@ class TestComputeRoutingPicks:
 
     def test_mu_none_for_uncovered_model(self) -> None:
         """Cascade picks a model NOT in bandit_states -> cascade_pick_mu is None."""
-        # Bandit only has OPUS; confidence routes to SONNET.
+        # Bandit only has OPUS; confidence routes to Sonnet 5.
         states = {OPUS: BanditState(mu=0.9, sigma=0.01, n_obs=200)}
         rng = random.Random(7)
         picks = compute_routing_picks(
@@ -603,7 +605,7 @@ class TestComputeRoutingPicks:
             explore_rate=0.0,
             _rng=rng,
         )
-        assert picks.cascade_pick == SONNET
+        assert picks.cascade_pick == SONNET_5
         assert picks.cascade_pick_mu is None
         assert picks.cascade_pick_n_obs is None
         # Shadow picks OPUS, which IS in bandit_states.

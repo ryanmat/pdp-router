@@ -506,8 +506,8 @@ class TestNoDriverBackstop:
     def test_retired_driver_pick_is_walked_past_not_dispatched(self, client) -> None:
         """The kept-pick path checks usability, not bare membership: a cascade
         pick that IS a driver but is retired (available=False) must be walked
-        past to a usable one, never dispatched. Pick sonnet retired + opus
-        usable -> opus."""
+        past to a usable one, never dispatched. Retiring sonnet 4.6 leaves the
+        walk to land on the pinned driver for this turn."""
         from pdp_router._router import DEFAULT_REGISTRY
 
         cap = DEFAULT_REGISTRY.get("claude-sonnet-4-6")
@@ -535,7 +535,9 @@ class TestNoDriverBackstop:
         finally:
             object.__setattr__(cap, "available", True)
         assert resp.status_code == 200
-        assert mock_get_client.call_args[0][0] == "claude-opus-4-8"
+        # The load-bearing half: the retired arm is never the dispatched one.
+        assert mock_get_client.call_args[0][0] != "claude-sonnet-4-6"
+        assert mock_get_client.call_args[0][0] == "claude-sonnet-5"
 
     def test_no_usable_driver_refuses_a_stream_before_it_opens(self, client) -> None:
         """A streaming request degrades to the same JSON 503, not a 200 stream

@@ -1228,7 +1228,7 @@ class TestFaithfulPanelStreaming:
             assert json.loads(e).get("object") != "pdp.route_info"
         # Chair synthesis is what gets streamed; the chunk model marks the panel.
         assert _content(events) == "synth answer"
-        assert "pdp-panel-3+claude-sonnet-4-6" in resp.text
+        assert "pdp-panel-3+claude-sonnet-5" in resp.text
         # Terminal stop then [DONE].
         assert events[-1] == "[DONE]"
         last_chunk = json.loads(events[-2])
@@ -1276,7 +1276,7 @@ class TestFaithfulPanelStreaming:
         assert "[panel:" in full
         for member in _PANEL_MEMBERS:
             assert member in full
-        assert "chair: claude-sonnet-4-6" in full
+        assert "chair: claude-sonnet-5" in full
 
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
@@ -1637,7 +1637,7 @@ class TestFaithfulPanelStreaming:
             },
         )
         assert resp.status_code == 200
-        assert "pdp-panel-2+claude-sonnet-4-6" in resp.text  # 2 survivors, not 3
+        assert "pdp-panel-2+claude-sonnet-5" in resp.text  # 2 survivors, not 3
         rows = _read_inbox_rows(inbox_dir)
         member_rows = [r for r in rows if r["routing_mode"] == "panel"]
         chair_rows = [r for r in rows if r["routing_mode"] == "panel_chair"]
@@ -1646,7 +1646,7 @@ class TestFaithfulPanelStreaming:
         assert "gemini-2.5-pro" not in member_models  # errored arm excluded
         assert len(member_rows) == 2
         assert len(chair_rows) == 1
-        assert chair_rows[0]["model_selected"] == "claude-sonnet-4-6"
+        assert chair_rows[0]["model_selected"] == "claude-sonnet-5"
 
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
@@ -1669,7 +1669,7 @@ class TestFaithfulPanelStreaming:
         faithful error frame, not a torn stream with no finish_reason:stop."""
 
         def _factory(model_id, *_a, **_k):
-            if model_id == "claude-sonnet-4-6":  # the chair
+            if model_id == "claude-sonnet-5":  # the chair
                 raise RuntimeError("chair client boom")
             m = MagicMock()
             m.complete.side_effect = lambda *_ca, **_ck: _panel_member_completion("ok")
@@ -2088,11 +2088,11 @@ class TestToolStreamingDriverFloor:
             resp = client.post("/openai/v1/chat/completions", json=self._stream_body())
 
         assert resp.status_code == 200
-        assert mock_gc.call_args[0][0] == "claude-opus-4-8"
+        assert mock_gc.call_args[0][0] == "claude-opus-5"
         events = _parse_sse(resp.text)
         assert events[-1] == "[DONE]"
         chunks = [json.loads(e) for e in events[:-1]]
-        assert chunks and all(c["model"] == "claude-opus-4-8" for c in chunks)
+        assert chunks and all(c["model"] == "claude-opus-5" for c in chunks)
         assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
     def test_panel_worthy_stream_with_tools_takes_the_tool_path(self, client) -> None:

@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import pytest
 
-from pdp_router._cost import estimate_cost
+from pdp_router._cost import _MODEL_PRICING, estimate_cost
+from pdp_router._router import DEFAULT_REGISTRY
 
 
 class TestEstimateCost:
@@ -91,3 +92,36 @@ class TestEstimateCost:
 
     def test_missing_keys_default_to_zero(self) -> None:
         assert estimate_cost("claude-opus-4-7", {}) == 0.0
+
+    def test_opus_5_cost(self) -> None:
+        usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+        assert estimate_cost("claude-opus-5", usage) == pytest.approx(5.00 + 25.00)
+
+    def test_sonnet_5_cost(self) -> None:
+        # List price. Sonnet 5 carries introductory pricing of $2/$10 through
+        # 2026-08-31; the table encodes list so it does not silently under-price
+        # once the promotion lapses.
+        usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+        assert estimate_cost("claude-sonnet-5", usage) == pytest.approx(3.00 + 15.00)
+
+    def test_new_generation_has_its_own_row_not_a_prefix_coincidence(self) -> None:
+        # The 5-generation ids also match the generic "claude-sonnet"/"claude-opus"
+        # prefixes, which happen to carry the same rates today. Pinning them to
+        # their own rows keeps a future reprice of the 4-generation row from
+        # silently dragging the 5-generation arms with it.
+        rows = [prefix for prefix, _ in _MODEL_PRICING]
+        assert "claude-opus-5" in rows
+        assert "claude-sonnet-5" in rows
+        assert rows.index("claude-opus-5") < rows.index("claude-opus")
+        assert rows.index("claude-sonnet-5") < rows.index("claude-sonnet")
+
+
+class TestRegistryPricingParity:
+    """Every routable model must resolve to a real row, never the fallback."""
+
+    def test_every_registry_model_has_explicit_pricing(self) -> None:
+        for capability in DEFAULT_REGISTRY.available_models():
+            matched = [p for p, _ in _MODEL_PRICING if capability.name.startswith(p)]
+            assert matched, (
+                f"{capability.name} has no pricing row and would hit the fallback"
+            )

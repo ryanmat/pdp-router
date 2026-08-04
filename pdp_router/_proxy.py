@@ -30,8 +30,10 @@ from pdp_router._models import (
     GEMINI_PRO,
     GPT_5_5,
     OPUS,
+    OPUS_5,
     QWEN_3_7_PLUS,
     SONNET,
+    SONNET_5,
     CreditExhaustionError,
     expand_canonical_to_live,
 )
@@ -370,8 +372,16 @@ class ToolChatCompletionResponse(ChatCompletionResponse):
 # Gemini Flash-Lite is excluded on purpose -- it is the budget classifier arm and
 # its grounding quality is not validated, so a search-intent pick of it is floored
 # up to a confirmed searcher rather than trusted to search. Ordered for the floor:
-# Sonnet is the default target; the rest are availability fallbacks.
-_RELIABLE_SEARCHERS: tuple[str, ...] = (SONNET, OPUS, GEMINI_PRO, GEMINI_FLASH)
+# index 0 is the default target and the rest are availability fallbacks, so the
+# current-generation Sonnet leads and the prior generation stays as a fallback.
+_RELIABLE_SEARCHERS: tuple[str, ...] = (
+    SONNET_5,
+    OPUS_5,
+    SONNET,
+    OPUS,
+    GEMINI_PRO,
+    GEMINI_FLASH,
+)
 
 # Lexical pre-gate for explicit web-search intent on the latest user message.
 # Deterministic (no classifier LLM round-trip) so it needs no test mock and CI
@@ -445,7 +455,25 @@ def _search_floor_model() -> str | None:
 # requests); DeepSeek's client can too, but _client_kwargs carries no DeepSeek
 # credential path. Live registry ids in preference order, mirroring
 # _RELIABLE_SEARCHERS.
-_TOOL_DRIVERS: tuple[str, ...] = (SONNET, OPUS, GPT_5_5, QWEN_3_7_PLUS)
+_TOOL_DRIVERS: tuple[str, ...] = (
+    SONNET_5,
+    OPUS_5,
+    SONNET,
+    OPUS,
+    GPT_5_5,
+    QWEN_3_7_PLUS,
+)
+
+# Panel chair defaults. Both panel paths -- the non-streaming bot path and the
+# streaming faithful-surface path -- read these, so the literals live once.
+_CHAIR_MODEL_DEFAULT = SONNET_5
+# max_tokens bounds thinking and visible output together, and the 5-generation
+# Anthropic arms run adaptive thinking when the request omits a thinking
+# parameter, which this proxy always does. On the 4-generation arms that same
+# omission meant no thinking at all, so the previous 2048 was sized for a chair
+# that spent every token on the synthesis. Left there, reasoning would eat into
+# the budget and truncate the answer.
+_CHAIR_MAX_TOKENS_DEFAULT = "8192"
 
 
 def _tool_shaped_history(messages: list[ChatMessage]) -> bool:
@@ -1020,7 +1048,7 @@ def _configured_providers(config: ProxyConfig) -> dict[str, bool]:
     """Which provider credentials are actually present in this process.
 
     Registry size says nothing about reachability: the roster is a static list,
-    so /health reports 11 models with zero keys configured. This is what a
+    so /health reports the full roster with zero keys configured. This is what a
     first-run user needs instead, without spending a billable request to find out.
     """
     return {
@@ -1822,8 +1850,10 @@ async def _execute_panel_with_synth(
     assert _bandit_cache is not None
 
     panel_n = int(os.getenv("PROXY_AUTOPANEL_N", "3"))
-    chair_model = os.getenv("PROXY_CHAIR_MODEL", "claude-sonnet-4-6")
-    chair_max_tokens = int(os.getenv("PROXY_CHAIR_MAX_TOKENS", "2048"))
+    chair_model = os.getenv("PROXY_CHAIR_MODEL", _CHAIR_MODEL_DEFAULT)
+    chair_max_tokens = int(
+        os.getenv("PROXY_CHAIR_MAX_TOKENS", _CHAIR_MAX_TOKENS_DEFAULT)
+    )
 
     results, members = await _run_panel_members(
         request=request,
@@ -2868,8 +2898,10 @@ async def _iter_panel_sse(
     start = time.monotonic()
 
     panel_n = int(os.getenv("PROXY_AUTOPANEL_N", "3"))
-    chair_model = os.getenv("PROXY_CHAIR_MODEL", "claude-sonnet-4-6")
-    chair_max_tokens = int(os.getenv("PROXY_CHAIR_MAX_TOKENS", "2048"))
+    chair_model = os.getenv("PROXY_CHAIR_MODEL", _CHAIR_MODEL_DEFAULT)
+    chair_max_tokens = int(
+        os.getenv("PROXY_CHAIR_MAX_TOKENS", _CHAIR_MAX_TOKENS_DEFAULT)
+    )
     keepalive_s = float(os.getenv("PROXY_PANEL_KEEPALIVE_S", "10"))
 
     # Lead with the assistant-role delta so a strict reader (Crush) sees a
