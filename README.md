@@ -1,50 +1,37 @@
-<div align="center">
-
 # pdp-router
 
-**An outcome-fed router for heterogeneous AI models.**
+An outcome-fed router for heterogeneous AI models: a confidence cascade, a
+Thompson Sampling bandit, and a multi-model panel behind two OpenAI-compatible
+surfaces.
 
 [![ci](https://github.com/ryanmat/pdp-router/actions/workflows/ci.yml/badge.svg)](https://github.com/ryanmat/pdp-router/actions/workflows/ci.yml)
-[![python](https://img.shields.io/badge/python-3.11_%7C_3.12_%7C_3.13-3776AB?logo=python&logoColor=white)](https://github.com/ryanmat/pdp-router/blob/main/pyproject.toml)
-[![license](https://img.shields.io/github/license/ryanmat/pdp-router)](https://github.com/ryanmat/pdp-router/blob/main/LICENSE)
-[![ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-</div>
+## Overview
 
-pdp-router routes a single request across many AI models and learns, from real
-outcomes, which model to trust for a given job. It starts from a confidence cascade, logs every routing
-decision, and lets recorded outcomes reshape the trust weights and Thompson
-Sampling posteriors behind future decisions. Point an OpenAI-compatible client
-at it, and it picks the model, or convenes a panel of models, for you.
+pdp-router sits behind an OpenAI-compatible endpoint and decides, per request,
+which model answers. A cheap classifier scores request complexity. A confidence
+cascade starts at the cheapest capable model and escalates only when confidence
+is low; with `ROUTING_MODE=bandit`, Thompson Sampling over per-model,
+per-domain posteriors makes the pick instead. Decomposable queries can convene
+a panel of lineage-diverse models in parallel, with a chair model synthesizing
+the answers. Every routing decision is logged as a JSONL row. Grade those rows
+against outcomes you care about, write the results back to a SQLite trust DB,
+and the trust weights and posteriors reshape future routing. With no trust DB,
+it routes on the static cascade.
 
-## Features
+LiteLLM and OpenRouter are gateways: many models behind one API. pdp-router is
+a smaller, more opinionated thing built on the same idea: a learned router with
+a measured feedback loop. If you want a gateway, use those. If you want a
+router that logs its decisions and improves from graded outcomes, this is a
+reference implementation of that, extracted from a production system.
 
-- **Outcome-fed.** Every routing decision is logged, and real outcomes flow back
-  into per-model, per-domain trust weights and Thompson Sampling posteriors.
-- **Confidence cascade.** Start at the cheapest capable model and escalate only
-  when confidence is low. Pay for the big model when the question earns it.
-- **Multi-model panel.** On hard queries, fan out to several lineage-diverse
-  models in parallel and synthesize their answers with a chair model.
-- **Two OpenAI-compatible surfaces.** A default one that reports the routed
-  model inline, and a byte-faithful one that strict agent clients accept without
-  knowing a router is there.
-- **Cognitive diversity by design.** Thirteen models across six training lineages,
-  chosen because different lineages fail differently.
-- **Bring your own outcomes.** Point it at a SQLite trust DB your grading
-  process populates. With no DB, it routes on the static cascade.
-- **Observability built in.** Optional OpenTelemetry traces, metrics, and GenAI
-  instrumentation. Point `OTEL_EXPORTER_OTLP_ENDPOINT` at any OTLP collector,
-  including LangSmith, with no extra dependency.
+The roster is thirteen models across six training lineages: Anthropic (Opus,
+Sonnet, Haiku), Google (Gemini Pro, Flash, Flash-Lite), Meta Llama 4 (Scout
+and Maverick via Vertex AI), DeepSeek, and OpenAI and Qwen via OpenRouter. The
+lineage spread is deliberate: different training lineages fail differently,
+and the panel selects across lineages rather than stacking near-clones.
 
-## Where it fits
-
-LiteLLM and OpenRouter are excellent gateways for reaching many
-models behind one API. pdp-router is a smaller, more opinionated thing: a
-learned router with a real feedback loop wrapped around that idea. If you want a
-gateway, use those. If you want a router that measures its own decisions and
-improves from them, clone this and bring your outcomes.
-
-## Current results
+## Results
 
 At a 100% bandit-routing flip on one production domain, the bandit's outcome
 rate was 0.800 vs the static confidence cascade's 0.893 (n=80 graded
@@ -52,9 +39,13 @@ decisions, Fisher exact p=0.017), monotonically worsening in 20-row windows.
 The flip was reverted to a 10% canary the same day, under a tripwire
 pre-committed before the flip.
 
-The reward signal (did the alert clear?) was blind to output quality. A model emitting garbage text was not penalized as long as the alert resolved. The fix upstream is a rubric-based judge ensemble as a second outcome source, soaking before it earns bandit weight. 
+The reward signal (did the alert clear?) was blind to output quality. A model
+emitting garbage text was not penalized as long as the alert resolved. The fix
+upstream is a rubric-based judge ensemble as a second outcome source, soaking
+before it earns bandit weight.
 
-Takeaway: A learned router can only beat a good heuristic when its reward measures what the user actually cares about. 
+A learned router beats a good heuristic only when its reward measures what the
+user actually cares about.
 
 ## Architecture
 
@@ -83,19 +74,26 @@ flowchart TD
 | `_models.py` | Model ID constants and the live roster |
 | `_tracing.py` | Optional OpenTelemetry export (traces, metrics, logs, GenAI instrumentation) |
 
-The roster spans six training lineages: Anthropic (Opus, Sonnet, Haiku), Google
-(Gemini Pro, Flash, Flash-Lite), Meta Llama 4 (Scout and Maverick via Vertex
-AI), DeepSeek, and OpenAI and Qwen via OpenRouter. Thirteen models in total. The
-deliberate point is **cognitive diversity**: different training lineages fail
-differently, and the panel selects across lineages rather than stacking
-near-clones.
+## Setup
 
-## Quickstart
+Python 3.11 to 3.13.
 
 ```bash
 git clone https://github.com/ryanmat/pdp-router && cd pdp-router
 cp .env.example .env          # add one provider key
 uv sync --all-extras
+```
+
+Tests and lint are hermetic: no network, no databases, no credentials.
+
+```bash
+uv run pytest -q
+uv run ruff check .
+```
+
+## Usage
+
+```bash
 uv run pdp-router-proxy
 ```
 
@@ -110,35 +108,39 @@ curl -s http://127.0.0.1:7741/v1/chat/completions \
 `model: pdp-auto` engages routing; a concrete model ID pins that model.
 `GET /v1/models` lists the roster. `GET /health` reports which provider
 credentials actually landed and whether a trust DB was found, so you can
-confirm your setup without spending a request. Strict agent clients should use
-the faithful surface at `/openai/v1/chat/completions`.
+confirm your setup without spending a request.
 
-**One provider key is enough.** With only `ANTHROPIC_API_KEY` set, the Gemini
+Two surfaces: `/v1/chat/completions` reports the routed model inline in the
+`model` field; `/openai/v1/chat/completions` is byte-faithful for strict agent
+clients that reject responses naming a model they did not request.
+
+One provider key is enough. With only `ANTHROPIC_API_KEY` set, the Gemini
 complexity classifier falls back cross-lineage to Haiku and routing works
-normally; the arms you have no credentials for are simply never selected. With
-no trust DB present, the confidence cascade routes on defaults. The learned
-layer activates when you bring outcomes (next section).
+normally; the arms you have no credentials for are never selected. With no
+trust DB present, the confidence cascade routes on defaults. The learned layer
+activates when you bring outcomes (below).
 
 `uv run pdp-router-proxy` is the launch path that reads `.env`. If you invoke
 uvicorn directly, either export the variables yourself or use
 `uv run --env-file .env uvicorn pdp_router._proxy:app`. Real environment
 variables always take precedence over the file.
 
-> **No authentication.** The proxy binds `127.0.0.1` and has no auth, no rate
+> No authentication. The proxy binds `127.0.0.1` and has no auth, no rate
 > limiting, and no quota. Anything that can reach the port can spend your
 > provider credits. Put your own auth in front of it before exposing it
 > anywhere, and treat `PROXY_HOST=0.0.0.0` as a deliberate decision.
 
-The panel, streaming, effort routing, and web search are opt-in. Turn them on
-with environment variables (see `.env.example`); for example
-`PROXY_AUTOPANEL_ENABLED=1` convenes the panel on hard queries. Defaults are
-conservative: a fresh clone runs the single-model cascade until you enable the
-extras.
+## Configuration
 
-## Bring your own outcomes
+Defaults are conservative: a fresh clone runs the single-model cascade. The
+panel, streaming, effort routing, web search, and tool passthrough are opt-in
+environment toggles, documented in `.env.example`. For example,
+`PROXY_AUTOPANEL_ENABLED=1` convenes the panel on hard queries.
+
+### Outcomes
 
 The bandit and trust weights read from a SQLite DB (default
-`~/.pdp-router/pdp_tracker.db`, override `PROXY_TRUST_DB`) that **your** grading
+`~/.pdp-router/pdp_tracker.db`, override `PROXY_TRUST_DB`) that your grading
 process populates:
 
 ```sql
@@ -153,14 +155,15 @@ CREATE TABLE bandit_state (
 Every request appends a routing-decision row to a JSONL inbox (default
 `~/.pdp-router/inbox/proxy-YYYYMMDD.jsonl`, override `PROXY_ROUTING_INBOX_DIR`).
 Drain those rows into your store, grade them against whatever outcome you care
-about, recompute posteriors, write them back. That loop, not this code, is where
-the value lives.
+about, recompute posteriors, write them back. The router is only as good as
+this loop.
 
-Reading a row, the three fields that matter most:
+Reading a row, the fields that matter most:
 
 | Field | Meaning |
 |---|---|
-| `context_json.chat_request_id` | **Join on this.** The request UUID, identical to the `X-PDP-Prediction-Id` response header. `alert_id` carries it too, as `chat-<uuid>`. |
+| `context_json.chat_request_id` | Join on this. The request UUID, identical to the `X-PDP-Prediction-Id` response header. `alert_id` carries it too, as `chat-<uuid>`. |
+| `model_selected` | The model that served the request. Group outcomes by this to grade per model. |
 | `routing_mode` | The policy that actually produced the pick: `bandit` when Thompson Sampling ran, `cascade` for the thresholds, `explicit` when the caller pinned a model, `panel`/`panel_chair` for panel rows. Group by this to compare policies. |
 | `cascade_explored` | `true` when the pick came from the epsilon-greedy explore branch and is uniform-random rather than threshold-driven. Exclude these before computing agreement rates. |
 
@@ -172,7 +175,7 @@ readable `bandit_state` table, routing silently falls through to the cascade. Th
 proxy warns at startup when that happens, and `routing_mode` on each row records
 which policy actually served the request.
 
-## Tracing
+### Tracing
 
 Nothing is exported and no GenAI instrumentation is loaded until you set an OTLP
 endpoint. Any OTLP-compatible backend works. LangSmith needs no SDK and no extra
@@ -184,7 +187,7 @@ OTEL_EXPORTER_OTLP_HEADERS=x-api-key=<your-key>,Langsmith-Project=pdp-router
 ```
 
 Traces carry the routing decision, token usage, latency, and cost per arm.
-Prompt and completion **text** is not recorded unless you set
+Prompt and completion text is not recorded unless you set
 `OTEL_CAPTURE_CONTENT=1`, because turning that on ships the content of every
 request and response to your backend.
 
