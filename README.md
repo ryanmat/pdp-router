@@ -28,7 +28,7 @@ at it, and it picks the model, or convenes a panel of models, for you.
 - **Two OpenAI-compatible surfaces.** A default one that reports the routed
   model inline, and a byte-faithful one that strict agent clients accept without
   knowing a router is there.
-- **Cognitive diversity by design.** Eleven models across six training lineages,
+- **Cognitive diversity by design.** Thirteen models across six training lineages,
   chosen because different lineages fail differently.
 - **Bring your own outcomes.** Point it at a SQLite trust DB your grading
   process populates. With no DB, it routes on the static cascade.
@@ -85,7 +85,7 @@ flowchart TD
 
 The roster spans six training lineages: Anthropic (Opus, Sonnet, Haiku), Google
 (Gemini Pro, Flash, Flash-Lite), Meta Llama 4 (Scout and Maverick via Vertex
-AI), DeepSeek, and OpenAI and Qwen via OpenRouter. Eleven models in total. The
+AI), DeepSeek, and OpenAI and Qwen via OpenRouter. Thirteen models in total. The
 deliberate point is **cognitive diversity**: different training lineages fail
 differently, and the panel selects across lineages rather than stacking
 near-clones.

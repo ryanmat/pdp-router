@@ -13,7 +13,7 @@ What that means in practice:
   the commit message. Your PR will be closed, not merged -- nothing personal,
   it is how the mirror stays consistent.
 - **No support contract.** This is a reference implementation; see the
-  README's "What this is" section.
+  README's "Where it fits" section.
 
 ## Dev setup
 
