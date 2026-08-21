@@ -107,6 +107,7 @@ def _route(model: str = "claude-sonnet-4-6", panel_score: int = 0) -> tuple:
         0.55,
         3,
         panel_score,
+        "general",
         False,
         "",
         [ChatMessage(role="user", content="hi")],
@@ -176,7 +177,7 @@ class TestFlagOffFourShapeContract:
         )
 
     @patch("pdp_router._proxy._tool_passthrough_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.confidence_cascade", return_value=("claude-sonnet-4-6", False))
     @patch("pdp_router._proxy.get_client")
     def test_tool_role_message_with_content_proceeds_to_the_provider(
@@ -199,7 +200,7 @@ class TestFlagOffFourShapeContract:
         assert {"role": "tool", "content": "a.txt"} in messages
 
     @patch("pdp_router._proxy._tool_passthrough_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.confidence_cascade", return_value=("claude-sonnet-4-6", False))
     @patch("pdp_router._proxy.get_client")
     def test_assistant_tool_calls_with_content_serves_and_drops_the_tool_fields(
@@ -299,7 +300,7 @@ class TestV1SurfaceUntouched:
     """
 
     @patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.confidence_cascade", return_value=("claude-sonnet-4-6", False))
     @patch("pdp_router._proxy.get_client")
     def test_v1_ignores_a_canonical_tool_request_even_with_the_flag_on(
@@ -396,7 +397,7 @@ class TestPanelInvariants:
     @patch("pdp_router._proxy._tool_passthrough_enabled", return_value=False)
     @patch("pdp_router._proxy._web_search_enabled", return_value=False)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_flag_off_panel_members_see_no_tools_kwarg_when_tools_ride(

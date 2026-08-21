@@ -421,6 +421,9 @@ def confidence_cascade(
     routing_context: object | None = None,
     context_bandit_states: dict | None = None,
     return_debug: bool = False,
+    uplift_baseline: str | None = None,
+    uplift_min_prob: float = 0.75,
+    uplift_min_obs: int = 10,
 ) -> str | tuple[str, bool]:
     """Full routing pipeline: cascade + fallback + budget override -> model name.
 
@@ -467,6 +470,13 @@ def confidence_cascade(
             Bandit-mode picks are not "exploration" in this sense (the
             posterior sampling is the bandit's exploration mechanism), so
             ``explored=False`` in bandit mode.
+        uplift_baseline: When set (bandit mode only), arms other than this
+            baseline become sampleable only after clearing the one-sided
+            uplift bar (see eligible_arms): posterior beats the baseline's
+            with probability >= uplift_min_prob on >= uplift_min_obs
+            observations. Bounded promotion rather than free arm selection --
+            the bandit can only move traffic OFF the baseline onto arms with
+            demonstrated uplift. None (default) disables the gate entirely.
 
     Returns:
         Model name string ready to pass to get_client(), OR a
@@ -483,6 +493,7 @@ def confidence_cascade(
             RoutingContext,
             apply_cost_to_bandit,
             contextual_thompson_sample,
+            eligible_arms,
             thompson_sample,
         )
 
@@ -499,6 +510,14 @@ def confidence_cascade(
                     m.name: m.cost_per_mtok_in + m.cost_per_mtok_out for m in reg.available_models()
                 }
                 domain_states = apply_cost_to_bandit(domain_states, costs)
+            if uplift_baseline:
+                # Gate AFTER cost adjustment, so the bar is measured on the
+                # same posteriors the sampler sees. Contextual states are not
+                # gated: their _CONTEXT_MIN_OBS fallback already lands on
+                # these gated domain states.
+                domain_states = eligible_arms(
+                    domain_states, uplift_baseline, uplift_min_prob, uplift_min_obs
+                )
 
             pick = contextual_thompson_sample(
                 context_states=context_bandit_states,
@@ -527,6 +546,10 @@ def confidence_cascade(
                     m.name: m.cost_per_mtok_in + m.cost_per_mtok_out for m in reg.available_models()
                 }
                 states = apply_cost_to_bandit(states, costs)
+            if uplift_baseline:
+                states = eligible_arms(
+                    states, uplift_baseline, uplift_min_prob, uplift_min_obs
+                )
 
             pick = thompson_sample(states, rng=_rng)
             log.info("Thompson pick: %s (mode=bandit)", pick)

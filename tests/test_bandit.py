@@ -557,3 +557,90 @@ class TestPrecursorRawSignals:
             forecast_uncertainty=0.3,
         )
         assert base.signal_density() == with_floats.signal_density()
+
+
+class TestProbBeats:
+    def test_symmetry(self) -> None:
+        from pdp_router._bandit import prob_beats
+
+        a = BanditState(mu=0.7, sigma=0.05, n_obs=50)
+        b = BanditState(mu=0.6, sigma=0.05, n_obs=50)
+        assert prob_beats(a, b) + prob_beats(b, a) == pytest.approx(1.0)
+        assert prob_beats(a, b) > 0.5
+
+    def test_equal_posteriors_are_a_coin_flip(self) -> None:
+        from pdp_router._bandit import prob_beats
+
+        a = BanditState(mu=0.5, sigma=0.1)
+        assert prob_beats(a, a) == pytest.approx(0.5)
+
+    def test_wide_sigma_dilutes_a_mu_edge(self) -> None:
+        # The same mean gap is less convincing from a noisy posterior.
+        from pdp_router._bandit import prob_beats
+
+        baseline = BanditState(mu=0.5, sigma=0.05)
+        sharp = BanditState(mu=0.6, sigma=0.02)
+        noisy = BanditState(mu=0.6, sigma=0.25)
+        assert prob_beats(sharp, baseline) > prob_beats(noisy, baseline)
+
+    def test_zero_variance_falls_back_to_mu_comparison(self) -> None:
+        from pdp_router._bandit import prob_beats
+
+        hi = BanditState(mu=0.9, sigma=0.0)
+        lo = BanditState(mu=0.1, sigma=0.0)
+        assert prob_beats(hi, lo) == 1.0
+        assert prob_beats(lo, hi) == 0.0
+        assert prob_beats(hi, hi) == 0.5
+
+
+class TestEligibleArms:
+    _BASELINE = "cheap-model"
+
+    def _states(self) -> dict:
+        return {
+            self._BASELINE: BanditState(mu=0.60, sigma=0.02, n_obs=200),
+            "clear-winner": BanditState(mu=0.80, sigma=0.02, n_obs=100),
+            "marginal": BanditState(mu=0.61, sigma=0.05, n_obs=100),
+            "young-star": BanditState(mu=0.95, sigma=0.02, n_obs=3),
+            "loser": BanditState(mu=0.40, sigma=0.02, n_obs=100),
+        }
+
+    def test_only_demonstrated_uplift_survives(self) -> None:
+        from pdp_router._bandit import eligible_arms
+
+        kept = eligible_arms(self._states(), self._BASELINE)
+        assert set(kept) == {self._BASELINE, "clear-winner"}
+
+    def test_baseline_always_retained(self) -> None:
+        from pdp_router._bandit import eligible_arms
+
+        states = {
+            self._BASELINE: BanditState(mu=0.9, sigma=0.02, n_obs=200),
+            "loser": BanditState(mu=0.1, sigma=0.02, n_obs=100),
+        }
+        kept = eligible_arms(states, self._BASELINE)
+        assert set(kept) == {self._BASELINE}
+
+    def test_min_obs_blocks_a_lucky_prior(self) -> None:
+        from pdp_router._bandit import eligible_arms
+
+        kept = eligible_arms(self._states(), self._BASELINE, min_obs=10)
+        assert "young-star" not in kept
+        kept_low_bar = eligible_arms(self._states(), self._BASELINE, min_obs=2)
+        assert "young-star" in kept_low_bar
+
+    def test_missing_baseline_returns_states_unchanged(self) -> None:
+        from pdp_router._bandit import eligible_arms
+
+        states = self._states()
+        kept = eligible_arms(states, "not-a-model")
+        assert kept == states
+        assert kept is not states  # copy, not the caller's dict
+
+    def test_min_prob_is_the_bar(self) -> None:
+        from pdp_router._bandit import eligible_arms, prob_beats
+
+        states = self._states()
+        p = prob_beats(states["marginal"], states[self._BASELINE])
+        assert "marginal" in eligible_arms(states, self._BASELINE, min_prob=p - 0.01)
+        assert "marginal" not in eligible_arms(states, self._BASELINE, min_prob=p + 0.01)

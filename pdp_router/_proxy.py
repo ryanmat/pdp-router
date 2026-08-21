@@ -23,6 +23,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError, model_validator
 
 from pdp_router._clients import CompletionResult, get_client
+from pdp_router._conversation import ConversationCache
+from pdp_router._cost import estimate_cost
 from pdp_router._effort import level_for_score, supports_effort
 from pdp_router._lineage import classify_lineage
 from pdp_router._models import (
@@ -196,6 +198,82 @@ def _tool_passthrough_enabled() -> bool:
     return _flag_enabled(
         "pipeline.proxy_tool_passthrough_enabled",
         "PROXY_TOOL_PASSTHROUGH_ENABLED",
+        default=False,
+    )
+
+
+def _implicit_feedback_enabled() -> bool:
+    """Return True if pipeline.proxy_implicit_feedback_enabled is on (default False).
+
+    Emits one extra routing row per routed multi-turn exchange grading the
+    PREVIOUS turn by what the user did next (moved on / corrected / retried).
+    Zero LLM cost, deterministic heuristics only. This is the cheapest outcome
+    signal the chat surface can produce and the accumulation source for the
+    future learning loop. Default OFF: ship dark, sample the emitted signals
+    against real conversations, then enable to start accruing.
+    """
+    return _flag_enabled(
+        "pipeline.proxy_implicit_feedback_enabled",
+        "PROXY_IMPLICIT_FEEDBACK_ENABLED",
+        default=False,
+    )
+
+
+def _prompt_caching_enabled() -> bool:
+    """Return True if pipeline.proxy_prompt_caching_enabled is on (default False).
+
+    Marks the prompt prefix of with-tools requests cacheable (Anthropic
+    cache_control breakpoints on the system block and last message). Scoped to
+    the agent-tool paths, where every turn re-sends a growing transcript
+    within seconds and cache reads (0.1x input) are near-guaranteed. Default
+    OFF because cache WRITES bill at 1.25x input: a one-shot conversation with
+    this on costs more, not less. Ship dark, watch the cache-token telemetry
+    on live agent traffic, then enable. The plain multi-turn paths are
+    deliberately untouched (their bodies are frozen and their 5-minute-TTL
+    hit rate is unproven).
+    """
+    return _flag_enabled(
+        "pipeline.proxy_prompt_caching_enabled",
+        "PROXY_PROMPT_CACHING_ENABLED",
+        default=False,
+    )
+
+
+def _spend_cap_enabled() -> bool:
+    """Return True if pipeline.proxy_spend_cap_enabled is on (default False).
+
+    Gates the per-conversation spend ceiling: a one-shot footer warning at
+    PROXY_CONVERSATION_BUDGET_WARN_USD and an insufficient_quota refusal for
+    requests arriving after the conversation crossed
+    PROXY_CONVERSATION_BUDGET_MAX_USD. A runaway agent loop on a frontier-
+    floored tool conversation is the failure this bounds. Default OFF: the
+    tracked spend is soft (in-memory, resets on restart, undercounts
+    usage-silent streams), so the cap ships dark until the accounting has
+    been watched on live traffic.
+    """
+    return _flag_enabled(
+        "pipeline.proxy_spend_cap_enabled",
+        "PROXY_SPEND_CAP_ENABLED",
+        default=False,
+    )
+
+
+def _sticky_driver_enabled() -> bool:
+    """Return True if pipeline.proxy_sticky_driver_enabled is on (default False).
+
+    Makes tool conversations fully sticky: the first driver that serves a
+    conversation keeps serving it, even when a later turn's cascade pick is
+    itself a usable driver. The win is provider prompt-cache continuity -- a
+    multi-turn agent transcript re-read from a warm cache costs a fraction of
+    the cold read that every mid-conversation model switch forces, and at
+    agent transcript lengths that usually outweighs the tier savings of
+    per-turn routing. Default OFF: it inverts the floor-not-override design,
+    so it ships dark and turns on only after live acceptance. The
+    PROXY_TOOL_MODEL operator override still beats the sticky driver.
+    """
+    return _flag_enabled(
+        "pipeline.proxy_sticky_driver_enabled",
+        "PROXY_STICKY_DRIVER_ENABLED",
         default=False,
     )
 
@@ -430,6 +508,37 @@ def _has_search_intent(messages: list[ChatMessage]) -> bool:
     return bool(_SEARCH_INTENT_RE.search(user_msgs[-1][:2000]))
 
 
+# v1 correction heuristics for implicit feedback. Deliberately small and ASCII:
+# explicit negation/correction phrasings plus imperative rollbacks. Precision
+# over recall -- a missed correction reads as moved_on (weak positive noise),
+# while a false correction poisons the negative signal.
+_CORRECTION_MARKERS = re.compile(
+    r"(?:^no\b)"
+    r"|\b(?:not what i|that'?s (?:wrong|not)|wrong|incorrect|undo|revert|instead"
+    r"|try again|start over|still (?:wrong|broken|not working)|don'?t)\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_implicit_feedback(latest_text: str, previous_digest: str | None) -> str:
+    """Deterministically grade the user's next turn against the previous one.
+
+    Moving on to the next task is positive signal; correcting the agent is
+    negative. No LLM: the marker list catches explicit corrections, and an
+    exact re-send of the previous user text catches the silent retry. Noisy
+    by design -- volume, not per-row precision, is what makes the signal
+    usable downstream.
+    """
+    if (
+        previous_digest is not None
+        and hashlib.sha256(latest_text.encode("utf-8")).hexdigest() == previous_digest
+    ):
+        return "retry"
+    if _CORRECTION_MARKERS.search(latest_text[:2000]):
+        return "correction"
+    return "moved_on"
+
+
 def _search_floor_model() -> str | None:
     """Return the preferred AVAILABLE reliable searcher for the search-intent
     floor, or None if none are available.
@@ -583,26 +692,95 @@ def _tool_row_context(
 # -- Classification --
 
 CLASSIFY_SYSTEM = (
-    "Rate the user's request on two axes.\n"
+    "Rate the user's request on three axes.\n"
     "1) Complexity (1-5): 1=trivial lookup, 5=deep frontier-grade reasoning.\n"
     "2) Panel-worth (0-10): how much would synthesizing 3 model perspectives "
     "improve the answer vs picking one model? 0=identical, 10=clearly multi-angle. "
     "High panel-worth signals: 'compare', 'trade-off', 'pros/cons', multi-part "
     "questions, open-ended design/strategy queries, conflicting-info topics.\n"
-    "Reply with EXACTLY two integers separated by a single space (e.g. '4 8')."
+    "3) Task category (1-6): 1=general chat/Q&A, 2=writing new code, "
+    "3=debugging or fixing code, 4=planning/architecture/code comprehension, "
+    "5=ops (git, deploy, infra, databases), 6=prose writing or editing.\n"
+    "Reply with EXACTLY three integers separated by single spaces (e.g. '4 8 2')."
 )
 
 _SCORE_TO_CONFIDENCE = {1: 0.95, 2: 0.75, 3: 0.55, 4: 0.35, 5: 0.15}
 
+# Budget modes: aliases of the auto model that shift the score->confidence
+# mapping one tier down (cost) or up (max) while leaving the classifier, the
+# thresholds, and every explicit-model path untouched. Downstream clients that
+# hardcode "pdp-auto" are unaffected; the aliases are opt-in per client config.
+_AUTO_MODEL_MODES: dict[str, str] = {
+    "pdp-auto": "balanced",
+    "": "balanced",
+    "pdp-auto-cost": "cost",
+    "pdp-auto-max": "max",
+}
 
-def _parse_classifier(text: str) -> tuple[int, int] | None:
-    """Parse the classifier reply into (complexity, panel_score).
+_MODE_SCORE_TO_CONFIDENCE: dict[str, dict[int, float]] = {
+    "balanced": _SCORE_TO_CONFIDENCE,
+    # One tier cheaper: a score-2 request reads as trivial, a score-4 as
+    # moderate. High confidence = cheap model in this cascade's inversion.
+    "cost": {1: 0.95, 2: 0.95, 3: 0.75, 4: 0.55, 5: 0.35},
+    # One tier stronger: a score-1 request reads as moderate, 4 and 5 both
+    # land on the frontier tier.
+    "max": {1: 0.75, 2: 0.55, 3: 0.35, 4: 0.15, 5: 0.15},
+}
 
-    Handles two shapes:
-      - '4 8'  -> (4, 8)            Sprint X.K two-int format.
-      - '4'    -> (4, 0)            Pre-X.K single-int back-compat.
 
-    Complexity clamped to [1, 5]; panel_score clamped to [0, 10]. Returns
+def _parse_auto_model(model: str) -> tuple[bool, str]:
+    """Return (is_auto, mode) for a request's model field.
+
+    ("pdp-auto", "") -> (True, "balanced"); the -cost/-max aliases return
+    their mode; anything else -- including an unknown pdp-auto-* -- is
+    (False, ""), which sends it down the explicit-model path where the
+    registry 400 gives the caller a real error instead of a silent default.
+    """
+    mode = _AUTO_MODEL_MODES.get(model)
+    if mode is None:
+        return False, ""
+    return True, mode
+
+# Task-category names, indexed by classifier code - 1. Telemetry for the
+# routing rows (per-category model-strength analysis needs the label recorded
+# at decision time); nothing routes on it.
+_TASK_CATEGORIES: tuple[str, ...] = (
+    "general",
+    "codegen",
+    "debugging",
+    "planning",
+    "ops",
+    "writing",
+)
+
+
+def _task_category_from_code(raw: str) -> str:
+    """Map the classifier's third integer to a category name.
+
+    Non-integer or out-of-range values collapse to "general" instead of
+    failing the parse: the first two fields carry routing weight, the third
+    is telemetry, and returning None over a bad category would re-bill the
+    classifier through the retry/fallback path for nothing.
+    """
+    try:
+        code = int(raw)
+    except ValueError:
+        return _TASK_CATEGORIES[0]
+    if 1 <= code <= len(_TASK_CATEGORIES):
+        return _TASK_CATEGORIES[code - 1]
+    return _TASK_CATEGORIES[0]
+
+
+def _parse_classifier(text: str) -> tuple[int, int, str] | None:
+    """Parse the classifier reply into (complexity, panel_score, task_category).
+
+    Handles three shapes:
+      - '4 8 2' -> (4, 8, "codegen")   three-int format.
+      - '4 8'   -> (4, 8, "general")   Sprint X.K two-int back-compat.
+      - '4'     -> (4, 0, "general")   pre-X.K single-int back-compat.
+
+    Complexity clamped to [1, 5]; panel_score clamped to [0, 10]; category
+    resolved by _task_category_from_code (never fails the parse). Returns
     None on an unparseable reply so _classify_request can treat it as a
     classifier failure (retry/fallback) instead of a silent (3, 0) collapse
     that would disable the auto-panel with no trace.
@@ -610,10 +788,20 @@ def _parse_classifier(text: str) -> tuple[int, int] | None:
     try:
         cleaned = strip_markdown_fences(text).strip()
         parts = cleaned.split()
-        if len(parts) >= 2:
-            return (max(1, min(5, int(parts[0]))), max(0, min(10, int(parts[1]))))
+        if len(parts) >= 3:
+            return (
+                max(1, min(5, int(parts[0]))),
+                max(0, min(10, int(parts[1]))),
+                _task_category_from_code(parts[2]),
+            )
+        if len(parts) == 2:
+            return (
+                max(1, min(5, int(parts[0]))),
+                max(0, min(10, int(parts[1]))),
+                _TASK_CATEGORIES[0],
+            )
         if len(parts) == 1:
-            return (max(1, min(5, int(parts[0]))), 0)
+            return (max(1, min(5, int(parts[0]))), 0, _TASK_CATEGORIES[0])
     except (ValueError, IndexError):
         pass
     return None
@@ -650,8 +838,10 @@ def _classify_retryable(exc: Exception) -> bool:
     )
 
 
-def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple[float, int, int]:
-    """Classify request complexity, return (confidence, score, panel_score).
+def _classify_request(
+    messages: list[ChatMessage], config: ProxyConfig
+) -> tuple[float, int, int, str]:
+    """Classify request complexity, return (confidence, score, panel_score, task_category).
 
     The classifier call is retried a bounded number of times on a TRANSIENT error
     (a provider 503/429, a timeout). The transient retry matters because a single
@@ -680,6 +870,7 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
     backoff = float(os.getenv("PROXY_CLASSIFY_RETRY_BACKOFF_S", "0.2"))
 
     score, panel_score = 3, 0
+    task_category = _TASK_CATEGORIES[0]
     try:
         # Preflight the credentials rather than learning it from an exception on
         # every request. The default classifier is gemini-2.5-flash-lite, so a
@@ -705,7 +896,7 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
                     raise ValueError(
                         f"unparseable classifier reply: {result.text[:80]!r}"
                     )
-                score, panel_score = parsed
+                score, panel_score, task_category = parsed
                 break
             except Exception as e:
                 if attempt < retries and _classify_retryable(e):
@@ -748,19 +939,19 @@ def _classify_request(messages: list[ChatMessage], config: ProxyConfig) -> tuple
                     raise ValueError(
                         f"unparseable fallback classifier reply: {result.text[:80]!r}"
                     )
-                score, panel_score = parsed
+                score, panel_score, task_category = parsed
             except Exception:
                 log.warning(
                     "Fallback classifier %s also failed, falling back to (3, 0)",
                     fallback,
                     exc_info=True,
                 )
-                score, panel_score = 3, 0
+                score, panel_score, task_category = 3, 0, _TASK_CATEGORIES[0]
         else:
             log.warning("Classifier failed, falling back to (3, 0)", exc_info=True)
-            score, panel_score = 3, 0
+            score, panel_score, task_category = 3, 0, _TASK_CATEGORIES[0]
 
-    return _SCORE_TO_CONFIDENCE.get(score, 0.55), score, panel_score
+    return _SCORE_TO_CONFIDENCE.get(score, 0.55), score, panel_score, task_category
 
 
 # -- Trust cache --
@@ -922,15 +1113,44 @@ class BanditCache(_MtimeCache):
 _config: ProxyConfig | None = None
 _trust_cache: TrustCache | None = None
 _bandit_cache: BanditCache | None = None
+_conversation_cache: ConversationCache | None = None
+
+
+def _record_conversation_spend(
+    non_system: list[ChatMessage], model_name: str, cost: float
+) -> None:
+    """Add one turn's estimated cost to its conversation's running total.
+
+    Soft accounting, not billing truth: totals reset on restart, and a
+    streaming turn whose provider reported no usage contributes nothing.
+    Zero-cost calls still touch the entry so turn-based state stays fresh.
+    """
+    if _conversation_cache is None:
+        return
+    key = _tool_pin_digest(_first_user_text(non_system))
+    state = _conversation_cache.get(key)
+    state.spend_usd += max(0.0, cost)
+    if cost > 0:
+        log.info(
+            "Conversation spend: +$%.6f total=$%.6f model=%s key=%s",
+            cost,
+            state.spend_usd,
+            model_name,
+            key[:8],
+        )
 
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
-    global _config, _trust_cache, _bandit_cache
+    global _config, _trust_cache, _bandit_cache, _conversation_cache
     init_tracing()
     _config = ProxyConfig()
     _trust_cache = TrustCache(str(_config.trust_db_path), _config.trust_cache_ttl)
     _bandit_cache = BanditCache(str(_config.trust_db_path), _config.trust_cache_ttl)
+    _conversation_cache = ConversationCache(
+        max_entries=_config.conversation_cache_max,
+        ttl_s=_config.conversation_cache_ttl_s,
+    )
 
     if not _config.anthropic_api_key and not _config.gemini_api_key:
         log.warning("No API keys configured. Set ANTHROPIC_API_KEY or GEMINI_API_KEY.")
@@ -1115,11 +1335,14 @@ async def list_models() -> dict:
     created = 1715000000  # arbitrary; OpenAI clients only check it for non-null
     entries: list[dict] = [
         {
-            "id": "pdp-auto",
+            "id": auto_id,
             "object": "model",
             "created": created,
             "owned_by": "pdp-router",
         }
+        # The mode aliases are listed so an OpenAI client's model picker can
+        # select them; "" is the internal unset marker, not a model id.
+        for auto_id in ("pdp-auto", "pdp-auto-cost", "pdp-auto-max")
     ]
     for model in DEFAULT_REGISTRY.available_models():
         entries.append(
@@ -1137,16 +1360,18 @@ def _route_request(
     request: ChatCompletionRequest,
     *,
     for_tools: bool = False,
-) -> tuple[str, float, int, int, bool, str, list[ChatMessage], _RouteProvenance]:
+) -> tuple[str, float, int, int, str, bool, str, list[ChatMessage], _RouteProvenance]:
     """Apply classification and routing.
 
-    Returns (model_name, confidence, score, panel_score, search_intent, system,
-    non_system, provenance). panel_score is 0 for explicit-model requests (caller
-    did selection; auto-panel never triggers). search_intent is True only when web
-    search is enabled AND the latest user message shows explicit search intent;
-    it drives the auto-panel skip (handler) and the Sonnet capability floor.
-    provenance carries which policy actually produced the pick, so the routing
-    row records the executed mode rather than a hardcoded guess.
+    Returns (model_name, confidence, score, panel_score, task_category,
+    search_intent, system, non_system, provenance). panel_score is 0 for
+    explicit-model requests (caller did selection; auto-panel never triggers);
+    task_category is "" there for the same reason (no classification ran).
+    search_intent is True only when web search is enabled AND the latest user
+    message shows explicit search intent; it drives the auto-panel skip
+    (handler) and the Sonnet capability floor. provenance carries which policy
+    actually produced the pick, so the routing row records the executed mode
+    rather than a hardcoded guess.
 
     for_tools suppresses the search-intent capability floor: a tools request
     never attaches proxy web search (the tool branch returns above that), so
@@ -1167,9 +1392,12 @@ def _route_request(
     # Honor explicit model when caller has already done selection. This is
     # the path used by an external panel composer after trust-weighted selection
     # has picked N specific members. The cascade remains the default for
-    # "pdp-auto" (or unset) so single delegations still feed the learning
-    # system. -1.0 / 0 are log-distinguishability markers, not real values.
-    if request.model and request.model != "pdp-auto":
+    # "pdp-auto" (or unset, or a mode alias) so single delegations still feed
+    # the learning system. -1.0 / 0 are log-distinguishability markers, not
+    # real values. The auto check runs FIRST: the mode aliases are not
+    # registry entries, so the registry 400 below must never see them.
+    is_auto, mode = _parse_auto_model(request.model or "")
+    if not is_auto:
         if DEFAULT_REGISTRY.get(request.model) is None:
             raise HTTPException(
                 status_code=400,
@@ -1177,12 +1405,20 @@ def _route_request(
             )
         model_name = request.model
         confidence, score, panel_score = -1.0, 0, 0
+        task_category = ""
         search_intent = False
         # No routing ran: the caller chose. Recording this as "cascade" would
         # put caller-pinned picks into the cascade's own outcome statistics.
         provenance = _RouteProvenance(mode="explicit")
     else:
-        confidence, score, panel_score = _classify_request(non_system, _config)
+        confidence, score, panel_score, task_category = _classify_request(
+            non_system, _config
+        )
+        if mode != "balanced":
+            # The mode remaps the same classifier score onto a shifted
+            # confidence before the cascade thresholds read it; the recorded
+            # confidence is the one that actually routed.
+            confidence = _MODE_SCORE_TO_CONFIDENCE[mode].get(score, confidence)
         model_name, provenance = _cascade_with_provenance(
             confidence=confidence,
             trust_weights=_trust_cache.get_weights(),
@@ -1220,6 +1456,7 @@ def _route_request(
         confidence,
         score,
         panel_score,
+        task_category,
         search_intent,
         system,
         non_system,
@@ -1266,6 +1503,12 @@ def _cascade_with_provenance(
         routing_mode=_config.routing_mode,
         bandit_states=bandit_states,
         return_debug=True,
+        # Uplift gate (env-only, default off, bandit mode only): bounded
+        # promotion over the configured baseline arm. Doubly dark today --
+        # unset baseline AND cascade routing mode.
+        uplift_baseline=_config.uplift_baseline or None,
+        uplift_min_prob=_config.uplift_min_prob,
+        uplift_min_obs=_config.uplift_min_obs,
     )
     # Configured mode is not executed mode: bandit with an absent or unreadable
     # posterior store falls through to the cascade. Ask the same predicate the
@@ -1354,6 +1597,9 @@ def _make_routing_row(
     score: int,
     panel_score: int,
     search_intent: bool = False,
+    task_category: str = "",
+    conversation_key: str = "",
+    mode: str = "",
     role: str | None = None,
     explored: bool | None = None,
     tool_context: dict[str, Any] | None = None,
@@ -1389,7 +1635,18 @@ def _make_routing_row(
         "complexity": score,
         "panel_score": panel_score,
         "search_intent": search_intent,
+        # Always present ("" for explicit picks, where no classification ran)
+        # so json_extract queries never need an existence check.
+        "task_category": task_category,
+        # First-user-turn digest prefix: the cross-turn join key (sticky
+        # driver, spend, implicit feedback all correlate on it). Always
+        # present; "" only for callers that have no conversation identity.
+        "conversation_key": conversation_key,
     }
+    # Omit-when-absent (role precedent): the balanced default is the norm, so
+    # only the aliases mark their rows.
+    if mode and mode != "balanced":
+        context["mode"] = mode
     if role is not None:
         context["role"] = role
     if tool_context is not None:
@@ -1484,6 +1741,7 @@ def _execute_single(
         result.estimated_cost_usd,
         elapsed,
     )
+    _record_conversation_spend(non_system, model_name, result.estimated_cost_usd)
 
     searches = getattr(result, "web_search_requests", 0)
     if searches:
@@ -1621,6 +1879,7 @@ def _execute_single_with_tools(
             max_tokens=request.max_tokens,
             effort=effort,
             parallel_tool_calls=getattr(request, "parallel_tool_calls", None),
+            enable_prompt_caching=_prompt_caching_enabled(),
         )
     except CreditExhaustionError as e:
         raise HTTPException(
@@ -1662,6 +1921,7 @@ def _execute_single_with_tools(
         result.estimated_cost_usd,
         elapsed,
     )
+    _record_conversation_spend(non_system, model_name, result.estimated_cost_usd)
 
     # Only on a turn that claims to have finished answering. A tool-only turn
     # has no text by design, and warning on it would fire on every tool call.
@@ -1791,6 +2051,8 @@ def _panel_routing_rows(
     confidence: float,
     score: int,
     panel_score: int,
+    task_category: str = "",
+    conversation_key: str = "",
 ) -> list[dict[str, Any]]:
     """Build the routing-decision rows for one panel turn.
 
@@ -1809,6 +2071,8 @@ def _panel_routing_rows(
             confidence=confidence,
             score=score,
             panel_score=panel_score,
+            task_category=task_category,
+            conversation_key=conversation_key,
             role="panel_member",
         )
         for r in survivors
@@ -1822,6 +2086,8 @@ def _panel_routing_rows(
             confidence=confidence,
             score=score,
             panel_score=panel_score,
+            task_category=task_category,
+            conversation_key=conversation_key,
             role="chair",
         )
     )
@@ -1837,6 +2103,8 @@ async def _execute_panel_with_synth(
     panel_score: int,
     system: str,
     non_system: list[ChatMessage],
+    task_category: str = "",
+    conversation_key: str = "",
 ) -> ChatCompletionResponse:
     """Fan out to N lineage-diverse panel members, then synthesize via the chair.
 
@@ -1886,6 +2154,8 @@ async def _execute_panel_with_synth(
                     confidence=confidence,
                     score=score,
                     panel_score=panel_score,
+                    task_category=task_category,
+                    conversation_key=conversation_key,
                     explored=provenance.explored,
                 )
             ],
@@ -1934,6 +2204,8 @@ async def _execute_panel_with_synth(
             confidence=confidence,
             score=score,
             panel_score=panel_score,
+            task_category=task_category,
+            conversation_key=conversation_key,
         ),
     )
 
@@ -1974,6 +2246,7 @@ async def _execute_panel_with_synth(
         total_out,
         total_cost,
     )
+    _record_conversation_spend(non_system, chair_model, total_cost)
 
     content = chair.text if chair.text else ""
     chair_failed = False
@@ -2072,21 +2345,127 @@ async def _handle_chat(
             confidence,
             score,
             panel_score,
+            task_category,
             search_intent,
             system,
             non_system,
             provenance,
         ) = _route_request(request, for_tools=tools_active)
 
+        # Stable conversation identity: sha256 of the first user turn, the same
+        # digest the tool-driver pin keys on. Full digest keys the in-memory
+        # state cache; the [:8] prefix rides on rows as a readable join key.
+        conversation_key = _tool_pin_digest(_first_user_text(non_system))
+
+        # Spend ceiling (flag-gated, default off). The refusal runs BEFORE any
+        # client build or routing row -- a capped conversation must not add
+        # exposure rows -- and applies to explicit-model requests too: spend is
+        # spend. peek(), not get(): a capped-out or brand-new conversation must
+        # not have its eviction slot refreshed by the check itself.
+        budget_note: str | None = None
+        if _spend_cap_enabled() and _conversation_cache is not None:
+            budget_state = _conversation_cache.peek(conversation_key)
+            if budget_state is not None:
+                if budget_state.spend_usd >= _config.budget_max_usd:
+                    log.warning(
+                        "Conversation budget exceeded: $%.2f of $%.2f (key=%s); refusing",
+                        budget_state.spend_usd,
+                        _config.budget_max_usd,
+                        conversation_key[:8],
+                    )
+                    raise HTTPException(
+                        status_code=429,
+                        detail=ErrorResponse(
+                            error=ErrorDetail(
+                                message=(
+                                    f"Conversation budget exceeded: "
+                                    f"${budget_state.spend_usd:.2f} spent of "
+                                    f"${_config.budget_max_usd:.2f} limit"
+                                ),
+                                type="insufficient_quota",
+                            )
+                        ).model_dump(),
+                    )
+                if (
+                    budget_state.spend_usd >= _config.budget_warn_usd
+                    and not budget_state.budget_warned
+                ):
+                    # One-shot latch. The note renders only on a footer-bearing
+                    # stop turn, so a tool_calls turn or a footer-off surface
+                    # can consume the single warning silently -- the log line
+                    # is the guaranteed signal, the footer a best-effort one.
+                    budget_state.budget_warned = True
+                    budget_note = (
+                        f"budget ${budget_state.spend_usd:.2f}"
+                        f"/${_config.budget_max_usd:.2f}"
+                    )
+                    log.warning(
+                        "Conversation budget warning: $%.2f of $%.2f (key=%s)",
+                        budget_state.spend_usd,
+                        _config.budget_max_usd,
+                        conversation_key[:8],
+                    )
+
+        # Implicit next-turn feedback (flag-gated, default off): grade the
+        # PREVIOUS routed turn by what the user did next, THEN advance the
+        # lineage to this turn -- that order means a turn can never grade
+        # itself. Routed picks only; caller-pinned turns are outside the
+        # learning loop. Attribution caveat: last_model is the routing-time
+        # pick, so a panel-served turn attributes to the cascade pick the
+        # panel preempted (tool turns are corrected post-floor below); refine
+        # if panels ever earn feedback volume.
+        if (
+            _implicit_feedback_enabled()
+            and _conversation_cache is not None
+            and provenance.mode != "explicit"
+        ):
+            fb_state = _conversation_cache.get(conversation_key)
+            fb_user_msgs = [m.content or "" for m in non_system if m.role == "user"]
+            fb_latest = fb_user_msgs[-1] if fb_user_msgs else ""
+            if fb_state.last_request_id and fb_state.last_model and fb_latest:
+                fb_signal = _classify_implicit_feedback(
+                    fb_latest, fb_state.last_user_text_digest
+                )
+                append_routing_decisions_jsonl(
+                    inbox_dir=_config.routing_inbox_dir,
+                    rows=[
+                        _make_routing_row(
+                            chat_request_id=chat_request_id,
+                            model_selected=fb_state.last_model,
+                            routing_mode="implicit_feedback",
+                            context_bucket="chat:feedback",
+                            confidence=-1.0,
+                            score=0,
+                            panel_score=0,
+                            conversation_key=conversation_key[:8],
+                            tool_context={
+                                "feedback_signal": fb_signal,
+                                "target_chat_request_id": fb_state.last_request_id,
+                            },
+                        )
+                    ],
+                )
+            if fb_latest:
+                fb_state.last_request_id = chat_request_id
+                fb_state.last_user_text_digest = hashlib.sha256(
+                    fb_latest.encode("utf-8")
+                ).hexdigest()
+                fb_state.last_model = model_name
+                fb_state.turn_count += 1
+
+        # Auto-model parse shared by the effort, panel, and tool gates below;
+        # auto_mode also rides the routing rows when it is not balanced.
+        is_auto, auto_mode = _parse_auto_model(request.model or "")
+
         # Deterministic effort dial (default off). Map the classifier complexity
         # score to a reasoning-effort level for the arms that support one. Only for
-        # pdp-auto routed picks -- explicit-model requests carry no real score
+        # auto routed picks -- explicit-model requests carry no real score
         # (score=0) -- and only when supports_effort gates the model in. None means
         # "leave the knob unset" (the no-dial arms: Gemini, DeepSeek, Llama, Haiku).
         effort_level: str | None = None
         if (
             _effort_routing_enabled()
-            and request.model in ("pdp-auto", "")
+            and is_auto
             and supports_effort(model_name)
         ):
             effort_level = level_for_score(
@@ -2097,7 +2476,7 @@ async def _handle_chat(
 
         effective_stream = request.stream and _streaming_enabled()
         panel_base = (
-            request.model in ("pdp-auto", "")
+            is_auto
             and _autopanel_enabled()
             and panel_score >= int(os.getenv("PROXY_AUTOPANEL_THRESHOLD", "7"))
         )
@@ -2113,7 +2492,8 @@ async def _handle_chat(
                 # an explicit request, where the caller picked and no cascade
                 # ran. Feeds model_cascade_pick/tool_pin_key on the routing row.
                 routed_pick: str | None = None
-                if request.model and request.model != "pdp-auto":
+                sticky_applied = False
+                if not is_auto:
                     # The caller's explicit pick is honored inside the driver
                     # set and refused outside it -- routing must not silently
                     # replace a model the caller named.
@@ -2133,9 +2513,15 @@ async def _handle_chat(
                     # Driver floor on the routed path: the pick came from
                     # policy, so a pick that is not a usable driver is replaced,
                     # never refused. PROXY_TOOL_MODEL is the operator override
-                    # and beats the pin and any driver pick; an unusable value
-                    # degrades to the pin walk instead of failing the request.
+                    # and beats the sticky driver, the pin, and any driver pick;
+                    # an unusable value degrades to the sticky/pin logic instead
+                    # of failing the request.
                     routed_pick = model_name
+                    sticky_state = (
+                        _conversation_cache.get(conversation_key)
+                        if _sticky_driver_enabled() and _conversation_cache is not None
+                        else None
+                    )
                     override = os.getenv("PROXY_TOOL_MODEL", "").strip()
                     if override and _is_usable_tool_driver(override, _config):
                         model_name = override
@@ -2145,10 +2531,31 @@ async def _handle_chat(
                                 "PROXY_TOOL_MODEL=%s is not a usable tool driver; ignoring",
                                 override,
                             )
+                        # Sticky driver: the conversation's incumbent beats even
+                        # a usable cascade pick (fully sticky). The win is
+                        # provider prompt-cache continuity -- every mid-
+                        # conversation model switch re-reads the whole
+                        # transcript cold, which at agent lengths usually costs
+                        # more than per-turn tier routing saves. An incumbent
+                        # that lost usability (retired, key removed) falls
+                        # through to the floor/pin logic below.
+                        if (
+                            sticky_state is not None
+                            and sticky_state.driver
+                            and _is_usable_tool_driver(sticky_state.driver, _config)
+                        ):
+                            if sticky_state.driver != model_name:
+                                log.info(
+                                    "Sticky driver: %s -> %s (conversation incumbent)",
+                                    model_name,
+                                    sticky_state.driver,
+                                )
+                                sticky_applied = True
+                            model_name = sticky_state.driver
                         # Usability, not bare membership: a driver that is
                         # retired (available=False) or credential-less must also
                         # be walked past, or it would be dispatched and fail.
-                        if not _is_usable_tool_driver(model_name, _config):
+                        elif not _is_usable_tool_driver(model_name, _config):
                             driver = _tool_driver_model(_first_user_text(non_system), _config)
                             if driver is not None:
                                 log.info(
@@ -2198,6 +2605,15 @@ async def _handle_chat(
                             low_max=_config.effort_score_low_max,
                             high_min=_config.effort_score_high_min,
                         )
+                    if sticky_state is not None:
+                        # Record the served driver so later turns stay on it --
+                        # including an operator override, which then persists
+                        # for the conversation even if the override is removed.
+                        sticky_state.driver = model_name
+                    if _implicit_feedback_enabled() and _conversation_cache is not None:
+                        # The lineage recorded above points at the pre-floor
+                        # cascade pick; repoint it at the driver that serves.
+                        _conversation_cache.get(conversation_key).last_model = model_name
                 client = _build_client(model_name)
                 tool_context = _tool_row_context(
                     request,
@@ -2205,6 +2621,10 @@ async def _handle_chat(
                     model_selected=model_name,
                     cascade_pick=routed_pick,
                 )
+                if sticky_applied:
+                    # Omit-when-absent (the role precedent): present only when
+                    # the incumbent actually displaced a different pick.
+                    tool_context["tool_sticky"] = True
                 row_kwargs: dict[str, Any] = {
                     "chat_request_id": chat_request_id,
                     "model_selected": model_name,
@@ -2214,6 +2634,9 @@ async def _handle_chat(
                     "score": score,
                     "panel_score": panel_score,
                     "search_intent": search_intent,
+                    "task_category": task_category,
+                    "conversation_key": conversation_key[:8],
+                    "mode": auto_mode,
                     "explored": provenance.explored,
                 }
                 if effective_stream:
@@ -2232,6 +2655,9 @@ async def _handle_chat(
                         non_system=non_system,
                         score=score,
                         effort=effort_level,
+                        cascade_pick=routed_pick,
+                        floor_label="sticky" if sticky_applied else "tool floor",
+                        budget_note=budget_note,
                     )
                     stream_response.headers["X-PDP-Prediction-Id"] = chat_request_id
                     return stream_response
@@ -2268,6 +2694,17 @@ async def _handle_chat(
                     finish_reason=choice.finish_reason,
                     tool_call_count=len(calls),
                     tool_names=[call.function.name for call in calls[:8]],
+                    # Recomputed from the response usage (the executor's own
+                    # estimate is not surfaced on the OpenAI-shaped response).
+                    # Token-based only: cache token counts do not ride Usage,
+                    # so a cached turn's row cost is the uncached estimate.
+                    cost_usd=estimate_cost(
+                        model_name,
+                        {
+                            "input_tokens": tool_response.usage.prompt_tokens,
+                            "output_tokens": tool_response.usage.completion_tokens,
+                        },
+                    ),
                 )
                 append_routing_decisions_jsonl(
                     inbox_dir=_config.routing_inbox_dir,
@@ -2295,6 +2732,8 @@ async def _handle_chat(
                     panel_score=panel_score,
                     system=system,
                     non_system=non_system,
+                    task_category=task_category,
+                    conversation_key=conversation_key[:8],
                 )
                 stream_response.headers["X-PDP-Prediction-Id"] = chat_request_id
                 return stream_response
@@ -2311,6 +2750,8 @@ async def _handle_chat(
                     panel_score=panel_score,
                     system=system,
                     non_system=non_system,
+                    task_category=task_category,
+                    conversation_key=conversation_key[:8],
                 )
             # Panel-eligible but streaming on the default /v1 surface, or the
             # kill-switch is off: fall through to the single-model cascade below.
@@ -2329,6 +2770,9 @@ async def _handle_chat(
                     score=score,
                     panel_score=panel_score,
                     search_intent=search_intent,
+                    task_category=task_category,
+                    conversation_key=conversation_key[:8],
+                    mode=auto_mode,
                     explored=provenance.explored,
                 )
             ],
@@ -2350,6 +2794,7 @@ async def _handle_chat(
                 enable_web_search=web_search_on,
                 openai_faithful=openai_faithful,
                 effort=effort_level,
+                budget_note=budget_note,
             )
             stream_response.headers["X-PDP-Prediction-Id"] = chat_request_id
             return stream_response
@@ -2436,17 +2881,34 @@ def _chunk_event(
     )
 
 
-def _route_footer_content(model_name: str, score: int, effort: str | None) -> str:
+def _route_footer_content(
+    model_name: str,
+    score: int,
+    effort: str | None,
+    cascade_pick: str | None = None,
+    floor_label: str = "tool floor",
+    budget_note: str | None = None,
+) -> str:
     """Render the routing footer as a content delta.
 
     Shared by the plain and with-tools faithful generators so a tool turn that
     ends in text cannot drift into a different footer than a plain one.
+    cascade_pick is the router's own pre-floor pick: the suffix renders only
+    when a floor actually replaced it, so a kept driver pick, an explicit
+    request (None), and every plain-path caller keep the prior bytes.
+    floor_label names WHICH mechanism replaced it ("tool floor" for the pin
+    walk, "sticky" for the conversation incumbent) so the reader never has to
+    guess why the served model differs from the cascade pick.
     """
     tag = f"[routed: {model_name}"
     if score:
         tag += f" | score {score}"
     if effort:
         tag += f" | effort {effort}"
+    if cascade_pick and cascade_pick != model_name:
+        tag += f" | {floor_label} over {cascade_pick}"
+    if budget_note:
+        tag += f" | {budget_note}"
     tag += "]"
     return f"\n\n`{tag}`"
 
@@ -2463,6 +2925,7 @@ async def _iter_sse(
     enable_web_search: bool = False,
     openai_faithful: bool = False,
     effort: str | None = None,
+    budget_note: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Yield SSE-formatted events for a streaming completion.
 
@@ -2506,6 +2969,10 @@ async def _iter_sse(
         system = _augment_system_for_search(system)
 
     error_message: str | None = None
+    # Caller-owned usage sink (the clients' opt-in): populated with at most one
+    # StreamUsage after clean exhaustion, consumed for spend accounting after
+    # [DONE] and never serialized to the wire.
+    usage_sink: list = []
     try:
         if len(non_system) == 1:
             stream = client.stream_complete(  # type: ignore[attr-defined]
@@ -2514,6 +2981,7 @@ async def _iter_sse(
                 max_tokens=max_tokens,
                 enable_web_search=enable_web_search,
                 effort=effort,
+                usage_out=usage_sink,
             )
         else:
             messages = [{"role": m.role, "content": m.content} for m in non_system]
@@ -2523,6 +2991,7 @@ async def _iter_sse(
                 max_tokens=max_tokens,
                 enable_web_search=enable_web_search,
                 effort=effort,
+                usage_out=usage_sink,
             )
 
         async for token in stream:
@@ -2558,7 +3027,11 @@ async def _iter_sse(
                     completion_id,
                     created,
                     model_name,
-                    {"content": _route_footer_content(model_name, score, effort)},
+                    {
+                        "content": _route_footer_content(
+                            model_name, score, effort, budget_note=budget_note
+                        )
+                    },
                     None,
                 )
             # Clean completion: terminal finish_reason chunk so a strict client
@@ -2569,6 +3042,21 @@ async def _iter_sse(
 
     # Terminator. OpenAI clients look for this exact sentinel.
     yield "data: [DONE]\n\n"
+
+    # Accounting AFTER the terminator (the with-tools generator's rule): it can
+    # never perturb the wire, and a disconnect loses that turn's spend.
+    if error_message is None and usage_sink:
+        reported = usage_sink[-1]
+        turn_cost = estimate_cost(
+            model_name,
+            {
+                "input_tokens": reported.input_tokens,
+                "output_tokens": reported.output_tokens,
+                "cache_read_input_tokens": reported.cache_read_input_tokens,
+                "cache_creation_input_tokens": reported.cache_creation_input_tokens,
+            },
+        )
+        _record_conversation_spend(non_system, model_name, turn_cost)
 
 
 async def _build_stream_response(
@@ -2583,6 +3071,7 @@ async def _build_stream_response(
     enable_web_search: bool = False,
     openai_faithful: bool = False,
     effort: str | None = None,
+    budget_note: str | None = None,
 ) -> StreamingResponse:
     """Wrap _iter_sse in a FastAPI StreamingResponse with text/event-stream."""
     return StreamingResponse(
@@ -2597,6 +3086,7 @@ async def _build_stream_response(
             enable_web_search=enable_web_search,
             openai_faithful=openai_faithful,
             effort=effort,
+            budget_note=budget_note,
         ),
         media_type="text/event-stream",
     )
@@ -2628,6 +3118,9 @@ async def _iter_sse_with_tools(
     non_system: list[ChatMessage],
     score: int,
     effort: str | None = None,
+    cascade_pick: str | None = None,
+    floor_label: str = "tool floor",
+    budget_note: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Yield SSE events for a streaming turn that may call tools.
 
@@ -2655,6 +3148,9 @@ async def _iter_sse_with_tools(
     # None until a StreamFinish arrives, so an absent reason stays tellable from
     # a reported one. What the provider sends is passed through verbatim.
     finish_reason: str | None = None
+    # Provider-reported final usage, if any. Consumed server-side for the
+    # conversation spend total after [DONE]; never serialized to the wire.
+    finish_usage = None
     # What this generator actually put on the wire. The provider's label cannot
     # answer "was this a tool turn": an Anthropic stop_reason outside
     # _STOP_REASONS (pause_turn, refusal) maps to "stop" on a genuine tool turn,
@@ -2675,6 +3171,7 @@ async def _iter_sse_with_tools(
             max_tokens=request.max_tokens,
             effort=effort,
             parallel_tool_calls=getattr(request, "parallel_tool_calls", None),
+            enable_prompt_caching=_prompt_caching_enabled(),
         )
         async for event in stream:
             if isinstance(event, ToolCallDelta):
@@ -2688,6 +3185,7 @@ async def _iter_sse_with_tools(
                 )
             elif isinstance(event, StreamFinish):
                 finish_reason = event.finish_reason
+                finish_usage = event.usage
             else:
                 yield _chunk_event(completion_id, created, model_name, {"content": event}, None)
     except CreditExhaustionError as e:
@@ -2733,12 +3231,32 @@ async def _iter_sse_with_tools(
                 completion_id,
                 created,
                 model_name,
-                {"content": _route_footer_content(model_name, score, effort)},
+                {
+                    "content": _route_footer_content(
+                        model_name, score, effort, cascade_pick, floor_label, budget_note
+                    )
+                },
                 None,
             )
         yield _chunk_event(completion_id, created, model_name, {}, finish_reason)
 
     yield "data: [DONE]\n\n"
+
+    # Accounting AFTER the terminator so it can never perturb or delay the
+    # wire. A client that disconnects mid-stream closes this generator before
+    # reaching here, so that turn's spend goes uncounted -- the same tradeoff
+    # the panel transcript capture accepts for its finally-block work.
+    if error_message is None and finish_usage is not None:
+        turn_cost = estimate_cost(
+            model_name,
+            {
+                "input_tokens": finish_usage.input_tokens,
+                "output_tokens": finish_usage.output_tokens,
+                "cache_read_input_tokens": finish_usage.cache_read_input_tokens,
+                "cache_creation_input_tokens": finish_usage.cache_creation_input_tokens,
+            },
+        )
+        _record_conversation_spend(non_system, model_name, turn_cost)
 
 
 async def _build_tool_stream_response(
@@ -2750,6 +3268,9 @@ async def _build_tool_stream_response(
     non_system: list[ChatMessage],
     score: int,
     effort: str | None = None,
+    cascade_pick: str | None = None,
+    floor_label: str = "tool floor",
+    budget_note: str | None = None,
 ) -> StreamingResponse:
     """Wrap _iter_sse_with_tools in a FastAPI StreamingResponse."""
     return StreamingResponse(
@@ -2761,6 +3282,9 @@ async def _build_tool_stream_response(
             non_system=non_system,
             score=score,
             effort=effort,
+            cascade_pick=cascade_pick,
+            floor_label=floor_label,
+            budget_note=budget_note,
         ),
         media_type="text/event-stream",
     )
@@ -2876,6 +3400,8 @@ async def _iter_panel_sse(
     panel_score: int,
     system: str,
     non_system: list[ChatMessage],
+    task_category: str = "",
+    conversation_key: str = "",
 ) -> AsyncGenerator[str, None]:
     """Faithful-surface SSE for a STREAMING auto-panel: fan out N lineage-diverse
     members, then stream the chair synthesis.
@@ -2970,6 +3496,8 @@ async def _iter_panel_sse(
                     confidence=confidence,
                     score=score,
                     panel_score=panel_score,
+                    task_category=task_category,
+                    conversation_key=conversation_key,
                     explored=provenance.explored,
                 )
             ],
@@ -3030,6 +3558,8 @@ async def _iter_panel_sse(
             confidence=confidence,
             score=score,
             panel_score=panel_score,
+            task_category=task_category,
+            conversation_key=conversation_key,
         ),
     )
     log.info(
@@ -3139,6 +3669,8 @@ async def _build_panel_stream_response(
     panel_score: int,
     system: str,
     non_system: list[ChatMessage],
+    task_category: str = "",
+    conversation_key: str = "",
 ) -> StreamingResponse:
     """Wrap _iter_panel_sse in a FastAPI StreamingResponse (text/event-stream)."""
     return StreamingResponse(
@@ -3150,6 +3682,8 @@ async def _build_panel_stream_response(
             panel_score=panel_score,
             system=system,
             non_system=non_system,
+            task_category=task_category,
+            conversation_key=conversation_key,
         ),
         media_type="text/event-stream",
     )

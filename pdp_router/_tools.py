@@ -43,12 +43,31 @@ class ToolCallDelta:
 
 
 @dataclass(frozen=True)
+class StreamUsage:
+    """Final token usage a provider reported for one streamed turn.
+
+    Cache fields are Anthropic-only today; providers without prompt caching
+    leave them zero. Consumed server-side for cost accounting -- never
+    serialized onto the SSE wire.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+
+
+@dataclass(frozen=True)
 class StreamFinish:
     """The terminal reason a with-tools stream ended."""
 
     # Yielded rather than inferred. The plain streaming path can hardcode "stop";
     # a tool turn ends in "tool_calls", and a truncated one in "length".
     finish_reason: str
+    # None means the provider reported no usage for this turn -- tellable from
+    # a reported all-zero StreamUsage. Defaulted so every existing literal
+    # (StreamFinish("stop")) keeps its meaning and equality.
+    usage: StreamUsage | None = None
 
 
 class ToolTranslationError(ValueError):

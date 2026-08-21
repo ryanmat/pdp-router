@@ -271,3 +271,80 @@ class TestGetClientGemini:
                 location="us-east5",
             )
             assert isinstance(client, GeminiClient)
+
+
+class TestGeminiPlainStreamUsage:
+    """usage_out sink on the Gemini plain stream: last usage_metadata wins."""
+
+    class _FakeStream:
+        def __init__(self, chunks: list) -> None:
+            self._chunks = chunks
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._chunks:
+                raise StopAsyncIteration
+            return self._chunks.pop(0)
+
+    def _client_with_chunks(self, chunks: list) -> GeminiClient:
+        from unittest.mock import AsyncMock
+
+        with patch("pdp_router._clients.genai", create=True) as mock_genai:
+            mock_genai.Client = MagicMock
+            client = GeminiClient("gemini-2.5-flash", api_key="test-key")
+        client._client = MagicMock()
+        client._client.aio.models.generate_content_stream = AsyncMock(
+            return_value=self._FakeStream(chunks)
+        )
+        return client
+
+    def test_sink_captures_the_last_usage_metadata(self) -> None:
+        import asyncio
+        from types import SimpleNamespace
+
+        from pdp_router._tools import StreamUsage
+
+        chunks = [
+            SimpleNamespace(text="hi", usage_metadata=None),
+            SimpleNamespace(
+                text="!",
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=40, candidates_token_count=7
+                ),
+            ),
+        ]
+        client = self._client_with_chunks(chunks)
+        sink: list = []
+
+        async def _drive() -> list:
+            return [
+                t
+                async for t in client.stream_complete_multi(
+                    "sys", [{"role": "user", "content": "x"}], usage_out=sink
+                )
+            ]
+
+        out = asyncio.run(_drive())
+        assert out == ["hi", "!"]
+        assert sink == [StreamUsage(input_tokens=40, output_tokens=7)]
+
+    def test_no_metadata_appends_nothing(self) -> None:
+        import asyncio
+        from types import SimpleNamespace
+
+        chunks = [SimpleNamespace(text="hi", usage_metadata=None)]
+        client = self._client_with_chunks(chunks)
+        sink: list = []
+
+        async def _drive() -> list:
+            return [
+                t
+                async for t in client.stream_complete_multi(
+                    "sys", [{"role": "user", "content": "x"}], usage_out=sink
+                )
+            ]
+
+        assert asyncio.run(_drive()) == ["hi"]
+        assert sink == []

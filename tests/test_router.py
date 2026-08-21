@@ -671,3 +671,74 @@ class TestComputeRoutingPicks:
         )
         # Cost adjustment in the bandit path should not mutate the caller's dict.
         assert original == snapshot
+
+
+class TestUpliftGate:
+    """confidence_cascade's uplift gate: bounded promotion over a baseline arm."""
+
+    @staticmethod
+    def _states() -> dict:
+        return {
+            HAIKU: BanditState(mu=0.60, sigma=0.02, n_obs=200),
+            SONNET_5: BanditState(mu=0.85, sigma=0.02, n_obs=100),
+            OPUS_5: BanditState(mu=0.62, sigma=0.05, n_obs=100),
+        }
+
+    def test_gate_restricts_sampling_to_baseline_plus_cleared_arms(self) -> None:
+        # Opus-5's marginal edge does not clear the 75% bar; over many seeded
+        # draws the pick must always be the baseline or the clear winner.
+        picks = {
+            confidence_cascade(
+                0.50,
+                routing_mode="bandit",
+                bandit_states=self._states(),
+                uplift_baseline=HAIKU,
+                _rng=random.Random(seed),
+            )
+            for seed in range(40)
+        }
+        assert picks <= {HAIKU, SONNET_5}
+        assert SONNET_5 in picks
+
+    def test_no_baseline_leaves_every_arm_sampleable(self) -> None:
+        # Overlapping posteriors so every arm has real win probability; the
+        # point is that WITHOUT a baseline no arm is filtered out.
+        states = {
+            HAIKU: BanditState(mu=0.60, sigma=0.05, n_obs=200),
+            SONNET_5: BanditState(mu=0.64, sigma=0.05, n_obs=100),
+            OPUS_5: BanditState(mu=0.62, sigma=0.05, n_obs=100),
+        }
+        picks = {
+            confidence_cascade(
+                0.50,
+                routing_mode="bandit",
+                bandit_states=states,
+                _rng=random.Random(seed),
+            )
+            for seed in range(60)
+        }
+        assert picks == {HAIKU, SONNET_5, OPUS_5}
+
+    def test_baseline_only_when_nothing_clears_the_bar(self) -> None:
+        states = {
+            HAIKU: BanditState(mu=0.90, sigma=0.02, n_obs=200),
+            SONNET_5: BanditState(mu=0.50, sigma=0.02, n_obs=100),
+        }
+        picks = {
+            confidence_cascade(
+                0.50,
+                routing_mode="bandit",
+                bandit_states=states,
+                uplift_baseline=HAIKU,
+                _rng=random.Random(seed),
+            )
+            for seed in range(20)
+        }
+        assert picks == {HAIKU}
+
+    def test_cascade_mode_ignores_the_gate(self) -> None:
+        # The gate lives on the bandit branch only; cascade routing with a
+        # baseline set behaves exactly as without it.
+        with_gate = confidence_cascade(0.90, uplift_baseline=HAIKU)
+        without = confidence_cascade(0.90)
+        assert with_gate == without

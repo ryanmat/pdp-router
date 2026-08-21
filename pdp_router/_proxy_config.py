@@ -85,6 +85,40 @@ class ProxyConfig:
     effort_score_high_min: int = field(
         default_factory=lambda: int(os.getenv("PROXY_EFFORT_SCORE_HIGH_MIN", "4"))
     )
+    # Per-conversation state cache (sticky tool driver, spend accounting,
+    # implicit-feedback lineage). Entries are keyed by the first-user-turn
+    # digest; bounds keep a long-running proxy's memory flat.
+    conversation_cache_max: int = field(
+        default_factory=lambda: int(os.getenv("PROXY_CONVERSATION_CACHE_MAX", "512"))
+    )
+    conversation_cache_ttl_s: float = field(
+        default_factory=lambda: float(os.getenv("PROXY_CONVERSATION_CACHE_TTL_S", "7200"))
+    )
+    # Per-conversation spend ceiling (only consulted when the
+    # proxy_spend_cap_enabled flag is on): one footer warning at warn, an
+    # insufficient_quota refusal for requests arriving past max. Spend is the
+    # soft in-memory total -- it resets on restart and undercounts turns whose
+    # provider reported no usage, so max is a runaway-loop backstop, not a
+    # billing limit.
+    budget_warn_usd: float = field(
+        default_factory=lambda: float(os.getenv("PROXY_CONVERSATION_BUDGET_WARN_USD", "1.00"))
+    )
+    budget_max_usd: float = field(
+        default_factory=lambda: float(os.getenv("PROXY_CONVERSATION_BUDGET_MAX_USD", "5.00"))
+    )
+    # Uplift gate for bandit-mode routing: when a baseline model id is set,
+    # other arms are sampleable only after their posterior beats the
+    # baseline's with probability >= uplift_min_prob on >= uplift_min_obs
+    # observations. Env-only and default OFF (empty baseline) -- flipping it
+    # grants the bandit bounded promotion authority, which is an operator
+    # decision, not a flag flip; it also only matters under ROUTING_MODE=bandit.
+    uplift_baseline: str = field(default_factory=lambda: os.getenv("PROXY_UPLIFT_BASELINE", ""))
+    uplift_min_prob: float = field(
+        default_factory=lambda: float(os.getenv("PROXY_UPLIFT_MIN_PROB", "0.75"))
+    )
+    uplift_min_obs: int = field(
+        default_factory=lambda: int(os.getenv("PROXY_UPLIFT_MIN_OBS", "10"))
+    )
 
     def __post_init__(self) -> None:
         # Keep the transcript dir beside the inbox WITHOUT a second env var to set:

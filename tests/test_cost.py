@@ -116,6 +116,47 @@ class TestEstimateCost:
         assert rows.index("claude-sonnet-5") < rows.index("claude-sonnet")
 
 
+class TestCacheAwarePricing:
+    """Prompt-cache token pricing: read 0.1x input, write 1.25x input, Anthropic rows."""
+
+    def test_cache_read_and_write_rates_sonnet_5(self) -> None:
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 1_000_000,
+            "cache_creation_input_tokens": 1_000_000,
+        }
+        assert estimate_cost("claude-sonnet-5", usage) == pytest.approx(0.30 + 3.75)
+
+    def test_cache_rates_haiku(self) -> None:
+        usage = {"cache_read_input_tokens": 1_000_000}
+        assert estimate_cost("claude-haiku-4-5-20251001", usage) == pytest.approx(0.025)
+
+    def test_all_four_terms_sum_without_double_counting(self) -> None:
+        # Anthropic's input_tokens excludes the cache counts on the wire, so
+        # the terms are independent.
+        usage = {
+            "input_tokens": 1_000_000,
+            "output_tokens": 1_000_000,
+            "cache_read_input_tokens": 1_000_000,
+            "cache_creation_input_tokens": 1_000_000,
+        }
+        assert estimate_cost("claude-opus-5", usage) == pytest.approx(
+            5.00 + 25.00 + 0.50 + 6.25
+        )
+
+    def test_missing_cache_keys_leave_existing_pricing_untouched(self) -> None:
+        usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+        assert estimate_cost("claude-sonnet-5", usage) == pytest.approx(3.00 + 15.00)
+
+    def test_row_without_cache_rates_prices_cache_at_input_rate(self) -> None:
+        # Pins the .get fallback: a provider that never emits cache keys is
+        # unaffected, and a future mispriced row over-estimates instead of
+        # silently zeroing.
+        usage = {"cache_read_input_tokens": 1_000_000}
+        assert estimate_cost("gemini-2.5-pro", usage) == pytest.approx(1.25)
+
+
 class TestRegistryPricingParity:
     """Every routable model must resolve to a real row, never the fallback."""
 

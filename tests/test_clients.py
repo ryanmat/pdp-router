@@ -21,7 +21,7 @@ from pdp_router._clients import (
     get_client,
 )
 from pdp_router._models import CreditExhaustionError, UpstreamStreamError
-from pdp_router._tools import StreamFinish, ToolCallDelta
+from pdp_router._tools import StreamFinish, StreamUsage, ToolCallDelta
 
 
 class TestCompletionResult:
@@ -541,6 +541,165 @@ def _collect(agen) -> list:
     return asyncio.run(_drive())
 
 
+class TestApplyCacheBreakpoints:
+    """_apply_cache_breakpoints: two markers, copy-on-write, empty-content skip."""
+
+    def test_system_and_string_last_message_get_markers(self) -> None:
+        from pdp_router._clients import _apply_cache_breakpoints
+
+        system, messages = _apply_cache_breakpoints(
+            "sys", [{"role": "user", "content": "hi"}]
+        )
+        assert system == [
+            {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
+        ]
+        assert messages == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                ],
+            }
+        ]
+
+    def test_block_list_content_gets_marker_on_last_block_only(self) -> None:
+        from pdp_router._clients import _apply_cache_breakpoints
+
+        blocks = [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "a"},
+            {"type": "tool_result", "tool_use_id": "t2", "content": "b"},
+        ]
+        _, messages = _apply_cache_breakpoints("sys", [{"role": "user", "content": blocks}])
+        out_blocks = messages[-1]["content"]
+        assert "cache_control" not in out_blocks[0]
+        assert out_blocks[1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_empty_last_content_skips_the_message_marker(self) -> None:
+        # An empty text block with cache_control is a provider-side 400; the
+        # system breakpoint alone still caches tools+system.
+        from pdp_router._clients import _apply_cache_breakpoints
+
+        system, messages = _apply_cache_breakpoints(
+            "sys", [{"role": "assistant", "content": ""}]
+        )
+        assert isinstance(system, list)
+        assert messages == [{"role": "assistant", "content": ""}]
+
+    def test_caller_structures_are_never_mutated(self) -> None:
+        from pdp_router._clients import _apply_cache_breakpoints
+
+        blocks = [{"type": "text", "text": "x"}]
+        original = [{"role": "user", "content": blocks}]
+        _apply_cache_breakpoints("sys", original)
+        assert original == [{"role": "user", "content": [{"type": "text", "text": "x"}]}]
+
+    def test_never_more_than_two_breakpoints(self) -> None:
+        import json as _json
+
+        from pdp_router._clients import _apply_cache_breakpoints
+
+        system, messages = _apply_cache_breakpoints(
+            "sys",
+            [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "b"},
+                {"role": "user", "content": "c"},
+            ],
+        )
+        assert _json.dumps([system, messages]).count("cache_control") == 2
+
+
+class TestAnthropicPromptCaching:
+    """enable_prompt_caching on the with-tools paths: on-state shapes, off-state wall."""
+
+    def test_off_by_default_keeps_the_request_shape(self) -> None:
+        """The byte-identity wall: without the kwarg the system is the plain
+        string and no cache_control appears anywhere in the request."""
+        import json as _json
+
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            create.return_value = TestAnthropicToolCalls._message(
+                self, [TestAnthropicToolCalls._tool_use_block(self)]
+            )
+            client = AnthropicClient("claude-sonnet-4-20250514", api_key="sk-test")
+            client.complete_with_tools("sys", [{"role": "user", "content": "hi"}], _TOOLS)
+
+            kwargs = create.call_args.kwargs
+            assert kwargs["system"] == "sys"
+            assert "cache_control" not in _json.dumps(kwargs["messages"])
+
+    def test_on_marks_system_and_last_message(self) -> None:
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            create.return_value = TestAnthropicToolCalls._message(
+                self, [TestAnthropicToolCalls._tool_use_block(self)]
+            )
+            client = AnthropicClient("claude-sonnet-4-20250514", api_key="sk-test")
+            client.complete_with_tools(
+                "sys",
+                [{"role": "user", "content": "hi"}],
+                _TOOLS,
+                enable_prompt_caching=True,
+            )
+
+            kwargs = create.call_args.kwargs
+            assert kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
+            last_content = kwargs["messages"][-1]["content"]
+            assert last_content[-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_stream_on_and_off_shapes(self) -> None:
+        import json as _json
+
+        events = [
+            SimpleNamespace(
+                type="message_delta", delta=SimpleNamespace(stop_reason="end_turn")
+            )
+        ]
+        for enabled in (False, True):
+            with patch("pdp_router._clients.anthropic.AsyncAnthropic") as mock_cls:
+                mock_cls.return_value.messages.stream.return_value = _FakeToolStream(
+                    events, None
+                )
+                client = AnthropicClient("claude-sonnet-4-20250514", api_key="sk-test")
+                _collect(
+                    client.stream_with_tools(
+                        "sys",
+                        [{"role": "user", "content": "hi"}],
+                        _TOOLS,
+                        enable_prompt_caching=enabled,
+                    )
+                )
+                kwargs = mock_cls.return_value.messages.stream.call_args.kwargs
+            marked = "cache_control" in _json.dumps(
+                [kwargs["system"], kwargs["messages"]]
+            )
+            assert marked is enabled
+
+    def test_cache_usage_fields_ride_the_completion_result(self) -> None:
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            message = TestAnthropicToolCalls._message(
+                self, [TestAnthropicToolCalls._tool_use_block(self)]
+            )
+            message.usage.input_tokens = 100
+            message.usage.output_tokens = 50
+            message.usage.cache_read_input_tokens = 4000
+            message.usage.cache_creation_input_tokens = 1000
+            create.return_value = message
+            client = AnthropicClient("claude-sonnet-5", api_key="sk-test")
+            result = client.complete_with_tools(
+                "sys", [{"role": "user", "content": "hi"}], _TOOLS
+            )
+
+        assert result.cache_read_input_tokens == 4000
+        assert result.cache_creation_input_tokens == 1000
+        # 100 in @ $3 + 50 out @ $15 + 4000 read @ $0.30 + 1000 write @ $3.75.
+        assert result.estimated_cost_usd == pytest.approx(
+            (100 * 3.00 + 50 * 15.00 + 4000 * 0.30 + 1000 * 3.75) / 1_000_000
+        )
+
+
 class TestAnthropicToolStreaming:
     """stream_with_tools: Anthropic stream events out as text, deltas and a finish."""
 
@@ -567,6 +726,27 @@ class TestAnthropicToolStreaming:
 
     def _message_delta(self, stop_reason: str) -> SimpleNamespace:
         return SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason=stop_reason))
+
+    def _message_start(
+        self, input_tokens: int, cache_read: int = 0, cache_creation: int = 0
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(
+                usage=SimpleNamespace(
+                    input_tokens=input_tokens,
+                    cache_read_input_tokens=cache_read,
+                    cache_creation_input_tokens=cache_creation,
+                )
+            ),
+        )
+
+    def _usage_delta(self, output_tokens: int, stop_reason: str | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason=stop_reason),
+            usage=SimpleNamespace(output_tokens=output_tokens),
+        )
 
     def _client(
         self, mock_cls: MagicMock, events: list, raise_at: int | None = None
@@ -631,6 +811,59 @@ class TestAnthropicToolStreaming:
             out = _collect(self._stream_call(client))
 
         assert out == ["hello ", "world", StreamFinish("stop")]
+
+    def test_usage_rides_the_stream_finish(self) -> None:
+        """message_start carries input + cache counts, the closing
+        message_delta carries the cumulative output count."""
+        events = [
+            self._message_start(50, cache_read=10, cache_creation=5),
+            self._text_delta("hi"),
+            self._usage_delta(20, stop_reason="end_turn"),
+        ]
+        with patch("pdp_router._clients.anthropic.AsyncAnthropic") as mock_cls:
+            client = self._client(mock_cls, events)
+            out = _collect(self._stream_call(client))
+
+        assert out == [
+            "hi",
+            StreamFinish(
+                "stop",
+                usage=StreamUsage(
+                    input_tokens=50,
+                    output_tokens=20,
+                    cache_read_input_tokens=10,
+                    cache_creation_input_tokens=5,
+                ),
+            ),
+        ]
+
+    def test_cumulative_output_count_keeps_the_last_value(self) -> None:
+        """message_delta usage is cumulative, so the last value wins -- summing
+        the two would double-count."""
+        events = [
+            self._message_start(30),
+            self._text_delta("a"),
+            self._usage_delta(7),
+            self._text_delta("b"),
+            self._usage_delta(12, stop_reason="end_turn"),
+        ]
+        with patch("pdp_router._clients.anthropic.AsyncAnthropic") as mock_cls:
+            client = self._client(mock_cls, events)
+            out = _collect(self._stream_call(client))
+
+        finish = out[-1]
+        assert finish.usage == StreamUsage(input_tokens=30, output_tokens=12)
+
+    def test_no_usage_events_leaves_usage_none(self) -> None:
+        """The plain fakes never emit usage, so every StreamFinish they produce
+        must stay equal to the bare literal -- the wall for this class."""
+        events = [self._text_delta("x"), self._message_delta("end_turn")]
+        with patch("pdp_router._clients.anthropic.AsyncAnthropic") as mock_cls:
+            client = self._client(mock_cls, events)
+            out = _collect(self._stream_call(client))
+
+        assert out[-1] == StreamFinish("stop")
+        assert out[-1].usage is None
 
     def test_empty_text_delta_is_skipped(self) -> None:
         events = [self._text_delta(""), self._text_delta("x"), self._message_delta("end_turn")]
@@ -1278,9 +1511,10 @@ class TestOpenAICompatibleToolStreaming:
 
         assert out == ["blocked", StreamFinish("content_filter")]
 
-    def test_usage_only_chunk_after_finish_is_tolerated(self) -> None:
+    def test_usage_only_chunk_after_finish_rides_the_stream_finish(self) -> None:
         """OpenRouter emits a usage chunk with an empty choices list after the
-        finish chunk, so the finish must not terminate the loop."""
+        finish chunk. The finish is deferred to end-of-stream so that usage
+        can ride on the StreamFinish instead of being dropped."""
         lines = [
             self._sse(self._content("hi")),
             self._sse(self._finish("stop")),
@@ -1291,7 +1525,31 @@ class TestOpenAICompatibleToolStreaming:
             client = self._client(mock_cls, lines)
             out = _collect(self._stream_call(client))
 
+        assert out == [
+            "hi",
+            StreamFinish("stop", usage=StreamUsage(input_tokens=3, output_tokens=1)),
+        ]
+
+    def test_no_usage_chunk_leaves_usage_none(self) -> None:
+        lines = [
+            self._sse(self._content("hi")),
+            self._sse(self._finish("stop")),
+            "data: [DONE]",
+        ]
+        with patch("httpx.Client"), patch("httpx.AsyncClient") as mock_cls:
+            client = self._client(mock_cls, lines)
+            out = _collect(self._stream_call(client))
+
         assert out == ["hi", StreamFinish("stop")]
+        assert out[-1].usage is None
+
+    def test_with_tools_body_requests_the_usage_chunk(self) -> None:
+        lines = [self._sse(self._finish("stop")), "data: [DONE]"]
+        with patch("httpx.Client"), patch("httpx.AsyncClient") as mock_cls:
+            client = self._client(mock_cls, lines)
+            _collect(self._stream_call(client))
+            body = mock_cls.return_value.stream.call_args.kwargs["json"]
+        assert body["stream_options"] == {"include_usage": True}
 
     def test_keepalive_and_unparseable_lines_are_skipped(self) -> None:
         lines = [
@@ -1406,6 +1664,114 @@ class TestOpenAICompatibleToolStreaming:
             )
 
         assert out[0] == ToolCallDelta(index=0, id="call_1", name="run", arguments="")
+
+
+class TestPlainStreamUsage:
+    """usage_out sink on the plain streaming paths: opt-in, one append, str-only yields."""
+
+    def test_anthropic_sink_populated_after_clean_exhaustion(self) -> None:
+        events = [
+            SimpleNamespace(
+                type="message_start",
+                message=SimpleNamespace(
+                    usage=SimpleNamespace(
+                        input_tokens=80,
+                        cache_read_input_tokens=0,
+                        cache_creation_input_tokens=0,
+                    )
+                ),
+            ),
+            SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(type="text_delta", text="hi"),
+            ),
+            SimpleNamespace(
+                type="message_delta",
+                delta=SimpleNamespace(stop_reason="end_turn"),
+                usage=SimpleNamespace(output_tokens=9),
+            ),
+        ]
+        with patch("pdp_router._clients.anthropic.AsyncAnthropic") as mock_cls:
+            mock_cls.return_value.messages.stream.return_value = _FakeToolStream(events)
+            client = AnthropicClient("claude-sonnet-5", api_key="sk-test")
+            sink: list = []
+            out = _collect(
+                client.stream_complete_multi(
+                    "sys", [{"role": "user", "content": "x"}], usage_out=sink
+                )
+            )
+        assert out == ["hi"]
+        assert sink == [StreamUsage(input_tokens=80, output_tokens=9)]
+
+    def test_anthropic_without_sink_yields_strings_only(self) -> None:
+        events = [
+            SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(type="text_delta", text="hi"),
+            ),
+        ]
+        with patch("pdp_router._clients.anthropic.AsyncAnthropic") as mock_cls:
+            mock_cls.return_value.messages.stream.return_value = _FakeToolStream(events)
+            client = AnthropicClient("claude-sonnet-5", api_key="sk-test")
+            out = _collect(
+                client.stream_complete_multi("sys", [{"role": "user", "content": "x"}])
+            )
+        assert out == ["hi"]
+
+    def _openai_client(self, mock_cls: MagicMock, lines: list) -> OpenAICompatibleClient:
+        mock_cls.return_value.stream.return_value = _FakeSSEResponse(lines)
+        return OpenAICompatibleClient(
+            "openai/gpt-5.5",
+            api_key="k",
+            base_url="https://openrouter.ai/api/v1",
+            label="OpenRouter",
+        )
+
+    def test_openai_compat_plain_body_stays_bare_without_sink(self) -> None:
+        """The live plain body wall: no sink, no stream_options."""
+        lines = [
+            'data: {"choices": [{"index": 0, "delta": {"content": "hi"}}]}',
+            "data: [DONE]",
+        ]
+        with patch("httpx.Client"), patch("httpx.AsyncClient") as mock_cls:
+            client = self._openai_client(mock_cls, lines)
+            _collect(client.stream_complete_multi("sys", [{"role": "user", "content": "x"}]))
+            body = mock_cls.return_value.stream.call_args.kwargs["json"]
+        assert "stream_options" not in body
+
+    def test_openai_compat_sink_opts_in_and_captures(self) -> None:
+        lines = [
+            'data: {"choices": [{"index": 0, "delta": {"content": "hi"}}]}',
+            'data: {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2}}',
+            "data: [DONE]",
+        ]
+        with patch("httpx.Client"), patch("httpx.AsyncClient") as mock_cls:
+            client = self._openai_client(mock_cls, lines)
+            sink: list = []
+            out = _collect(
+                client.stream_complete_multi(
+                    "sys", [{"role": "user", "content": "x"}], usage_out=sink
+                )
+            )
+            body = mock_cls.return_value.stream.call_args.kwargs["json"]
+        assert out == ["hi"]
+        assert body["stream_options"] == {"include_usage": True}
+        assert sink == [StreamUsage(input_tokens=5, output_tokens=2)]
+
+    def test_openai_compat_no_usage_chunk_appends_nothing(self) -> None:
+        lines = [
+            'data: {"choices": [{"index": 0, "delta": {"content": "hi"}}]}',
+            "data: [DONE]",
+        ]
+        with patch("httpx.Client"), patch("httpx.AsyncClient") as mock_cls:
+            client = self._openai_client(mock_cls, lines)
+            sink: list = []
+            _collect(
+                client.stream_complete_multi(
+                    "sys", [{"role": "user", "content": "x"}], usage_out=sink
+                )
+            )
+        assert sink == []
 
 
 class TestPlainStreamErrorGuard:

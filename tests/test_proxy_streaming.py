@@ -24,7 +24,7 @@ from pdp_router._proxy import (
     _RouteProvenance,
     app,
 )
-from pdp_router._tools import StreamFinish, ToolCallDelta, ToolTranslationError
+from pdp_router._tools import StreamFinish, StreamUsage, ToolCallDelta, ToolTranslationError
 
 
 @pytest.fixture()
@@ -91,7 +91,7 @@ def _parse_sse(body: str) -> list[str]:
 class TestNonStreamingRegression:
     """Default callers MUST keep working after we add the streaming branch."""
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_nonstream_still_returns_json(self, mock_get_client, _mock_classify, client) -> None:
         mock_llm = MagicMock()
@@ -112,7 +112,7 @@ class TestNonStreamingRegression:
         assert data["object"] == "chat.completion"
         assert data["choices"][0]["message"]["content"] == "plain reply"
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_stream_default_false_returns_json(
         self, mock_get_client, _mock_classify, client
@@ -135,7 +135,7 @@ class TestNonStreamingRegression:
 
 
 class TestStreamingResponseShape:
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_stream_returns_sse_content_type(self, mock_get_client, _mock_classify, client) -> None:
         mock_get_client.return_value = _make_streaming_mock_client(["a", "b"])
@@ -152,7 +152,7 @@ class TestStreamingResponseShape:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_stream_first_event_is_route_info(
         self, mock_get_client, _mock_classify, client
@@ -176,7 +176,7 @@ class TestStreamingResponseShape:
         assert "confidence" in first
         assert "score" in first
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_stream_yields_content_deltas(self, mock_get_client, _mock_classify, client) -> None:
         tokens = ["hello", " ", "world"]
@@ -202,7 +202,7 @@ class TestStreamingResponseShape:
         recovered = "".join(d["choices"][0]["delta"]["content"] for d in delta_events)
         assert recovered == "hello world"
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_stream_done_terminator(self, mock_get_client, _mock_classify, client) -> None:
         mock_get_client.return_value = _make_streaming_mock_client(["one"])
@@ -219,7 +219,7 @@ class TestStreamingResponseShape:
         events = _parse_sse(resp.text)
         assert events[-1] == "[DONE]"
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_stream_multi_turn_uses_stream_complete_multi(
         self, mock_get_client, _mock_classify, client
@@ -264,7 +264,7 @@ class TestStreamingResponseShape:
 
 
 class TestStreamingErrorPath:
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_stream_mid_error_emits_error_event(
         self, mock_get_client, _mock_classify, client
@@ -295,7 +295,7 @@ class TestStreamingErrorPath:
 
 
 class TestStreamFlagOff:
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_flag_off_falls_back_to_json(
         self, mock_get_client, _mock_classify, client_streaming_disabled
@@ -326,7 +326,7 @@ class TestOpenAIFaithfulSurface:
     so strict agent clients like Crush stop rejecting it as 'unexpected EOF'.
     See claude-code-concerns.md #44."""
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_faithful_first_event_is_role_chunk_not_route_info(
         self, mock_get_client, _mock_classify, client
@@ -357,7 +357,7 @@ class TestOpenAIFaithfulSurface:
             assert payload.get("type") != "route_info"
 
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_faithful_terminal_chunk_has_finish_reason_stop(
         self, mock_get_client, _mock_classify, _footer, client
@@ -388,7 +388,7 @@ class TestOpenAIFaithfulSurface:
         )
         assert content == "hello world"
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_faithful_mid_error_emits_error_frame_not_clean_stop(
         self, mock_get_client, _mock_classify, client
@@ -425,7 +425,7 @@ class TestOpenAIFaithfulSurface:
         assert stop_chunks == []
         assert parsed[-1] == "[DONE]"
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_default_v1_surface_still_leads_with_route_info(
         self, mock_get_client, _mock_classify, client
@@ -446,7 +446,7 @@ class TestOpenAIFaithfulSurface:
         assert json.loads(events[0])["object"] == "pdp.route_info"
 
     @patch("pdp_router._proxy._route_footer_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_faithful_footer_when_enabled(
         self, mock_get_client, _mock_classify, _footer, client
@@ -471,7 +471,7 @@ class TestOpenAIFaithfulSurface:
         assert full.startswith("answer")
 
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_faithful_no_footer_when_disabled(
         self, mock_get_client, _mock_classify, _footer, client
@@ -488,7 +488,7 @@ class TestOpenAIFaithfulSurface:
         assert "[routed:" not in resp.text
 
     @patch("pdp_router._proxy._route_footer_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_default_v1_never_gets_footer(
         self, mock_get_client, _mock_classify, _footer, client
@@ -537,6 +537,7 @@ class TestFaithfulPlainStreamGolden:
         0.55,  # confidence
         3,  # score
         0,  # panel_score
+        "general",  # task_category
         False,  # search_intent
         "",  # system
         [ChatMessage(role="user", content="hi")],  # non_system
@@ -684,6 +685,7 @@ class TestToolStreaming:
         0.55,
         3,
         0,
+        "general",
         False,
         "",
         [ChatMessage(role="user", content="list files")],
@@ -700,12 +702,20 @@ class TestToolStreaming:
         body.update(overrides)
         return body
 
-    def _post(self, client, events: list, *, raise_at: int | None = None, footer: bool = False):
+    def _post(
+        self,
+        client,
+        events: list,
+        *,
+        raise_at: int | None = None,
+        footer: bool = False,
+        route: tuple | None = None,
+    ):
         mock_llm = _make_tool_streaming_mock_client(events, raise_at=raise_at)
         with (
             patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
             patch("pdp_router._proxy._route_footer_enabled", return_value=footer),
-            patch("pdp_router._proxy._route_request", return_value=self._ROUTE),
+            patch("pdp_router._proxy._route_request", return_value=route or self._ROUTE),
             patch("pdp_router._proxy.get_client", return_value=mock_llm),
         ):
             return client.post("/openai/v1/chat/completions", json=self._body())
@@ -844,6 +854,145 @@ class TestToolStreaming:
         # _route_footer_content, so drift here also moves the live plain path.
         assert "\n\n`[routed: claude-sonnet-4-6 | score 3]`" in contents
 
+    def test_floored_turn_footer_names_the_cascade_pick(self, client) -> None:
+        """A floored tool turn's footer names the router's own pick, so the
+        client can see the cascade ran and the driver floor replaced it.
+        "list files" pins index 3 (opus-4-8); the Haiku pick is not a driver."""
+        route = (
+            "claude-haiku-4-5-20251001",
+            0.95,
+            3,
+            0,
+            "general",
+            False,
+            "",
+            [ChatMessage(role="user", content="list files")],
+            _RouteProvenance(mode="cascade", explored=False),
+        )
+        events = ["hello", StreamFinish("stop")]
+        chunks = self._chunks(self._post(client, events, footer=True, route=route))
+
+        contents = [d.get("content", "") for d in self._deltas(chunks)]
+        assert (
+            "\n\n`[routed: claude-opus-4-8 | score 3"
+            " | tool floor over claude-haiku-4-5-20251001]`" in contents
+        )
+
+    def test_kept_driver_pick_footer_has_no_floor_suffix(self, client) -> None:
+        """A pick already inside the driver set is served as-is, and the footer
+        must not claim a floor that never ran (default _ROUTE is sonnet-4-6)."""
+        events = ["hello", StreamFinish("stop")]
+        chunks = self._chunks(self._post(client, events, footer=True))
+
+        contents = [d.get("content", "") for d in self._deltas(chunks)]
+        assert not any("tool floor" in c for c in contents)
+
+    def test_sticky_turn_footer_says_sticky_not_tool_floor(self, client) -> None:
+        """When the conversation incumbent displaces a usable driver pick, the
+        footer names the mechanism: sticky, not the pin-walk's tool floor."""
+        from pdp_router import _proxy
+
+        assert _proxy._conversation_cache is not None
+        digest = _proxy._tool_pin_digest("list files")
+        _proxy._conversation_cache.get(digest).driver = "claude-opus-4-8"
+
+        mock_llm = _make_tool_streaming_mock_client(["hello", StreamFinish("stop")])
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._sticky_driver_enabled", return_value=True),
+            patch("pdp_router._proxy._route_footer_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._ROUTE),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post("/openai/v1/chat/completions", json=self._body())
+
+        contents = [d.get("content", "") for d in self._deltas(self._chunks(resp))]
+        assert (
+            "\n\n`[routed: claude-opus-4-8 | score 3"
+            " | sticky over claude-sonnet-4-6]`" in contents
+        )
+
+    def test_stream_usage_never_reaches_the_wire(self, client) -> None:
+        """The leak wall: a usage-bearing StreamFinish is consumed server-side
+        for spend accounting; no emitted frame may carry a usage key and the
+        terminal bytes must match a usage-free turn's."""
+        events = [
+            "hello",
+            StreamFinish("stop", usage=StreamUsage(input_tokens=100, output_tokens=9)),
+        ]
+        resp = self._post(client, events, footer=False)
+        bare = self._post(client, ["hello", StreamFinish("stop")], footer=False)
+
+        assert "usage" not in resp.text
+
+        def _normalized(r) -> list[dict]:
+            return [
+                {k: v for k, v in c.items() if k not in ("id", "created")}
+                for c in self._chunks(r)
+            ]
+
+        assert _normalized(resp) == _normalized(bare)
+
+    def test_finish_usage_accumulates_conversation_spend(self, client) -> None:
+        """A streamed tool turn's reported usage lands in the conversation
+        state, priced by the shared estimator, keyed on the first user text."""
+        from pdp_router import _proxy
+        from pdp_router._cost import estimate_cost
+
+        usage = StreamUsage(input_tokens=1000, output_tokens=200)
+        events = ["hello", StreamFinish("stop", usage=usage)]
+        resp = self._post(client, events)
+        assert resp.status_code == 200
+
+        expected = estimate_cost(
+            "claude-sonnet-4-6", {"input_tokens": 1000, "output_tokens": 200}
+        )
+        digest = _proxy._tool_pin_digest("list files")
+        assert _proxy._conversation_cache is not None
+        state = _proxy._conversation_cache.peek(digest)
+        assert state is not None
+        assert state.spend_usd == pytest.approx(expected)
+
+        # A second turn in the same conversation accumulates.
+        self._post(client, ["again", StreamFinish("stop", usage=usage)])
+        assert state.spend_usd == pytest.approx(2 * expected)
+
+    def test_unreported_usage_adds_no_spend(self, client) -> None:
+        from pdp_router import _proxy
+
+        resp = self._post(client, ["hello", StreamFinish("stop")])
+        assert resp.status_code == 200
+        digest = _proxy._tool_pin_digest("list files")
+        assert _proxy._conversation_cache is not None
+        state = _proxy._conversation_cache.peek(digest)
+        assert state is None or state.spend_usd == 0.0
+
+    def test_budget_warning_rides_the_footer_once(self, client) -> None:
+        """A conversation past the warn threshold gets the budget note appended
+        to its next footer; the latch keeps the following turn's footer clean."""
+        from pdp_router import _proxy
+
+        assert _proxy._conversation_cache is not None
+        digest = _proxy._tool_pin_digest("list files")
+        _proxy._conversation_cache.get(digest).spend_usd = 1.25
+
+        events = ["hello", StreamFinish("stop")]
+        mock_llm = _make_tool_streaming_mock_client(events)
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._spend_cap_enabled", return_value=True),
+            patch("pdp_router._proxy._route_footer_enabled", return_value=True),
+            patch("pdp_router._proxy._route_request", return_value=self._ROUTE),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            first = client.post("/openai/v1/chat/completions", json=self._body())
+            mock_llm2 = _make_tool_streaming_mock_client(list(events))
+            with patch("pdp_router._proxy.get_client", return_value=mock_llm2):
+                second = client.post("/openai/v1/chat/completions", json=self._body())
+
+        assert "budget $1.25/$5.00" in first.text
+        assert "budget" not in second.text
+
     def test_no_footer_when_the_provider_labels_a_tool_turn_stop(self, client) -> None:
         """The footer guard cannot key on the provider's label.
 
@@ -962,7 +1111,7 @@ class TestToolStreaming:
             ),
             _proxy.ToolChatMessage(role="tool", tool_call_id="call_abc", content="a.txt"),
         ]
-        route = (*self._ROUTE[:6], history, self._ROUTE[7])
+        route = (*self._ROUTE[:7], history, self._ROUTE[8])
         mock_llm = _make_tool_streaming_mock_client([StreamFinish("stop")])
         seen: dict = {}
 
@@ -1017,7 +1166,7 @@ class TestToolStreaming:
     def test_system_prompt_reaches_the_stream_client(self, client) -> None:
         """A non-empty system turn is threaded to stream_with_tools; the
         empty-system route in the sibling tests let a dropped system pass."""
-        route = (*self._ROUTE[:5], "You are a careful tool runner.", *self._ROUTE[6:])
+        route = (*self._ROUTE[:6], "You are a careful tool runner.", *self._ROUTE[7:])
         mock_llm = _make_tool_streaming_mock_client([StreamFinish("stop")])
         seen: dict = {}
 
@@ -1192,7 +1341,7 @@ class TestFaithfulPanelStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_panels_and_streams_chair(
@@ -1248,7 +1397,7 @@ class TestFaithfulPanelStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=True)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_footer_names_panel_members(
@@ -1281,7 +1430,7 @@ class TestFaithfulPanelStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_zero_survivors_emits_error_frame_no_stop(
@@ -1326,7 +1475,7 @@ class TestFaithfulPanelStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_chair_empty_falls_back_to_first_survivor(
@@ -1366,7 +1515,7 @@ class TestFaithfulPanelStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_chair_stream_error_emits_error_frame(
@@ -1409,7 +1558,7 @@ class TestFaithfulPanelStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=[])
     @patch("pdp_router._proxy.get_client")
     def test_empty_members_streams_cascade_fallback(
@@ -1442,7 +1591,7 @@ class TestFaithfulPanelStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=[])
     @patch("pdp_router._proxy.get_client")
     def test_empty_members_fallback_records_the_executed_policy(
@@ -1513,7 +1662,7 @@ class TestFaithfulPanelStreaming:
 
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_keepalive_during_slow_fanout(
@@ -1541,7 +1690,7 @@ class TestFaithfulPanelStreaming:
     # -- regression guards: the panel-stream branch must not leak into other paths --
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_default_v1_stream_high_panel_score_is_single_model_route_info(
         self, mock_get_client, _classify, _autopanel, client
@@ -1562,7 +1711,7 @@ class TestFaithfulPanelStreaming:
 
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 4))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 4, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_faithful_stream_low_panel_score_is_single_model(
         self, mock_get_client, _classify, _autopanel, _panelstream, client
@@ -1584,7 +1733,7 @@ class TestFaithfulPanelStreaming:
 
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=False)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_kill_switch_off_is_single_model(
         self, mock_get_client, _classify, _autopanel, _panelstream, client
@@ -1607,7 +1756,7 @@ class TestFaithfulPanelStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_partial_survivor_excludes_errored_member_from_rows(
@@ -1651,7 +1800,7 @@ class TestFaithfulPanelStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_chair_client_build_failure_emits_error_frame(
@@ -1701,7 +1850,7 @@ class TestFaithfulPanelStreaming:
 
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", side_effect=RuntimeError("compose boom"))
     @patch("pdp_router._proxy.get_client")
     def test_fanout_machinery_failure_emits_error_frame(
@@ -1733,7 +1882,7 @@ class TestFaithfulPanelStreaming:
 
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_streaming_disabled_high_panel_score_is_single_model_json(
         self, mock_get_client, _classify, _autopanel, _panelstream, client_streaming_disabled
@@ -1792,7 +1941,7 @@ class TestPanelTranscriptStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_stream_tee_captures_full_synthesis(
@@ -1836,7 +1985,7 @@ class TestPanelTranscriptStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_stream_chair_error_records_partial_with_error_status(
@@ -1877,7 +2026,7 @@ class TestPanelTranscriptStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_stream_chair_empty_records_empty_synthesis_not_fallback(
@@ -1920,7 +2069,7 @@ class TestPanelTranscriptStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=True)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_stream_footer_reaches_client_but_not_synthesis(
@@ -1958,7 +2107,7 @@ class TestPanelTranscriptStreaming:
     @patch("pdp_router._proxy._route_footer_enabled", return_value=False)
     @patch("pdp_router._proxy._panel_streaming_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.35, 4, 9, "general"))
     @patch("pdp_router._proxy.compose_panel", return_value=list(_PANEL_MEMBERS))
     @patch("pdp_router._proxy.get_client")
     def test_stream_flag_off_writes_no_transcript_and_keeps_sse(
@@ -2054,6 +2203,7 @@ class TestToolStreamingDriverFloor:
         0.55,
         3,
         0,
+        "general",
         False,
         "",
         [ChatMessage(role="user", content="what is the capital of france")],

@@ -179,6 +179,58 @@ def default_priors(model_names: list[str]) -> dict[str, BanditState]:
     return {name: BanditState() for name in model_names}
 
 
+def prob_beats(candidate: BanditState, baseline: BanditState) -> float:
+    """P(candidate beats baseline) for two independent Normal posteriors.
+
+    Closed form Phi((mu_c - mu_b) / sqrt(sigma_c^2 + sigma_b^2)) via
+    math.erf -- no scipy. Symmetric: prob_beats(a, b) == 1 - prob_beats(b, a).
+    A degenerate zero-variance pair falls back to a mu comparison (1.0 / 0.5 /
+    0.0) rather than dividing by zero; _SIGMA_FLOOR makes that unreachable for
+    states produced by update_posterior.
+    """
+    denom = math.sqrt(candidate.sigma**2 + baseline.sigma**2)
+    if denom <= 0.0:
+        if candidate.mu > baseline.mu:
+            return 1.0
+        return 0.5 if candidate.mu == baseline.mu else 0.0
+    z = (candidate.mu - baseline.mu) / denom
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def eligible_arms(
+    states: dict[str, BanditState],
+    baseline_name: str,
+    min_prob: float = 0.75,
+    min_obs: int = 10,
+) -> dict[str, BanditState]:
+    """Filter arms to the baseline plus those clearing a one-sided uplift bar.
+
+    Promotion policy, not sampling: an arm becomes eligible only when its
+    posterior beats the price-efficient baseline's with probability >= min_prob
+    AND it has at least min_obs observations (the _CONTEXT_MIN_OBS philosophy:
+    a near-prior posterior must not luck past the bar). The baseline itself is
+    ALWAYS retained, so the result is never empty and the downstream
+    thompson_sample never sees an empty dict. A baseline missing from states
+    returns them unchanged -- with nothing to measure uplift against, gating
+    would be arbitrary.
+
+    Structural twin of apply_cost_to_bandit: states dict in, states dict out,
+    applied immediately before thompson_sample.
+    """
+    baseline = states.get(baseline_name)
+    if baseline is None:
+        return dict(states)
+    kept = {baseline_name: baseline}
+    for name, state in states.items():
+        if name == baseline_name:
+            continue
+        if state.n_obs < min_obs:
+            continue
+        if prob_beats(state, baseline) >= min_prob:
+            kept[name] = state
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # Contextual Thompson Sampling
 # ---------------------------------------------------------------------------

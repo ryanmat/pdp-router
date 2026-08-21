@@ -632,6 +632,7 @@ class TestEffortRouting:
         0.15,  # confidence
         5,  # score -> high effort
         0,  # panel_score
+        "general",  # task_category
         False,  # search_intent
         "",  # system
         [ChatMessage(role="user", content="hard")],  # non_system
@@ -690,6 +691,7 @@ class TestEffortRouting:
             0.95,
             1,
             0,
+            "general",
             False,
             "",
             [ChatMessage(role="user", content="easy")],
@@ -722,7 +724,7 @@ class TestClassifyRequest:
         from pdp_router._proxy import ChatMessage
 
         messages = [ChatMessage(role="user", content="Explain recursion")]
-        _confidence, score, _panel_score = _classify_request(messages, config)
+        _confidence, score, _panel_score, _task_category = _classify_request(messages, config)
 
         assert score == 3
         assert _confidence == 0.55
@@ -735,7 +737,7 @@ class TestClassifyRequest:
         from pdp_router._proxy import ChatMessage
 
         messages = [ChatMessage(role="user", content="test")]
-        _confidence, score, _panel_score = _classify_request(messages, config)
+        _confidence, score, _panel_score, _task_category = _classify_request(messages, config)
 
         assert score == 3
         assert _confidence == 0.55
@@ -750,7 +752,7 @@ class TestClassifyRequest:
         from pdp_router._proxy import ChatMessage
 
         messages = [ChatMessage(role="user", content="test")]
-        _confidence, score, _panel_score = _classify_request(messages, config)
+        _confidence, score, _panel_score, _task_category = _classify_request(messages, config)
 
         assert score == 3
 
@@ -767,7 +769,7 @@ class TestClassifyRequest:
         config = ProxyConfig(gemini_api_key="gk-test")
         messages = [ChatMessage(role="user", content="compare A vs B")]
         with patch.dict(os.environ, {"PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"}):
-            confidence, score, panel_score = _classify_request(messages, config)
+            confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (4, 8)
         assert confidence == _SCORE_TO_CONFIDENCE[4]
@@ -786,7 +788,7 @@ class TestClassifyRequest:
             os.environ,
             {"PROXY_CLASSIFY_RETRIES": "2", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
         ):
-            _confidence, score, panel_score = _classify_request(messages, config)
+            _confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (3, 0)
         assert mock_client.complete.call_count == 3  # initial + 2 retries
@@ -804,7 +806,7 @@ class TestClassifyRequest:
             os.environ,
             {"PROXY_CLASSIFY_RETRIES": "2", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
         ):
-            _confidence, score, panel_score = _classify_request(messages, config)
+            _confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (3, 0)
         assert mock_client.complete.call_count == 1
@@ -831,7 +833,7 @@ class TestClassifyFallback:
             patch("pdp_router._proxy.get_client", return_value=fallback) as mock_get_client,
             caplog.at_level(logging.DEBUG, logger="pdp_router._proxy"),
         ):
-            _confidence, score, panel_score = _classify_request(messages, config)
+            _confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (4, 8)
         # The uncredentialed primary is never constructed at all.
@@ -866,7 +868,7 @@ class TestClassifyFallback:
         config = ProxyConfig(anthropic_api_key="", gemini_api_key="")
         messages = [ChatMessage(role="user", content="test")]
         with patch("pdp_router._proxy.get_client") as mock_get_client:
-            _confidence, score, panel_score = _classify_request(messages, config)
+            _confidence, score, panel_score, _task_category = _classify_request(messages, config)
         assert (score, panel_score) == (3, 0)
         mock_get_client.assert_not_called()
 
@@ -892,7 +894,7 @@ class TestClassifyFallback:
             os.environ,
             {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
         ):
-            confidence, score, panel_score = _classify_request(messages, config)
+            confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (4, 8)
         assert confidence == _SCORE_TO_CONFIDENCE[4]
@@ -920,7 +922,7 @@ class TestClassifyFallback:
             os.environ,
             {"PROXY_CLASSIFY_RETRIES": "2", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
         ):
-            _confidence, score, panel_score = _classify_request(messages, config)
+            _confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (2, 0)
         assert primary.complete.call_count == 1  # non-retryable: no wasted retries
@@ -937,7 +939,7 @@ class TestClassifyFallback:
             os.environ,
             {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
         ):
-            _confidence, score, panel_score = _classify_request(messages, config)
+            _confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (3, 0)
         assert mock_get_client.call_count == 1
@@ -954,7 +956,7 @@ class TestClassifyFallback:
             os.environ,
             {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
         ):
-            _confidence, score, panel_score = _classify_request(messages, config)
+            _confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (3, 0)
         assert mock_get_client.call_count == 2
@@ -975,7 +977,7 @@ class TestClassifyFallback:
             os.environ,
             {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
         ):
-            _confidence, score, panel_score = _classify_request(messages, config)
+            _confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (4, 8)
         assert mock_get_client.call_count == 2
@@ -997,7 +999,7 @@ class TestClassifyFallback:
             os.environ,
             {"PROXY_CLASSIFY_RETRIES": "0", "PROXY_CLASSIFY_RETRY_BACKOFF_S": "0"},
         ):
-            _confidence, score, panel_score = _classify_request(messages, config)
+            _confidence, score, panel_score, _task_category = _classify_request(messages, config)
 
         assert (score, panel_score) == (3, 0)
         assert mock_get_client.call_count == 1
@@ -1045,7 +1047,7 @@ class TestClassifyRetryable:
 
 
 class TestChatCompletions:
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_returns_openai_format(self, mock_get_client, mock_classify, client) -> None:
         mock_client = MagicMock()
@@ -1074,7 +1076,7 @@ class TestChatCompletions:
     # capability hint to the system prompt, which would break the exact-match
     # assertion below. This test is about system extraction, not web search.
     @patch("pdp_router._proxy._web_search_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_system_prompt_extracted(
         self, mock_get_client, mock_classify, _mock_ws, client
@@ -1101,7 +1103,7 @@ class TestChatCompletions:
             or call_kwargs[1].get("system") == "You are helpful"
         )
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_multi_turn_uses_complete_multi(self, mock_get_client, mock_classify, client) -> None:
         mock_client = MagicMock()
@@ -1123,7 +1125,7 @@ class TestChatCompletions:
         assert resp.status_code == 200
         mock_client.complete_multi.assert_called_once()
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_credit_exhaustion_returns_402(self, mock_get_client, mock_classify, client) -> None:
         mock_client = MagicMock()
@@ -1140,7 +1142,7 @@ class TestChatCompletions:
 
         assert resp.status_code == 402
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_api_error_returns_503(self, mock_get_client, mock_classify, client) -> None:
         mock_client = MagicMock()
@@ -1207,6 +1209,7 @@ class TestToolPassthroughNonStream:
             0.5,
             4,
             0,
+            "general",
             False,
             "",
             non_system
@@ -1879,7 +1882,7 @@ class TestExplicitModel:
         mock_classify.assert_not_called()
         mock_get_client.assert_not_called()
 
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_pdp_auto_still_classifies(self, mock_get_client, mock_classify, client) -> None:
         """Regression guard -- explicit-model branch must not break the
@@ -2008,14 +2011,19 @@ class TestBanditCacheCanonical:
 
 
 class TestParseClassifier:
-    def test_two_int_format(self) -> None:
-        assert _parse_classifier("4 8") == (4, 8)
-        assert _parse_classifier("1 0") == (1, 0)
-        assert _parse_classifier("5 10") == (5, 10)
+    def test_three_int_format(self) -> None:
+        assert _parse_classifier("4 8 2") == (4, 8, "codegen")
+        assert _parse_classifier("1 0 1") == (1, 0, "general")
+        assert _parse_classifier("5 10 6") == (5, 10, "writing")
+
+    def test_two_int_back_compat(self) -> None:
+        assert _parse_classifier("4 8") == (4, 8, "general")
+        assert _parse_classifier("1 0") == (1, 0, "general")
+        assert _parse_classifier("5 10") == (5, 10, "general")
 
     def test_single_int_back_compat(self) -> None:
-        assert _parse_classifier("4") == (4, 0)
-        assert _parse_classifier("1") == (1, 0)
+        assert _parse_classifier("4") == (4, 0, "general")
+        assert _parse_classifier("1") == (1, 0, "general")
 
     def test_garbage_returns_none(self) -> None:
         # None signals parse failure so _classify_request can route it to the
@@ -2025,13 +2033,27 @@ class TestParseClassifier:
         assert _parse_classifier("no clue") is None
         assert _parse_classifier("4/8") is None
 
+    def test_bad_category_never_fails_the_parse(self) -> None:
+        # The first two fields carry routing weight; the third is telemetry.
+        # A junk or out-of-range category must collapse to "general", not
+        # return None -- None would re-bill the classifier via retry/fallback.
+        assert _parse_classifier("4 8 zebra") == (4, 8, "general")
+        assert _parse_classifier("4 8 99") == (4, 8, "general")
+        assert _parse_classifier("4 8 0") == (4, 8, "general")
+        assert _parse_classifier("4 8 -3") == (4, 8, "general")
+
     def test_clamps_both_axes(self) -> None:
-        assert _parse_classifier("9 99") == (5, 10)
-        assert _parse_classifier("0 -5") == (1, 0)
-        assert _parse_classifier("7 -1") == (5, 0)
+        assert _parse_classifier("9 99") == (5, 10, "general")
+        assert _parse_classifier("0 -5") == (1, 0, "general")
+        assert _parse_classifier("7 -1") == (5, 0, "general")
 
     def test_strips_markdown_fences(self) -> None:
-        assert _parse_classifier("```\n4 8\n```") == (4, 8)
+        assert _parse_classifier("```\n4 8 3\n```") == (4, 8, "debugging")
+
+    def test_every_category_code_maps(self) -> None:
+        expected = ["general", "codegen", "debugging", "planning", "ops", "writing"]
+        got = [_parse_classifier(f"3 0 {code}")[2] for code in range(1, 7)]
+        assert got == expected
 
 
 @pytest.fixture()
@@ -2095,7 +2117,7 @@ class TestPanelTranscriptCapture:
 
     @patch("pdp_router._proxy._panel_transcript_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_nonstream_panel_writes_transcript(
@@ -2145,7 +2167,7 @@ class TestPanelTranscriptCapture:
 
     @patch("pdp_router._proxy._panel_transcript_enabled", return_value=False)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_nonstream_panel_no_transcript_when_flag_off(
@@ -2182,7 +2204,7 @@ class TestPanelTranscriptCapture:
 
     @patch("pdp_router._proxy._panel_transcript_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_nonstream_chair_empty_records_empty_synthesis_not_fallback(
@@ -2230,7 +2252,7 @@ class TestAutoPanelGate:
     """Sprint X.K -- clawflag-gated proxy auto-panel decompose+synth path."""
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_flag_off_high_panel_score_still_cascades(
         self, mock_get_client, _mock_classify, _mock_flag, client
@@ -2254,7 +2276,7 @@ class TestAutoPanelGate:
         mock_llm.complete.assert_called_once()
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 4))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 4, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_flag_on_low_panel_score_still_cascades(
         self, mock_get_client, _mock_classify, _mock_flag, client
@@ -2276,7 +2298,7 @@ class TestAutoPanelGate:
         assert "pdp-panel" not in resp.json()["model"]
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_flag_on_high_panel_score_triggers_panel(
@@ -2342,7 +2364,7 @@ class TestAutoPanelGate:
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
     @patch("pdp_router._proxy._streaming_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_skipped_when_streaming(
         self,
@@ -2374,7 +2396,7 @@ class TestAutoPanelGate:
         assert resp.headers["content-type"].startswith("text/event-stream")
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_panel_member_failure_excluded_from_chair(
@@ -2414,7 +2436,7 @@ class TestAutoPanelGate:
         assert "pdp-panel-2+" in resp.json()["model"]
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_errored_member_excluded_from_routing_rows(
@@ -2469,7 +2491,7 @@ class TestAutoPanelGate:
         assert len(chair_rows) == 1
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_panel_all_failures_returns_503(
@@ -2501,7 +2523,7 @@ class TestAutoPanelGate:
         assert resp.status_code == 503
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_cascade_writes_jsonl_row(
         self,
@@ -2530,9 +2552,42 @@ class TestAutoPanelGate:
         assert rows[0]["context_bucket"] == "chat:cascade"
         assert rows[0]["domain"] == "chat"
         assert rows[0]["prediction_id"] == 0
+        # Always-present telemetry key (search_intent precedent): a two-int
+        # classifier reply still yields the "general" default here.
+        assert json.loads(rows[0]["context_json"])["task_category"] == "general"
+
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=False)
+    @patch(
+        "pdp_router._proxy._classify_request",
+        return_value=(0.55, 3, 0, "debugging"),
+    )
+    @patch("pdp_router._proxy.get_client")
+    def test_cascade_row_carries_task_category(
+        self,
+        mock_get_client,
+        _mock_classify,
+        _mock_flag,
+        client,
+        inbox_dir,
+    ) -> None:
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("cascade")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "why does this crash"}],
+            },
+        )
+
+        assert resp.status_code == 200
+        rows = _read_inbox_rows(inbox_dir)
+        assert json.loads(rows[0]["context_json"])["task_category"] == "debugging"
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_panel_writes_jsonl_rows(
@@ -2576,7 +2631,7 @@ class TestAutoPanelGate:
         assert len(ctx_ids) == 1
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_prediction_id_header_present_for_cascade(
         self,
@@ -2604,7 +2659,7 @@ class TestAutoPanelGate:
         assert len(uid) == 36  # uuid4 hex shape
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_prediction_id_header_present_for_panel(
@@ -2640,7 +2695,7 @@ class TestAutoPanelGate:
         assert resp.headers.get("x-pdp-prediction-id") is not None
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_prediction_id_matches_chat_request_id_in_jsonl(
         self,
@@ -2670,7 +2725,7 @@ class TestAutoPanelGate:
         assert ctx["chat_request_id"] == uid
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_prediction_id_header_survives_cascade_503(
         self,
@@ -2699,7 +2754,7 @@ class TestAutoPanelGate:
         assert len(resp.headers["x-pdp-prediction-id"]) == 36
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_prediction_id_header_survives_panel_all_failures_503(
@@ -2746,7 +2801,7 @@ class TestAutoPanelGate:
         assert len(resp.headers["x-pdp-prediction-id"]) == 36
 
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     @patch("pdp_router._proxy.synthesize_chair")
@@ -2957,7 +3012,7 @@ class TestSearchIntentGateAndFloor:
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch(
         "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
     )
@@ -2987,7 +3042,7 @@ class TestSearchIntentGateAndFloor:
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_panel_still_fires_without_search_intent(
@@ -3100,7 +3155,7 @@ class TestSearchIntentGateAndFloor:
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.95, 1, 3))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.95, 1, 3, "general"))
     @patch(
         "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
     )
@@ -3126,7 +3181,7 @@ class TestSearchIntentGateAndFloor:
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._streaming_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch(
         "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
     )
@@ -3190,7 +3245,7 @@ class TestWebSearchGate:
     """Tier B -- clawflag-gated proxy web search on the cascade path."""
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=False)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_flag_off_cascade_no_web_search(
         self, mock_get_client, _mock_classify, _mock_flag, client
@@ -3208,7 +3263,7 @@ class TestWebSearchGate:
         assert mock_llm.complete.call_args.kwargs.get("enable_web_search") is False
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_flag_on_cascade_passes_flag_and_nudges_system(
         self, mock_get_client, _mock_classify, _mock_flag, client
@@ -3238,7 +3293,7 @@ class TestWebSearchGate:
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._streaming_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch("pdp_router._proxy.get_client")
     def test_flag_on_streaming_passes_flag(
         self, mock_get_client, _mock_classify, _mock_streaming, _mock_flag, client
@@ -3270,7 +3325,7 @@ class TestWebSearchGate:
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
     @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
     @patch("pdp_router._proxy.compose_panel")
     @patch("pdp_router._proxy.get_client")
     def test_panel_path_stays_search_free(
@@ -3427,6 +3482,7 @@ class TestToolDriverFloorAndPin:
             0.5,
             score,
             panel_score,
+            "general",
             False,
             "",
             non_system
@@ -3776,7 +3832,7 @@ class TestToolDriverFloorAndPin:
         mock_llm.complete_with_tools.assert_called_once()
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch(
         "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
     )
@@ -3808,7 +3864,7 @@ class TestToolDriverFloorAndPin:
         assert "enable_web_search" not in mock_llm.complete_with_tools.call_args.kwargs
 
     @patch("pdp_router._proxy._web_search_enabled", return_value=True)
-    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0))
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
     @patch(
         "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
     )
@@ -3884,6 +3940,411 @@ class TestToolDriverFloorAndPin:
         assert len(rows) == 1
         assert rows[0]["model_selected"] == "claude-opus-5"
         assert rows[0]["routing_mode"] == "cascade"
+
+
+class TestStickyDriver:
+    """Fully sticky tool conversations behind pipeline.proxy_sticky_driver_enabled.
+
+    Precedence under the flag: PROXY_TOOL_MODEL override > conversation
+    incumbent > cascade-pick-if-driver > pin walk. Flag off must be
+    byte-identical to the floor-and-pin behavior above.
+    """
+
+    _mock = staticmethod(TestToolPassthroughNonStream._mock)
+    _route = staticmethod(TestToolDriverFloorAndPin._route)
+
+    _CONV_TEXT = "what is the capital of france"
+
+    def _post_auto(self, client, *, route: tuple, sticky: bool = True, env: dict | None = None):
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._sticky_driver_enabled", return_value=sticky),
+            patch("pdp_router._proxy._route_request", return_value=route),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm) as mock_get_client,
+            patch.dict(os.environ, env or {}),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [{"role": "user", "content": self._CONV_TEXT}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        return resp, mock_get_client
+
+    def test_incumbent_beats_a_usable_driver_pick(self, client) -> None:
+        """Turn 1 floors Haiku to the pin (opus-5); turn 2's cascade pick is
+        itself a usable driver (sonnet-4-6) but the incumbent must serve."""
+        _, gc1 = self._post_auto(client, route=self._route())
+        assert gc1.call_args[0][0] == "claude-opus-5"
+        _, gc2 = self._post_auto(client, route=self._route(model="claude-sonnet-4-6"))
+        assert gc2.call_args[0][0] == "claude-opus-5"
+
+    def test_flag_off_keeps_per_turn_routing(self, client) -> None:
+        _, gc1 = self._post_auto(client, route=self._route(), sticky=False)
+        assert gc1.call_args[0][0] == "claude-opus-5"
+        _, gc2 = self._post_auto(
+            client, route=self._route(model="claude-sonnet-4-6"), sticky=False
+        )
+        assert gc2.call_args[0][0] == "claude-sonnet-4-6"
+
+    def test_unusable_incumbent_falls_through_to_the_pin_walk(self, client) -> None:
+        """An incumbent whose credentials are gone (gpt-5.5, no OpenRouter key
+        in the fixture) is walked past, and the served driver replaces it."""
+        digest = _proxy._tool_pin_digest(self._CONV_TEXT)
+        assert _proxy._conversation_cache is not None
+        _proxy._conversation_cache.get(digest).driver = "openai/gpt-5.5"
+        _, gc = self._post_auto(client, route=self._route())
+        assert gc.call_args[0][0] == "claude-opus-5"
+        assert _proxy._conversation_cache.get(digest).driver == "claude-opus-5"
+
+    def test_override_beats_the_incumbent(self, client) -> None:
+        _, gc1 = self._post_auto(client, route=self._route())
+        assert gc1.call_args[0][0] == "claude-opus-5"
+        _, gc2 = self._post_auto(
+            client,
+            route=self._route(),
+            env={"PROXY_TOOL_MODEL": "claude-sonnet-4-6"},
+        )
+        assert gc2.call_args[0][0] == "claude-sonnet-4-6"
+
+    def test_explicit_model_never_records_an_incumbent(self, client) -> None:
+        mock_llm = self._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._sticky_driver_enabled", return_value=True),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "claude-sonnet-5",
+                    "messages": [{"role": "user", "content": self._CONV_TEXT}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        assert resp.status_code == 200
+        digest = _proxy._tool_pin_digest(self._CONV_TEXT)
+        assert _proxy._conversation_cache is not None
+        # Spend accounting may touch the entry; the sticky invariant is that
+        # no INCUMBENT is recorded for a caller-pinned model.
+        state = _proxy._conversation_cache.peek(digest)
+        assert state is None or state.driver is None
+
+    def test_sticky_row_carries_the_flag_and_conversation_key(self, client, inbox_dir) -> None:
+        self._post_auto(client, route=self._route())
+        resp, _ = self._post_auto(client, route=self._route(model="claude-sonnet-4-6"))
+        assert resp.status_code == 200
+        rows = _read_inbox_rows(inbox_dir)
+        first, second = json.loads(rows[0]["context_json"]), json.loads(rows[1]["context_json"])
+        assert "tool_sticky" not in first
+        assert second["tool_sticky"] is True
+        digest = _proxy._tool_pin_digest(self._CONV_TEXT)
+        assert first["conversation_key"] == digest[:8]
+        assert second["conversation_key"] == digest[:8]
+
+
+class TestAutoModelModes:
+    """pdp-auto-cost / pdp-auto-max aliases shift the score->confidence map."""
+
+    def test_parse_auto_model(self) -> None:
+        from pdp_router._proxy import _parse_auto_model
+
+        assert _parse_auto_model("pdp-auto") == (True, "balanced")
+        assert _parse_auto_model("") == (True, "balanced")
+        assert _parse_auto_model("pdp-auto-cost") == (True, "cost")
+        assert _parse_auto_model("pdp-auto-max") == (True, "max")
+        assert _parse_auto_model("pdp-auto-turbo") == (False, "")
+        assert _parse_auto_model("claude-sonnet-5") == (False, "")
+
+    def test_models_endpoints_list_the_aliases(self, client) -> None:
+        for path in ("/v1/models", "/openai/v1/models"):
+            ids = {m["id"] for m in client.get(path).json()["data"]}
+            assert {"pdp-auto", "pdp-auto-cost", "pdp-auto-max"} <= ids
+
+    def _routed_confidence(self, client, model: str, classify: tuple) -> tuple:
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ok")
+        with (
+            patch("pdp_router._proxy._autopanel_enabled", return_value=False),
+            patch("pdp_router._proxy._classify_request", return_value=classify),
+            patch(
+                "pdp_router._proxy._cascade_with_provenance",
+                return_value=(
+                    "claude-haiku-4-5-20251001",
+                    _proxy._RouteProvenance(mode="cascade", explored=False),
+                ),
+            ) as mock_cascade,
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+            )
+        return resp, mock_cascade.call_args.kwargs["confidence"]
+
+    def test_cost_mode_shifts_confidence_up_a_tier(self, client) -> None:
+        # Score 2 reads 0.75 balanced; cost mode feeds the cascade 0.95.
+        resp, conf = self._routed_confidence(
+            client, "pdp-auto-cost", (0.75, 2, 0, "general")
+        )
+        assert resp.status_code == 200
+        assert conf == 0.95
+
+    def test_max_mode_shifts_confidence_down_a_tier(self, client) -> None:
+        resp, conf = self._routed_confidence(client, "pdp-auto-max", (0.95, 1, 0, "general"))
+        assert resp.status_code == 200
+        assert conf == 0.75
+
+    def test_balanced_is_untouched(self, client) -> None:
+        resp, conf = self._routed_confidence(client, "pdp-auto", (0.75, 2, 0, "general"))
+        assert resp.status_code == 200
+        assert conf == 0.75
+
+    def test_mode_recorded_on_the_row_only_for_aliases(self, client, inbox_dir) -> None:
+        self._routed_confidence(client, "pdp-auto-cost", (0.75, 2, 0, "general"))
+        self._routed_confidence(client, "pdp-auto", (0.75, 2, 0, "general"))
+        rows = _read_inbox_rows(inbox_dir)
+        contexts = [json.loads(r["context_json"]) for r in rows]
+        assert contexts[0]["mode"] == "cost"
+        assert "mode" not in contexts[1]
+
+    def test_unknown_auto_alias_is_a_400(self, client) -> None:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto-turbo",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 400
+
+
+class TestClassifyImplicitFeedback:
+    """Deterministic next-turn grading: markers, exact retry, moved_on default."""
+
+    def test_correction_markers(self) -> None:
+        from pdp_router._proxy import _classify_implicit_feedback
+
+        for text in (
+            "no, that breaks the tests",
+            "That's wrong, look again",
+            "that's not what I asked for",
+            "undo that change",
+            "revert it",
+            "use uv instead",
+            "try again with the real file",
+            "still broken after your fix",
+            "don't touch the config",
+        ):
+            assert _classify_implicit_feedback(text, None) == "correction", text
+
+    def test_moved_on_default(self) -> None:
+        from pdp_router._proxy import _classify_implicit_feedback
+
+        for text in (
+            "now add the tests",
+            "great, next let us deploy it",
+            "what does the second function do?",
+            "nothing else, thanks",
+        ):
+            assert _classify_implicit_feedback(text, None) == "moved_on", text
+
+    def test_exact_resend_is_a_retry(self) -> None:
+        import hashlib as _hashlib
+
+        from pdp_router._proxy import _classify_implicit_feedback
+
+        digest = _hashlib.sha256(b"list the files").hexdigest()
+        assert _classify_implicit_feedback("list the files", digest) == "retry"
+        assert _classify_implicit_feedback("list the dirs", digest) == "moved_on"
+
+
+class TestImplicitFeedbackRows:
+    """One feedback row per routed multi-turn exchange, targeting the prior turn."""
+
+    _T1 = "compare these two approaches"
+
+    def _post(self, client, messages: list, *, flag: bool = True, model: str = "pdp-auto"):
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ok")
+        mock_llm.complete_multi.return_value = _mock_completion("ok")
+        with (
+            patch("pdp_router._proxy._implicit_feedback_enabled", return_value=flag),
+            patch("pdp_router._proxy._autopanel_enabled", return_value=False),
+            patch(
+                "pdp_router._proxy._classify_request",
+                return_value=(0.55, 3, 0, "general"),
+            ),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            return client.post(
+                "/v1/chat/completions", json={"model": model, "messages": messages}
+            )
+
+    def _two_turns(self, client, second_text: str, **kwargs):
+        first = self._post(client, [{"role": "user", "content": self._T1}], **kwargs)
+        second = self._post(
+            client,
+            [
+                {"role": "user", "content": self._T1},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": second_text},
+            ],
+            **kwargs,
+        )
+        return first, second
+
+    def test_second_turn_emits_a_feedback_row_targeting_the_first(
+        self, client, inbox_dir
+    ) -> None:
+        first, second = self._two_turns(client, "now write the tests")
+        assert second.status_code == 200
+        rows = _read_inbox_rows(inbox_dir)
+        fb = [r for r in rows if r["routing_mode"] == "implicit_feedback"]
+        assert len(fb) == 1
+        ctx = json.loads(fb[0]["context_json"])
+        assert ctx["feedback_signal"] == "moved_on"
+        assert ctx["target_chat_request_id"] == first.headers["X-PDP-Prediction-Id"]
+        assert fb[0]["context_bucket"] == "chat:feedback"
+        # Attributed to the model that served the graded turn.
+        assert fb[0]["model_selected"] == rows[0]["model_selected"]
+
+    def test_correction_signal_recorded(self, client, inbox_dir) -> None:
+        self._two_turns(client, "that's wrong, the cascade never runs there")
+        fb = [
+            r
+            for r in _read_inbox_rows(inbox_dir)
+            if r["routing_mode"] == "implicit_feedback"
+        ]
+        assert json.loads(fb[0]["context_json"])["feedback_signal"] == "correction"
+
+    def test_first_turn_emits_nothing(self, client, inbox_dir) -> None:
+        self._post(client, [{"role": "user", "content": self._T1}])
+        rows = _read_inbox_rows(inbox_dir)
+        assert [r for r in rows if r["routing_mode"] == "implicit_feedback"] == []
+
+    def test_flag_off_emits_nothing(self, client, inbox_dir) -> None:
+        self._two_turns(client, "that's wrong", flag=False)
+        rows = _read_inbox_rows(inbox_dir)
+        assert [r for r in rows if r["routing_mode"] == "implicit_feedback"] == []
+
+    def test_explicit_model_emits_nothing(self, client, inbox_dir) -> None:
+        self._two_turns(client, "that's wrong", model="claude-sonnet-5")
+        rows = _read_inbox_rows(inbox_dir) if list(inbox_dir.glob("proxy-*.jsonl")) else []
+        assert [r for r in rows if r["routing_mode"] == "implicit_feedback"] == []
+
+
+class TestPromptCachingThreading:
+    """The prompt-caching flag rides to the client as a per-call kwarg."""
+
+    def _post_tools(self, client, *, caching: bool):
+        mock_llm = TestToolPassthroughNonStream._mock()
+        with (
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._prompt_caching_enabled", return_value=caching),
+            patch(
+                "pdp_router._proxy._route_request",
+                return_value=TestToolDriverFloorAndPin._route(model="claude-sonnet-4-6"),
+            ),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            resp = client.post(
+                "/openai/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": _TOOLS_PARAM,
+                },
+            )
+        return resp, mock_llm
+
+    def test_flag_off_threads_false(self, client) -> None:
+        resp, mock_llm = self._post_tools(client, caching=False)
+        assert resp.status_code == 200
+        kwargs = mock_llm.complete_with_tools.call_args.kwargs
+        assert kwargs["enable_prompt_caching"] is False
+
+    def test_flag_on_threads_true(self, client) -> None:
+        resp, mock_llm = self._post_tools(client, caching=True)
+        assert resp.status_code == 200
+        kwargs = mock_llm.complete_with_tools.call_args.kwargs
+        assert kwargs["enable_prompt_caching"] is True
+
+
+class TestSpendCap:
+    """Per-conversation spend ceiling behind pipeline.proxy_spend_cap_enabled.
+
+    Warn once at budget_warn_usd (footer note + log), refuse with an
+    OpenAI-shaped 429 insufficient_quota past budget_max_usd -- before any
+    client build or routing row. Flag off is a strict no-op.
+    """
+
+    _TEXT = "what is the capital of france"
+
+    def _seed(self, spend: float):
+        digest = _proxy._tool_pin_digest(self._TEXT)
+        assert _proxy._conversation_cache is not None
+        state = _proxy._conversation_cache.get(digest)
+        state.spend_usd = spend
+        return state
+
+    def _post(self, client, *, cap: bool = True):
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ok")
+        with (
+            patch("pdp_router._proxy._spend_cap_enabled", return_value=cap),
+            patch("pdp_router._proxy._autopanel_enabled", return_value=False),
+            patch(
+                "pdp_router._proxy._classify_request",
+                return_value=(0.55, 3, 0, "general"),
+            ),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm) as mock_gc,
+        ):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "pdp-auto",
+                    "messages": [{"role": "user", "content": self._TEXT}],
+                },
+            )
+        return resp, mock_gc
+
+    def test_over_max_refuses_with_insufficient_quota(self, client, inbox_dir) -> None:
+        self._seed(5.50)
+        resp, mock_gc = self._post(client)
+        assert resp.status_code == 429
+        error = resp.json()["error"]
+        assert error["type"] == "insufficient_quota"
+        assert "$5.50" in error["message"]
+        # Refused BEFORE any dispatch or exposure row.
+        mock_gc.assert_not_called()
+        assert list(inbox_dir.glob("proxy-*.jsonl")) == []
+
+    def test_under_warn_serves_normally(self, client) -> None:
+        self._seed(0.10)
+        resp, _ = self._post(client)
+        assert resp.status_code == 200
+
+    def test_flag_off_never_refuses(self, client) -> None:
+        self._seed(99.0)
+        resp, _ = self._post(client, cap=False)
+        assert resp.status_code == 200
+
+    def test_warn_latch_fires_once(self, client) -> None:
+        state = self._seed(1.50)
+        assert state.budget_warned is False
+        resp, _ = self._post(client)
+        assert resp.status_code == 200
+        assert state.budget_warned is True
+
+    def test_fresh_conversation_is_never_capped(self, client) -> None:
+        # No cache entry at all: peek() must not create one, and the request
+        # must serve.
+        resp, _ = self._post(client)
+        assert resp.status_code == 200
 
 
 # -- Prompt 9: tools-request routing-row observability --
@@ -4118,8 +4579,9 @@ class TestToolRowObservability:
         assert anthropic["provider_path"] == "anthropic-translated"
 
     def test_non_tool_rows_gain_no_new_keys(self, client, inbox_dir) -> None:
-        """The byte-identity wall: a flag-on request WITHOUT tools takes the
-        legacy path and its context keys are exactly the pre-tool set."""
+        """The key-set wall: a flag-on request WITHOUT tools takes the legacy
+        path and its context keys are exactly the base telemetry set -- none
+        of the tool-only keys (tools_present, tool_pin_key, ...) may appear."""
         body = {"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]}
         resp, rows, _ = self._post_tools(
             client, inbox_dir, route=self._route(model="claude-sonnet-4-6"), body=body
@@ -4131,6 +4593,8 @@ class TestToolRowObservability:
             "complexity",
             "panel_score",
             "search_intent",
+            "task_category",
+            "conversation_key",
         }
 
 
@@ -4164,7 +4628,7 @@ class TestToolNonStreamHardening:
             "tools": _TOOLS_PARAM,
         }
         base = self._route()
-        route = (*base[:5], "You are a careful tool runner.", *base[6:])
+        route = (*base[:6], "You are a careful tool runner.", *base[7:])
         resp, mock_llm = self._post(client, body=body, route=route)
         assert resp.status_code == 200
         assert mock_llm.complete_with_tools.call_args.kwargs["system"] == (

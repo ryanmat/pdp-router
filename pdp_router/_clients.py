@@ -21,6 +21,7 @@ from pdp_router._effort import (
 from pdp_router._models import CreditExhaustionError, UpstreamStreamError
 from pdp_router._tools import (
     StreamFinish,
+    StreamUsage,
     ToolCall,
     ToolCallDelta,
     anthropic_stop_reason_to_finish_reason,
@@ -65,6 +66,11 @@ class CompletionResult:
     # exposes it best-effort via candidate grounding_metadata. 0 when web search
     # was off or the model chose not to search. Used for cost visibility.
     web_search_requests: int = 0
+    # Anthropic prompt-cache token counts (zero everywhere else, and zero on
+    # Anthropic when caching is off or the prompt is below the cacheable
+    # minimum). Defaulted so every existing construction site is untouched.
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
     # Tool calls the model asked for, in the order the provider returned them.
     # Empty on every plain completion, which is why the existing construction
     # sites are untouched by this field existing.
@@ -117,8 +123,15 @@ class LLMClient(Protocol):
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
-        """Yield text tokens as they arrive from the backend."""
+        """Yield text tokens as they arrive from the backend.
+
+        usage_out is a caller-owned sink: when provided and the provider
+        reported usage, exactly one StreamUsage is appended after clean
+        exhaustion. The yield type stays str -- providers that cannot report
+        (Ollama) accept and ignore the sink to satisfy this protocol.
+        """
         ...
 
     def stream_complete_multi(
@@ -128,9 +141,54 @@ class LLMClient(Protocol):
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens for multi-turn conversations."""
         ...
+
+
+_CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def _apply_cache_breakpoints(
+    system: str, messages: list[dict]
+) -> tuple[str | list[dict], list[dict]]:
+    """Mark the prompt prefix cacheable with two cache_control breakpoints.
+
+    (1) The system string becomes a single text block with cache_control --
+    tools serialize into the prefix ahead of system, so this one breakpoint
+    also caches the translated tool definitions. (2) The LAST message gets a
+    breakpoint on its final content block: the next agent turn appends after
+    it, so the entire current transcript is the cached prefix that turn reads.
+    Second-to-last would leave the newest content (often the largest -- tool
+    results) unread-from-cache every turn.
+
+    Copy-on-write throughout: the caller's dicts are never mutated. An empty
+    last-message content is skipped (an empty text block is a provider-side
+    400); the system breakpoint alone still caches tools+system. Prompts below
+    the model's cacheable minimum make cache_control a harmless no-op, so no
+    length check here. Two breakpoints, well under the API limit of four.
+    """
+    marked_system: str | list[dict] = system
+    if system:
+        marked_system = [{"type": "text", "text": system, "cache_control": _CACHE_CONTROL}]
+    if not messages:
+        return marked_system, messages
+    last = messages[-1]
+    content = last.get("content")
+    if isinstance(content, str) and content:
+        new_last = dict(last)
+        new_last["content"] = [
+            {"type": "text", "text": content, "cache_control": _CACHE_CONTROL}
+        ]
+    elif isinstance(content, list) and content:
+        blocks = list(content)
+        blocks[-1] = {**blocks[-1], "cache_control": _CACHE_CONTROL}
+        new_last = dict(last)
+        new_last["content"] = blocks
+    else:
+        return marked_system, messages
+    return marked_system, [*messages[:-1], new_last]
 
 
 class AnthropicClient:
@@ -258,6 +316,7 @@ class AnthropicClient:
         max_tokens: int = 1024,
         effort: str | None = None,
         parallel_tool_calls: bool | None = None,
+        enable_prompt_caching: bool = False,
     ) -> CompletionResult:
         """Send a completion that may call tools, translating in both directions.
 
@@ -275,6 +334,9 @@ class AnthropicClient:
             max_tokens: Maximum tokens to generate.
             effort: Reasoning-effort level, applied as on the plain paths.
             parallel_tool_calls: False suppresses parallel tool use.
+            enable_prompt_caching: Mark the prompt prefix cacheable (see
+                _apply_cache_breakpoints). Default False keeps the request
+                shape byte-identical to the pre-caching one.
 
         Raises:
             ToolTranslationError: On a tool payload that cannot be expressed.
@@ -292,9 +354,16 @@ class AnthropicClient:
         if effort and is_anthropic_effort_model(self._model):
             extra_kwargs["output_config"] = anthropic_output_config(effort)
 
+        request_system: str | list[dict] = system
+        anthropic_messages = openai_messages_to_anthropic(messages)
+        if enable_prompt_caching:
+            request_system, anthropic_messages = _apply_cache_breakpoints(
+                system, anthropic_messages
+            )
+
         message = self._make_api_call(
-            system=system,
-            messages=openai_messages_to_anthropic(messages),
+            system=request_system,
+            messages=anthropic_messages,
             max_tokens=max_tokens,
             **extra_kwargs,
         )
@@ -358,9 +427,19 @@ class AnthropicClient:
         raw_searches = getattr(server_tool_use, "web_search_requests", 0)
         web_search_requests = raw_searches if isinstance(raw_searches, int) else 0
 
+        # Cache counts are separate from input_tokens on the wire (input
+        # excludes them), so pricing needs all four. The isinstance coercion
+        # (the web_search_requests idiom above) also covers None and absent
+        # fields on older SDK objects.
+        raw_cache_read = getattr(message.usage, "cache_read_input_tokens", 0)
+        cache_read = raw_cache_read if isinstance(raw_cache_read, int) else 0
+        raw_cache_creation = getattr(message.usage, "cache_creation_input_tokens", 0)
+        cache_creation = raw_cache_creation if isinstance(raw_cache_creation, int) else 0
         token_usage = {
             "input_tokens": message.usage.input_tokens,
             "output_tokens": message.usage.output_tokens,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
         }
         cost = estimate_cost(self._model, token_usage)
 
@@ -368,6 +447,9 @@ class AnthropicClient:
         span.set_attribute("gen_ai.usage.input_tokens", token_usage["input_tokens"])
         span.set_attribute("gen_ai.usage.output_tokens", token_usage["output_tokens"])
         span.set_attribute("pdp_router.estimated_cost_usd", cost)
+        if cache_read or cache_creation:
+            span.set_attribute("pdp_router.cache_read_input_tokens", cache_read)
+            span.set_attribute("pdp_router.cache_creation_input_tokens", cache_creation)
         if web_search_requests:
             span.set_attribute("pdp_router.web_search_requests", web_search_requests)
 
@@ -378,6 +460,8 @@ class AnthropicClient:
             model=self._model,
             estimated_cost_usd=cost,
             web_search_requests=web_search_requests,
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_creation,
         )
 
     async def stream_complete(
@@ -387,6 +471,7 @@ class AnthropicClient:
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens as they arrive from the Anthropic backend."""
         async for token in self._stream(
@@ -395,6 +480,7 @@ class AnthropicClient:
             max_tokens=max_tokens,
             enable_web_search=enable_web_search,
             effort=effort,
+            usage_out=usage_out,
         ):
             yield token
 
@@ -405,6 +491,7 @@ class AnthropicClient:
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens for a multi-turn conversation."""
         async for token in self._stream(
@@ -413,6 +500,7 @@ class AnthropicClient:
             max_tokens=max_tokens,
             enable_web_search=enable_web_search,
             effort=effort,
+            usage_out=usage_out,
         ):
             yield token
 
@@ -424,6 +512,7 @@ class AnthropicClient:
         max_tokens: int,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         """Iterate the async messages stream, yielding content_block_delta text.
 
@@ -431,6 +520,12 @@ class AnthropicClient:
         web_search_tool_result blocks (and a pause while the search runs); the
         text_delta filter below skips them and yields only answer text. With
         effort set, output_config.effort rides on the stream request.
+
+        usage_out is a caller-owned sink (the _faithful_stream_tail outcome
+        idiom): when provided and the provider reported usage, exactly one
+        StreamUsage is appended after clean exhaustion. Nothing is appended on
+        error or when unreported, and the yield type stays str -- the plain
+        wire contract and every token-concatenating consumer are untouched.
         """
         client = self._get_async_client()
         stream_kwargs: dict = {}
@@ -438,6 +533,11 @@ class AnthropicClient:
             stream_kwargs["tools"] = [_anthropic_web_search_tool()]
         if effort and is_anthropic_effort_model(self._model):
             stream_kwargs["output_config"] = anthropic_output_config(effort)
+        usage_seen = False
+        usage_input = 0
+        usage_output = 0
+        usage_cache_read = 0
+        usage_cache_creation = 0
         try:
             async with client.messages.stream(
                 model=self._model,
@@ -447,13 +547,41 @@ class AnthropicClient:
                 **stream_kwargs,
             ) as stream:
                 async for event in stream:
+                    event_type = getattr(event, "type", None)
                     if (
-                        getattr(event, "type", None) == "content_block_delta"
+                        event_type == "content_block_delta"
                         and getattr(event.delta, "type", None) == "text_delta"
                     ):
                         text = getattr(event.delta, "text", "")
                         if text:
                             yield text
+                    elif event_type == "message_start" and usage_out is not None:
+                        start_usage = getattr(getattr(event, "message", None), "usage", None)
+                        if start_usage is not None:
+                            usage_seen = True
+                            usage_input = getattr(start_usage, "input_tokens", 0) or 0
+                            usage_cache_read = (
+                                getattr(start_usage, "cache_read_input_tokens", 0) or 0
+                            )
+                            usage_cache_creation = (
+                                getattr(start_usage, "cache_creation_input_tokens", 0) or 0
+                            )
+                    elif event_type == "message_delta" and usage_out is not None:
+                        delta_usage = getattr(event, "usage", None)
+                        if delta_usage is not None:
+                            reported_output = getattr(delta_usage, "output_tokens", None)
+                            if reported_output is not None:
+                                usage_seen = True
+                                usage_output = reported_output
+            if usage_out is not None and usage_seen:
+                usage_out.append(
+                    StreamUsage(
+                        input_tokens=usage_input,
+                        output_tokens=usage_output,
+                        cache_read_input_tokens=usage_cache_read,
+                        cache_creation_input_tokens=usage_cache_creation,
+                    )
+                )
         except anthropic.APIStatusError as e:
             error_msg = str(e).lower()
             if e.status_code == 402 or any(
@@ -475,6 +603,7 @@ class AnthropicClient:
         max_tokens: int = 1024,
         effort: str | None = None,
         parallel_tool_calls: bool | None = None,
+        enable_prompt_caching: bool = False,
     ) -> AsyncIterator[str | ToolCallDelta | StreamFinish]:
         """Stream a completion that may call tools, translating the request.
 
@@ -482,6 +611,9 @@ class AnthropicClient:
         streaming on both surfaces, so both its request body and its
         AsyncIterator[str] contract have to stay exactly as they are. Web search
         is never attached, for the reason complete_with_tools gives.
+        enable_prompt_caching marks the prompt prefix cacheable exactly as the
+        non-stream sibling does; default False keeps the request shape
+        byte-identical.
 
         Yields text as str, tool-call fragments as ToolCallDelta, and one
         StreamFinish when the turn ends.
@@ -501,6 +633,13 @@ class AnthropicClient:
         if effort and is_anthropic_effort_model(self._model):
             stream_kwargs["output_config"] = anthropic_output_config(effort)
 
+        request_system: str | list[dict] = system
+        request_messages = openai_messages_to_anthropic(messages)
+        if enable_prompt_caching:
+            request_system, request_messages = _apply_cache_breakpoints(
+                system, request_messages
+            )
+
         client = self._get_async_client()
         # Anthropic indexes stream events by CONTENT block; OpenAI indexes tool
         # call fragments by their ordinal among tool calls alone. A leading text
@@ -512,11 +651,20 @@ class AnthropicClient:
         # and "" is not parseable JSON, so those calls are repaired at the end of
         # the turn to match what the non-stream sibling already emits.
         empty_argument_calls: set[int] = set()
+        # Final usage for the turn: message_start carries input + cache token
+        # counts, message_delta carries the CUMULATIVE output count (the last
+        # value seen wins, never summed). usage_seen keeps "not reported"
+        # tellable from "reported zero" on the StreamFinish.
+        usage_seen = False
+        usage_input = 0
+        usage_output = 0
+        usage_cache_read = 0
+        usage_cache_creation = 0
         try:
             async with client.messages.stream(
                 model=self._model,
-                system=system,
-                messages=openai_messages_to_anthropic(messages),  # type: ignore[arg-type]
+                system=request_system,  # type: ignore[arg-type]
+                messages=request_messages,  # type: ignore[arg-type]
                 max_tokens=max_tokens,
                 **stream_kwargs,
             ) as stream:
@@ -526,7 +674,18 @@ class AnthropicClient:
                     # payload (text, input_json), so matching on the presence of an
                     # attribute instead would yield every fragment twice.
                     event_type = getattr(event, "type", None)
-                    if event_type == "content_block_start":
+                    if event_type == "message_start":
+                        start_usage = getattr(getattr(event, "message", None), "usage", None)
+                        if start_usage is not None:
+                            usage_seen = True
+                            usage_input = getattr(start_usage, "input_tokens", 0) or 0
+                            usage_cache_read = (
+                                getattr(start_usage, "cache_read_input_tokens", 0) or 0
+                            )
+                            usage_cache_creation = (
+                                getattr(start_usage, "cache_creation_input_tokens", 0) or 0
+                            )
+                    elif event_type == "content_block_start":
                         block = getattr(event, "content_block", None)
                         if getattr(block, "type", None) == "tool_use":
                             ordinal = len(tool_ordinals)
@@ -554,12 +713,30 @@ class AnthropicClient:
                                     empty_argument_calls.discard(ordinal)
                                 yield ToolCallDelta(index=ordinal, arguments=fragment)
                     elif event_type == "message_delta":
+                        # Usage rides on the raw event, not event.delta, and is
+                        # cumulative: keep the last value seen.
+                        delta_usage = getattr(event, "usage", None)
+                        if delta_usage is not None:
+                            reported_output = getattr(delta_usage, "output_tokens", None)
+                            if reported_output is not None:
+                                usage_seen = True
+                                usage_output = reported_output
                         stop_reason = getattr(event.delta, "stop_reason", None)
                         if stop_reason is not None:
                             for ordinal in sorted(empty_argument_calls):
                                 yield ToolCallDelta(index=ordinal, arguments="{}")
                             empty_argument_calls.clear()
-                            yield StreamFinish(anthropic_stop_reason_to_finish_reason(stop_reason))
+                            yield StreamFinish(
+                                anthropic_stop_reason_to_finish_reason(stop_reason),
+                                usage=StreamUsage(
+                                    input_tokens=usage_input,
+                                    output_tokens=usage_output,
+                                    cache_read_input_tokens=usage_cache_read,
+                                    cache_creation_input_tokens=usage_cache_creation,
+                                )
+                                if usage_seen
+                                else None,
+                            )
         except anthropic.APIStatusError as e:
             error_msg = str(e).lower()
             if e.status_code == 402 or any(
@@ -757,6 +934,7 @@ class GeminiClient:
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens as they arrive from the Gemini backend.
 
@@ -767,6 +945,7 @@ class GeminiClient:
             system=system,
             max_tokens=max_tokens,
             enable_web_search=enable_web_search,
+            usage_out=usage_out,
         ):
             yield token
 
@@ -777,6 +956,7 @@ class GeminiClient:
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens for a multi-turn Gemini conversation.
 
@@ -794,6 +974,7 @@ class GeminiClient:
             system=system,
             max_tokens=max_tokens,
             enable_web_search=enable_web_search,
+            usage_out=usage_out,
         ):
             yield token
 
@@ -804,10 +985,17 @@ class GeminiClient:
         system: str,
         max_tokens: int,
         enable_web_search: bool = False,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
-        """Iterate the Gemini async stream, yielding chunk.text when present."""
+        """Iterate the Gemini async stream, yielding chunk.text when present.
+
+        usage_out (the caller-owned sink; see the Anthropic _stream docstring)
+        captures the LAST non-None usage_metadata: Gemini repeats cumulative
+        metadata across chunks, so the final one carries the turn's totals.
+        """
         from google.genai import types
 
+        last_usage = None
         try:
             stream = await self._client.aio.models.generate_content_stream(
                 model=self._model,
@@ -819,9 +1007,20 @@ class GeminiClient:
                 ),
             )
             async for chunk in stream:
+                if usage_out is not None:
+                    metadata = getattr(chunk, "usage_metadata", None)
+                    if metadata is not None:
+                        last_usage = metadata
                 text = getattr(chunk, "text", None)
                 if text:
                     yield text
+            if usage_out is not None and last_usage is not None:
+                usage_out.append(
+                    StreamUsage(
+                        input_tokens=getattr(last_usage, "prompt_token_count", 0) or 0,
+                        output_tokens=getattr(last_usage, "candidates_token_count", 0) or 0,
+                    )
+                )
         except Exception as e:
             error_msg = str(e).lower()
             if any(kw in error_msg for kw in ("quota", "billing", "resource_exhausted", "429")):
@@ -942,12 +1141,16 @@ class OpenAICompatibleClient:
         max_tokens: int = 1024,
         effort: str | None = None,
         parallel_tool_calls: bool | None = None,
+        enable_prompt_caching: bool = False,
     ) -> CompletionResult:
         """Send a completion that may call tools, passing the payload through.
 
         These endpoints already speak OpenAI, so nothing is translated in either
         direction: the tool definitions ride verbatim and the ids and argument
-        strings come back untouched.
+        strings come back untouched. enable_prompt_caching is accepted for
+        protocol parity and ignored -- cache_control is Anthropic-shaped, and
+        OpenRouter's own passthrough is out of scope here; it is never
+        forwarded into the body.
 
         Raises:
             CreditExhaustionError: On HTTP 402 or billing-related errors.
@@ -1047,6 +1250,7 @@ class OpenAICompatibleClient:
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens as they arrive from the endpoint (enable_web_search ignored)."""
         async for token in self._stream(
@@ -1056,6 +1260,7 @@ class OpenAICompatibleClient:
             ],
             max_tokens=max_tokens,
             effort=effort,
+            usage_out=usage_out,
         ):
             yield token
 
@@ -1066,11 +1271,12 @@ class OpenAICompatibleClient:
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         """Yield text tokens for a multi-turn conversation (enable_web_search ignored)."""
         full_messages = [{"role": "system", "content": system}, *messages]
         async for token in self._stream(
-            messages=full_messages, max_tokens=max_tokens, effort=effort
+            messages=full_messages, max_tokens=max_tokens, effort=effort, usage_out=usage_out
         ):
             yield token
 
@@ -1079,8 +1285,14 @@ class OpenAICompatibleClient:
         messages: list[dict[str, str]],
         max_tokens: int,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
-        """Open an SSE stream against the endpoint, yield delta content."""
+        """Open an SSE stream against the endpoint, yield delta content.
+
+        stream_options rides on the body ONLY when usage_out is provided, so
+        every caller that has not opted in keeps a byte-identical request
+        body (this path serves live plain streaming on both surfaces).
+        """
         client = self._get_async_client()
         body: dict = {
             "model": self._model,
@@ -1088,8 +1300,11 @@ class OpenAICompatibleClient:
             "max_tokens": max_tokens,
             "stream": True,
         }
+        if usage_out is not None:
+            body["stream_options"] = {"include_usage": True}
         if effort and self._supports_reasoning_effort:
             body.update(openrouter_reasoning_body(effort))
+        last_usage: dict | None = None
         async with client.stream(  # type: ignore[attr-defined]
             "POST",
             self._chat_url,
@@ -1129,6 +1344,13 @@ class OpenAICompatibleClient:
                 # an error frame carries no choices, so `continue` dropped it and
                 # the stream ended looking like a clean finish.
                 _raise_on_error_frame(chunk, self._label)
+                # Also ahead of the choices check: the usage-only chunk
+                # carries no choices at all. Last value wins; appended once
+                # after clean exhaustion below.
+                if usage_out is not None:
+                    usage = chunk.get("usage")
+                    if usage:
+                        last_usage = usage
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
@@ -1136,6 +1358,13 @@ class OpenAICompatibleClient:
                 content = delta.get("content")
                 if content:
                     yield content
+            if usage_out is not None and last_usage is not None:
+                usage_out.append(
+                    StreamUsage(
+                        input_tokens=last_usage.get("prompt_tokens", 0) or 0,
+                        output_tokens=last_usage.get("completion_tokens", 0) or 0,
+                    )
+                )
 
     async def stream_with_tools(
         self,
@@ -1146,6 +1375,7 @@ class OpenAICompatibleClient:
         max_tokens: int = 1024,
         effort: str | None = None,
         parallel_tool_calls: bool | None = None,
+        enable_prompt_caching: bool = False,
     ) -> AsyncIterator[str | ToolCallDelta | StreamFinish]:
         """Stream a completion that may call tools, passing the payload through.
 
@@ -1153,6 +1383,8 @@ class OpenAICompatibleClient:
         Anthropic client gives: _stream serves plain streaming on both surfaces
         and its body and yield type have to stay as they are. The duplicated
         prologue is the price of leaving that live path untouched.
+        enable_prompt_caching is accepted for protocol parity and ignored,
+        never forwarded into the body (complete_with_tools gives the reason).
 
         Yields text as str, tool-call fragments as ToolCallDelta, and one
         StreamFinish when the turn ends.
@@ -1167,6 +1399,10 @@ class OpenAICompatibleClient:
             "max_tokens": max_tokens,
             "stream": True,
             "tools": tools,
+            # Ask for the final usage chunk. OpenRouter sends it AFTER the
+            # finish-bearing chunk; upstream arms that ignore the option just
+            # never send one, which degrades to StreamFinish(usage=None).
+            "stream_options": {"include_usage": True},
         }
         if tool_choice is not None:
             body["tool_choice"] = tool_choice
@@ -1197,6 +1433,16 @@ class OpenAICompatibleClient:
                 )
             response.raise_for_status()
 
+            # The finish is DEFERRED to end-of-stream rather than yielded on the
+            # finish-bearing chunk: OpenRouter sends the usage-only chunk after
+            # it, and the usage has to ride on the StreamFinish. Consequence: an
+            # error frame arriving between finish chunk and [DONE] now raises
+            # before any StreamFinish is yielded -- same client-visible outcome
+            # as an earlier error (error frame, no finish chunk).
+            pending_finish: str | None = None
+            usage_seen = False
+            usage_input = 0
+            usage_output = 0
             async for raw_line in response.aiter_lines():
                 line = raw_line.strip()
                 if not line or not line.startswith("data:"):
@@ -1209,6 +1455,13 @@ class OpenAICompatibleClient:
                 except json.JSONDecodeError:
                     continue
                 _raise_on_error_frame(chunk, self._label)
+                # Above the empty-choices guard: the usage-only chunk carries
+                # no choices at all.
+                usage = chunk.get("usage")
+                if usage:
+                    usage_seen = True
+                    usage_input = usage.get("prompt_tokens", 0) or 0
+                    usage_output = usage.get("completion_tokens", 0) or 0
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
@@ -1229,11 +1482,17 @@ class OpenAICompatibleClient:
                     )
                 finish_reason = choice.get("finish_reason")
                 if finish_reason:
-                    # After this chunk's own content, because some arms attach the
-                    # finish reason to the last content-bearing chunk instead of
-                    # sending it alone. Not a break either: a usage-only chunk can
-                    # follow it, and [DONE] is what ends the stream.
-                    yield StreamFinish(finish_reason)
+                    pending_finish = finish_reason
+            if pending_finish is not None:
+                yield StreamFinish(
+                    pending_finish,
+                    usage=StreamUsage(
+                        input_tokens=usage_input,
+                        output_tokens=usage_output,
+                    )
+                    if usage_seen
+                    else None,
+                )
 
 
 class DeepSeekClient(OpenAICompatibleClient):
@@ -1296,6 +1555,7 @@ class OllamaClient:
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         raise RuntimeError("Streaming not implemented for Ollama")
         # pragma: no cover -- unreachable, satisfies AsyncIterator typing.
@@ -1309,6 +1569,7 @@ class OllamaClient:
         max_tokens: int = 1024,
         enable_web_search: bool = False,
         effort: str | None = None,
+        usage_out: list[StreamUsage] | None = None,
     ) -> AsyncIterator[str]:
         raise RuntimeError("Streaming not implemented for Ollama")
         # pragma: no cover -- unreachable, satisfies AsyncIterator typing.
