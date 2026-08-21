@@ -1143,6 +1143,17 @@ def _record_conversation_spend(
 @asynccontextmanager
 async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
     global _config, _trust_cache, _bandit_cache, _conversation_cache
+    # Uvicorn configures its own loggers but never the root logger, so without
+    # this every INFO line this module emits (routing decisions, sticky-driver
+    # moves, conversation spend, the budget warning) dies in Python's lastResort
+    # handler, which passes WARNING and above only. Guarded on "root has no
+    # handlers" so a host application or the test runner that already
+    # configured logging is never overridden.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s:%(name)s:%(message)s",
+        )
     init_tracing()
     _config = ProxyConfig()
     _trust_cache = TrustCache(str(_config.trust_db_path), _config.trust_cache_ttl)

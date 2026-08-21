@@ -33,3 +33,25 @@ def _isolate_on_disk_state(tmp_path_factory):
         },
     ):
         yield base
+
+
+@pytest.fixture(autouse=True)
+def _pin_flags_to_defaults(monkeypatch):
+    """Detach every flag read from the host's live flag store for the suite.
+
+    _flag_enabled prefers the flag library whenever it is importable, and on a
+    deployed host the live store has features switched ON. Without this pin, a
+    test that exercises one feature can be silently affected by an unrelated
+    live flag (a feedback row shifting a row-index assertion was the incident
+    that added this). Setting the module handle to None routes every read to
+    the env fallback, and the suite's env carries no PROXY_*_ENABLED values,
+    so all flags sit at their coded defaults. Tests that want a flag on keep
+    patching the reader function; tests of the flag plumbing itself re-patch
+    the handle and still win.
+    """
+    from pdp_router import _proxy
+
+    monkeypatch.setattr(_proxy, "_clawflag", None)
+    for var in list(os.environ):
+        if var.startswith("PROXY_") and var.endswith("_ENABLED"):
+            monkeypatch.delenv(var)

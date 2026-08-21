@@ -4037,7 +4037,9 @@ class TestStickyDriver:
         self._post_auto(client, route=self._route())
         resp, _ = self._post_auto(client, route=self._route(model="claude-sonnet-4-6"))
         assert resp.status_code == 200
-        rows = _read_inbox_rows(inbox_dir)
+        # Filter to the exposure rows: a deliberately-enabled feedback flag
+        # would interleave its own rows and shift bare indices.
+        rows = [r for r in _read_inbox_rows(inbox_dir) if r["routing_mode"] == "cascade"]
         first, second = json.loads(rows[0]["context_json"]), json.loads(rows[1]["context_json"])
         assert "tool_sticky" not in first
         assert second["tool_sticky"] is True
