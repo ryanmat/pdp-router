@@ -14,10 +14,11 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError, model_validator
@@ -27,6 +28,16 @@ from pdp_router._conversation import ConversationCache
 from pdp_router._cost import estimate_cost
 from pdp_router._effort import level_for_score, supports_effort
 from pdp_router._lineage import classify_lineage
+from pdp_router._memory import (
+    MemoryItem,
+    MemoryModels,
+    MemoryRuntime,
+    append_shadow_jsonl,
+    assemble_block,
+    encode_embedding,
+    find_duplicate,
+    retrieve,
+)
 from pdp_router._models import (
     GEMINI_FLASH,
     GEMINI_PRO,
@@ -274,6 +285,35 @@ def _sticky_driver_enabled() -> bool:
     return _flag_enabled(
         "pipeline.proxy_sticky_driver_enabled",
         "PROXY_STICKY_DRIVER_ENABLED",
+        default=False,
+    )
+
+
+def _memory_enabled() -> bool:
+    """Return True if pipeline.proxy_memory_enabled is on (default False).
+
+    Master switch for the persistent user-memory sidecar: opens memory.db,
+    serves the /v1/memory routes, and starts the embedding-model load. Default
+    OFF and fail-closed: with the flag library absent and no env override the
+    helper reads False, so a flag-off proxy never opens the store or imports
+    the embedding stack. Retrieval and injection carry their own flags; this
+    one alone changes no chat request.
+    """
+    return _flag_enabled("pipeline.proxy_memory_enabled", "PROXY_MEMORY_ENABLED", default=False)
+
+
+def _memory_shadow_enabled() -> bool:
+    """Return True if pipeline.proxy_memory_shadow_enabled is on (default False).
+
+    Shadow mode: retrieve on a conversation's first turn, pin the block, and
+    append what WOULD have been injected to the local shadow log. Nothing is
+    injected, so the provider payload is byte-identical to a flags-off run;
+    the log is the accrual source for the injection eval gate. Consulted only
+    when the master flag is also on. Default OFF, fail-closed.
+    """
+    return _flag_enabled(
+        "pipeline.proxy_memory_shadow_enabled",
+        "PROXY_MEMORY_SHADOW_ENABLED",
         default=False,
     )
 
@@ -1114,6 +1154,12 @@ _config: ProxyConfig | None = None
 _trust_cache: TrustCache | None = None
 _bandit_cache: BanditCache | None = None
 _conversation_cache: ConversationCache | None = None
+# The memory sidecar. Built in _lifespan when the master flag is on, or by the
+# first flagged request after a hot flip; None whenever the flag is off.
+_memory_runtime: MemoryRuntime | None = None
+# Causes already logged with a traceback, so a broken store or model dir
+# writes one warning per distinct failure rather than one per request.
+_memory_failures_logged: set[str] = set()
 
 
 def _record_conversation_spend(
@@ -1142,7 +1188,7 @@ def _record_conversation_spend(
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
-    global _config, _trust_cache, _bandit_cache, _conversation_cache
+    global _config, _trust_cache, _bandit_cache, _conversation_cache, _memory_runtime
     # Uvicorn configures its own loggers but never the root logger, so without
     # this every INFO line this module emits (routing decisions, sticky-driver
     # moves, conversation spend, the budget warning) dies in Python's lastResort
@@ -1162,6 +1208,8 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
         max_entries=_config.conversation_cache_max,
         ttl_s=_config.conversation_cache_ttl_s,
     )
+    _memory_failures_logged.clear()
+    _memory_runtime = _build_memory_runtime(_config) if _memory_enabled() else None
 
     if not _config.anthropic_api_key and not _config.gemini_api_key:
         log.warning("No API keys configured. Set ANTHROPIC_API_KEY or GEMINI_API_KEY.")
@@ -1313,6 +1361,19 @@ def _trust_db_status(config: ProxyConfig) -> dict[str, Any]:
     return {"path": str(path), "present": present, "readable": readable}
 
 
+def _memory_status(config: ProxyConfig) -> dict[str, Any]:
+    """Memory sidecar state for /health. Read-only: with the flag off nothing
+    is opened, so a disabled proxy reports absence without creating the file.
+    load_error is the operator's diagnostic when models_loaded stays false."""
+    runtime = _memory_runtime
+    return {
+        "enabled": _memory_enabled(),
+        "db_present": config.memory_db_path.exists(),
+        "models_loaded": runtime is not None and runtime.models_ready,
+        "load_error": runtime.load_error if runtime is not None else None,
+    }
+
+
 @app.get("/health")
 async def health() -> dict:
     config = _config if _config is not None else ProxyConfig()
@@ -1323,6 +1384,7 @@ async def health() -> dict:
         "providers": _configured_providers(config),
         "trust_db": _trust_db_status(config),
         "routing_mode": config.routing_mode,
+        "memory": _memory_status(config),
     }
 
 
@@ -2464,6 +2526,19 @@ async def _handle_chat(
                 fb_state.last_model = model_name
                 fb_state.turn_count += 1
 
+        # Memory shadow (flag-gated, default off): resolve and record this
+        # conversation's block, injecting nothing. After the feedback digest is
+        # taken and the spend cap has had its say, before any fork, so a capped
+        # conversation never pays retrieval and no path below sees a changed
+        # message list.
+        if _memory_enabled() and _memory_shadow_enabled():
+            await _memory_shadow_turn(
+                non_system,
+                conversation_key,
+                surface="openai_v1" if openai_faithful else "v1",
+                chat_request_id=chat_request_id,
+            )
+
         # Auto-model parse shared by the effort, panel, and tool gates below;
         # auto_mode also rides the routing rows when it is not balanced.
         is_auto, auto_mode = _parse_auto_model(request.model or "")
@@ -2858,6 +2933,362 @@ async def chat_completions_openai(
     streaming and rejects the route_info first event as "unexpected EOF"; this surface
     is what it accepts. See claude-code-concerns.md #44."""
     return await _handle_chat(request, response, openai_faithful=True)
+
+
+# -- Memory sidecar: runtime access and the explicit /v1/memory routes --
+
+
+def _log_memory_failure_once(context: str, exc: BaseException) -> None:
+    """Warn with a traceback the first time a (context, cause) pair fails.
+
+    Memory never fails a request: a broken store or model dir turns the
+    feature off for that call, and this is the one place that says so, once,
+    rather than on every request until someone notices the journal.
+    """
+    cause = f"{context}: {type(exc).__name__}: {exc}"
+    if cause in _memory_failures_logged:
+        return
+    _memory_failures_logged.add(cause)
+    log.warning("Memory unavailable (%s); serving without it: %s", context, cause, exc_info=True)
+
+
+def _build_memory_runtime(config: ProxyConfig) -> MemoryRuntime:
+    """Create the runtime, open the store so the file exists (and an unusable
+    path is logged at once), and start the background model load. Never
+    raises: a failed store open is logged once and the routes answer 503."""
+    runtime = MemoryRuntime(config)
+    try:
+        _ = runtime.store  # open and migrate now, not on the first request
+    except (sqlite3.Error, OSError) as exc:
+        _log_memory_failure_once("startup", exc)
+    runtime.start_model_load()
+    log.info("Memory enabled: db=%s models=%s", config.memory_db_path, config.memory_model_dir)
+    return runtime
+
+
+def _get_memory_runtime() -> MemoryRuntime | None:
+    """The runtime when the master flag is on, else None.
+
+    Built lazily so a flag flipped on after startup needs no restart; the
+    (idempotent, cheap) start_model_load on every call is what lets a model
+    dir filled after the first failed load get picked up.
+    """
+    global _memory_runtime
+    if not _memory_enabled() or _config is None:
+        return None
+    if _memory_runtime is None:
+        _memory_runtime = _build_memory_runtime(_config)
+    else:
+        _memory_runtime.start_model_load()
+    return _memory_runtime
+
+
+def _require_memory_runtime() -> MemoryRuntime:
+    runtime = _get_memory_runtime()
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="memory is disabled")
+    return runtime
+
+
+def _require_memory_models(runtime: MemoryRuntime) -> MemoryModels:
+    models = runtime.models
+    if models is None:
+        raise HTTPException(status_code=503, detail="memory models are not loaded")
+    return models
+
+
+async def _memory_shadow_turn(
+    non_system: list[ChatMessage],
+    conversation_key: str,
+    *,
+    surface: str,
+    chat_request_id: str,
+) -> None:
+    """Resolve this conversation's memory block once and record it; inject nothing.
+
+    First turn (no pin): retrieve in a worker thread, assemble the block,
+    persist the pin under the FULL digest, mirror it on the conversation
+    state, append the shadow line, write the retrieve event. Later turns hit
+    the mirror, or the pin after a restart or eviction, and do no model work.
+    Models not yet loaded: nothing is pinned, so a later turn retries once
+    they are. Any failure is logged once per cause and the request proceeds
+    exactly as before -- memory never fails a request.
+    """
+    try:
+        runtime = _get_memory_runtime()
+        if runtime is None:
+            return
+        state = (
+            _conversation_cache.get(conversation_key) if _conversation_cache is not None else None
+        )
+        if state is not None and state.memory_block is not None:
+            return
+        store = runtime.store
+        pin = store.get_pin(conversation_key)
+        if pin is not None:
+            if state is not None:
+                state.memory_block = pin.block
+            return
+        models = runtime.models
+        if models is None:
+            log.info(
+                "Memory shadow: models not loaded yet, serving without memory (key=%s)",
+                conversation_key[:8],
+            )
+            return
+        config = runtime.config
+        result = await asyncio.to_thread(
+            retrieve,
+            store,
+            models,
+            _first_user_text(non_system),
+            min_ce_score=config.memory_min_ce_score,
+        )
+        block = assemble_block(
+            result, today=datetime.now(UTC).date(), max_chars=config.memory_block_max_chars
+        )
+        store.set_pin(conversation_key, block, result.item_ids, ttl_s=config.memory_pin_ttl_s)
+        if state is not None:
+            state.memory_block = block
+        append_shadow_jsonl(
+            config.memory_shadow_dir,
+            conversation_key8=conversation_key[:8],
+            surface=surface,
+            query=result.query,
+            block=block,
+            item_ids=result.item_ids,
+        )
+        # Shadow is not exposure: no model saw the block, so `uses` stays put.
+        store.add_event(
+            "retrieve",
+            {
+                "origin": "shadow",
+                "surface": surface,
+                "chat_request_id": chat_request_id,
+                "n": len(result.item_ids),
+                "item_ids": result.item_ids,
+                "block_chars": len(block),
+            },
+        )
+        log.info(
+            "Memory retrieve: n=%d chars=%d key=%s",
+            len(result.item_ids),
+            len(block),
+            conversation_key[:8],
+        )
+    except Exception as exc:
+        _log_memory_failure_once("shadow retrieval", exc)
+
+
+class MemoryWriteRequest(BaseModel):
+    text: str
+    kind: Literal["fact", "ask"] = "fact"
+    observed_at: str | None = None
+    surface: str | None = None
+    force: bool = False
+
+
+def _memory_item_json(
+    item: MemoryItem, *, cosine: float | None = None, ce_score: float | None = None
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"object": "memory.item", **asdict(item)}
+    if cosine is not None:
+        payload["cosine"] = cosine
+        payload["ce_score"] = ce_score
+    return payload
+
+
+def _record_memory_endpoint(
+    runtime: MemoryRuntime, route: str, method: str, status: int, item_id: str | None
+) -> None:
+    try:
+        runtime.store.add_event(
+            "endpoint",
+            {"route": route, "method": method, "status": status, "item_id": item_id},
+        )
+    except (sqlite3.Error, OSError) as exc:
+        _log_memory_failure_once(f"{method} {route} event", exc)
+
+
+async def _memory_endpoint(
+    runtime: MemoryRuntime,
+    *,
+    route: str,
+    method: str,
+    fn: Any,
+    item_id: str | None = None,
+) -> dict[str, Any]:
+    """Run a route body in a worker thread (SQLite and ONNX never block the
+    event loop), map its failures into the OpenAI error envelope, and record
+    the endpoint event. A store failure is a 503 logged once per cause; a
+    bad value is a 422; nothing here can 500."""
+    try:
+        payload = await asyncio.to_thread(fn)
+    except HTTPException as exc:
+        _record_memory_endpoint(runtime, route, method, exc.status_code, item_id)
+        raise
+    except ValueError as exc:
+        _record_memory_endpoint(runtime, route, method, 422, item_id)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (sqlite3.Error, OSError) as exc:
+        _log_memory_failure_once(f"{method} {route}", exc)
+        raise HTTPException(status_code=503, detail="memory store unavailable") from exc
+    _record_memory_endpoint(runtime, route, method, 200, item_id or payload.get("id"))
+    return payload
+
+
+def _memory_write_sync(runtime: MemoryRuntime, body: MemoryWriteRequest) -> dict[str, Any]:
+    models = _require_memory_models(runtime)
+    text = body.text.strip()
+    if not text:
+        raise ValueError("memory item text is empty")
+    vec = models.embedder.embed([text])[0]
+    if not body.force:
+        duplicate = find_duplicate(
+            runtime.store, models, body.kind, vec, threshold=runtime.config.memory_dedup_sim
+        )
+        if duplicate is not None:
+            raise HTTPException(
+                status_code=409, detail=f"duplicate of {duplicate.id}: {duplicate.text}"
+            )
+    surface = body.surface or "api"
+    item = runtime.store.add_item(
+        kind=body.kind,
+        text=text,
+        embedding=encode_embedding(vec),
+        embedding_model=models.embedder.model_name,
+        observed_at=body.observed_at or datetime.now(UTC).date().isoformat(),
+        source=f"explicit:{surface}",
+        surface=surface,
+        # Explicit facts start above the extraction default: the user said so.
+        score=0.6,
+    )
+    return _memory_item_json(item)
+
+
+def _memory_search_sync(runtime: MemoryRuntime, q: str | None, limit: int) -> dict[str, Any]:
+    store = runtime.store
+    if not q or not q.strip():
+        items = store.list_active(limit=limit)
+        return {"object": "list", "data": [_memory_item_json(i) for i in items]}
+    models = _require_memory_models(runtime)
+    result = retrieve(
+        store,
+        models,
+        q,
+        min_ce_score=runtime.config.memory_min_ce_score,
+        top_facts=limit,
+        top_asks=limit,
+    )
+    ranked = sorted(result.facts + result.asks, key=lambda r: (-r.ce_score, -r.cosine))[:limit]
+    # Search is not exposure: it records what surfaced and moves no `uses`.
+    store.add_event(
+        "retrieve",
+        {
+            "origin": "endpoint",
+            "query_chars": len(result.query),
+            "n": len(ranked),
+            "item_ids": [r.item.id for r in ranked],
+        },
+    )
+    return {
+        "object": "list",
+        "data": [_memory_item_json(r.item, cosine=r.cosine, ce_score=r.ce_score) for r in ranked],
+    }
+
+
+def _memory_get_sync(runtime: MemoryRuntime, item_id: str) -> dict[str, Any]:
+    item = runtime.store.get_item(item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="memory item not found")
+    return _memory_item_json(item)
+
+
+def _memory_forget_sync(runtime: MemoryRuntime, item_id: str) -> dict[str, Any]:
+    store = runtime.store
+    item = store.get_item(item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="memory item not found")
+    if item.archived_at is None:
+        # Archive first so a failed outcome write leaves a forgotten item
+        # forgotten; the second call finds it archived and changes nothing.
+        store.archive_item(item_id, "forgotten")
+        item = store.add_outcome(item_id=item_id, signal="forgotten", origin="explicit")
+    return _memory_item_json(item)
+
+
+def _memory_confirm_sync(runtime: MemoryRuntime, item_id: str) -> dict[str, Any]:
+    store = runtime.store
+    item = store.get_item(item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="memory item not found")
+    if item.archived_at is not None:
+        raise HTTPException(status_code=409, detail="memory item is archived")
+    updated = store.add_outcome(item_id=item_id, signal="confirmed", origin="explicit")
+    return _memory_item_json(updated)
+
+
+@app.post("/v1/memory")
+async def memory_write(body: MemoryWriteRequest) -> dict:
+    """Store one fact or ask the user stated. Deduped against active items of
+    the same kind unless `force`; 409 names the duplicate. Loopback and
+    unauthenticated like every other route."""
+    runtime = _require_memory_runtime()
+    return await _memory_endpoint(
+        runtime, route="/v1/memory", method="POST", fn=lambda: _memory_write_sync(runtime, body)
+    )
+
+
+@app.get("/v1/memory")
+async def memory_search(q: str | None = None, limit: int = Query(20, ge=1, le=100)) -> dict:
+    """With `q`: the same retrieval path a conversation start uses (cosine
+    candidates, cross-encoder order, quality gate), kinds merged, scored.
+    Without: active items newest first."""
+    runtime = _require_memory_runtime()
+    return await _memory_endpoint(
+        runtime,
+        route="/v1/memory",
+        method="GET",
+        fn=lambda: _memory_search_sync(runtime, q, limit),
+    )
+
+
+@app.get("/v1/memory/{item_id}")
+async def memory_get(item_id: str) -> dict:
+    runtime = _require_memory_runtime()
+    return await _memory_endpoint(
+        runtime,
+        route="/v1/memory/{id}",
+        method="GET",
+        item_id=item_id,
+        fn=lambda: _memory_get_sync(runtime, item_id),
+    )
+
+
+@app.delete("/v1/memory/{item_id}")
+async def memory_forget(item_id: str) -> dict:
+    """Soft-archive (reason `forgotten`) with a `forgotten` outcome; idempotent."""
+    runtime = _require_memory_runtime()
+    return await _memory_endpoint(
+        runtime,
+        route="/v1/memory/{id}",
+        method="DELETE",
+        item_id=item_id,
+        fn=lambda: _memory_forget_sync(runtime, item_id),
+    )
+
+
+@app.post("/v1/memory/{item_id}/confirm")
+async def memory_confirm(item_id: str) -> dict:
+    """Record a `confirmed` outcome (the worked delta) on an active item."""
+    runtime = _require_memory_runtime()
+    return await _memory_endpoint(
+        runtime,
+        route="/v1/memory/{id}/confirm",
+        method="POST",
+        item_id=item_id,
+        fn=lambda: _memory_confirm_sync(runtime, item_id),
+    )
 
 
 # -- Streaming helpers --

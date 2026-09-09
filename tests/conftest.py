@@ -8,6 +8,12 @@ from unittest.mock import patch
 
 import pytest
 
+# Captured at import, BEFORE the isolation fixture below patches the
+# environment: the requires_models tests need the HOST's model directory (the
+# one `python -m pdp_router.memory warmup` filled), and every fixture runs
+# after this module has been imported. None means "use the package default".
+HOST_MODEL_DIR = os.environ.get("PROXY_MEMORY_MODEL_DIR")
+
 
 @pytest.fixture(autouse=True)
 def _isolate_on_disk_state(tmp_path_factory):
@@ -30,6 +36,11 @@ def _isolate_on_disk_state(tmp_path_factory):
             "PROXY_ROUTING_INBOX_DIR": str(base / "inbox"),
             "PROXY_PANEL_TRANSCRIPT_DIR": str(base / "panel-transcripts"),
             "PROXY_TRUST_DB": str(base / "absent-trust.db"),
+            # The memory store and its model cache: a test that opens the
+            # store must never touch the developer's real memory.db, and a
+            # test that loads models must never download into the host dir.
+            "PROXY_MEMORY_DB_PATH": str(base / "memory.db"),
+            "PROXY_MEMORY_MODEL_DIR": str(base / "models"),
         },
     ):
         yield base
@@ -49,9 +60,16 @@ def _pin_flags_to_defaults(monkeypatch):
     patching the reader function; tests of the flag plumbing itself re-patch
     the handle and still win.
     """
-    from pdp_router import _proxy
-
-    monkeypatch.setattr(_proxy, "_clawflag", None)
+    try:
+        from pdp_router import _proxy
+    except ModuleNotFoundError:
+        # Base env without the proxy extra (CI runs `uv sync --frozen`):
+        # _proxy cannot import (fastapi absent), there is no flag handle to
+        # detach, and every proxy test module importorskips itself away. An
+        # unguarded import here fails ALL tests, not just proxy ones.
+        _proxy = None
+    if _proxy is not None:
+        monkeypatch.setattr(_proxy, "_clawflag", None)
     for var in list(os.environ):
         if var.startswith("PROXY_") and var.endswith("_ENABLED"):
             monkeypatch.delenv(var)

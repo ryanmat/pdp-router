@@ -556,6 +556,95 @@ class TestProxyConfigDefaults:
         config = ProxyConfig()
         assert str(config.panel_transcript_dir) == "/tmp/custom/transcripts"
 
+    def test_memory_db_defaults_to_pdp_router_home(self, monkeypatch) -> None:
+        monkeypatch.delenv("PROXY_MEMORY_DB_PATH", raising=False)
+        monkeypatch.delenv("PROXY_ROUTING_INBOX_DIR", raising=False)
+        config = ProxyConfig()
+        assert str(config.memory_db_path) == os.path.expanduser("~/.pdp-router/memory.db")
+
+    def test_memory_db_derives_from_inbox_when_env_unset(self, monkeypatch) -> None:
+        """memory.db sits beside the routing inbox with no second env var to set,
+        the same derivation the panel transcript dir uses, so one inbox override
+        moves the whole memory tree and nothing can drift to a different base."""
+        monkeypatch.delenv("PROXY_MEMORY_DB_PATH", raising=False)
+        monkeypatch.setenv("PROXY_ROUTING_INBOX_DIR", "/home/x/.pdp-router/inbox")
+        config = ProxyConfig()
+        assert str(config.memory_db_path) == "/home/x/.pdp-router/memory.db"
+
+    def test_memory_db_env_override_wins(self, monkeypatch) -> None:
+        monkeypatch.setenv("PROXY_MEMORY_DB_PATH", "/tmp/custom/memory.db")
+        monkeypatch.setenv("PROXY_ROUTING_INBOX_DIR", "/home/x/.pdp-router/inbox")
+        config = ProxyConfig()
+        assert str(config.memory_db_path) == "/tmp/custom/memory.db"
+
+    def test_memory_model_dir_derives_from_db_path(self, monkeypatch) -> None:
+        """Model files live beside memory.db unless told otherwise; the service
+        must never depend on the embedding library's own tmp-dir fallback."""
+        monkeypatch.delenv("PROXY_MEMORY_MODEL_DIR", raising=False)
+        monkeypatch.setenv("PROXY_MEMORY_DB_PATH", "/tmp/custom/memory.db")
+        config = ProxyConfig()
+        assert str(config.memory_model_dir) == "/tmp/custom/models"
+
+    def test_memory_paths_chain_from_the_inbox(self, monkeypatch) -> None:
+        """Derivation chains inbox -> db path -> model dir and shadow dir, so a
+        single PROXY_ROUTING_INBOX_DIR moves all of them together."""
+        monkeypatch.delenv("PROXY_MEMORY_MODEL_DIR", raising=False)
+        monkeypatch.delenv("PROXY_MEMORY_DB_PATH", raising=False)
+        monkeypatch.setenv("PROXY_ROUTING_INBOX_DIR", "/home/x/.pdp-router/inbox")
+        config = ProxyConfig()
+        assert str(config.memory_model_dir) == "/home/x/.pdp-router/models"
+        assert str(config.memory_shadow_dir) == "/home/x/.pdp-router/memory-shadow"
+
+    def test_memory_model_dir_env_override_wins(self, monkeypatch) -> None:
+        monkeypatch.setenv("PROXY_MEMORY_MODEL_DIR", "/tmp/models")
+        monkeypatch.setenv("PROXY_MEMORY_DB_PATH", "/tmp/custom/memory.db")
+        config = ProxyConfig()
+        assert str(config.memory_model_dir) == "/tmp/models"
+
+    def test_memory_shadow_dir_follows_an_overridden_db_path(self, monkeypatch) -> None:
+        monkeypatch.setenv("PROXY_MEMORY_DB_PATH", "/tmp/custom/memory.db")
+        config = ProxyConfig()
+        assert str(config.memory_shadow_dir) == "/tmp/custom/memory-shadow"
+
+    _MEMORY_TUNABLE_VARS = (
+        "PROXY_MEMORY_EMBED_MODEL",
+        "PROXY_MEMORY_RERANK_MODEL",
+        "PROXY_MEMORY_MIN_CE_SCORE",
+        "PROXY_MEMORY_BLOCK_MAX_CHARS",
+        "PROXY_MEMORY_PIN_TTL_S",
+        "PROXY_MEMORY_DEDUP_SIM",
+        "PROXY_MEMORY_WORKING_TTL_DAYS",
+    )
+
+    def test_memory_tunables_default_to_the_spec_values(self, monkeypatch) -> None:
+        for var in self._MEMORY_TUNABLE_VARS:
+            monkeypatch.delenv(var, raising=False)
+        config = ProxyConfig()
+        assert config.memory_embed_model == "BAAI/bge-small-en-v1.5"
+        assert config.memory_rerank_model == "Xenova/ms-marco-MiniLM-L-6-v2"
+        assert config.memory_min_ce_score == 0.0
+        assert config.memory_block_max_chars == 1500
+        assert config.memory_pin_ttl_s == 86400
+        assert config.memory_dedup_sim == 0.92
+        assert config.memory_working_ttl_days == 90
+
+    def test_memory_tunables_env_override(self, monkeypatch) -> None:
+        monkeypatch.setenv("PROXY_MEMORY_EMBED_MODEL", "org/embed")
+        monkeypatch.setenv("PROXY_MEMORY_RERANK_MODEL", "org/rerank")
+        monkeypatch.setenv("PROXY_MEMORY_MIN_CE_SCORE", "0.5")
+        monkeypatch.setenv("PROXY_MEMORY_BLOCK_MAX_CHARS", "800")
+        monkeypatch.setenv("PROXY_MEMORY_PIN_TTL_S", "60")
+        monkeypatch.setenv("PROXY_MEMORY_DEDUP_SIM", "0.8")
+        monkeypatch.setenv("PROXY_MEMORY_WORKING_TTL_DAYS", "30")
+        config = ProxyConfig()
+        assert config.memory_embed_model == "org/embed"
+        assert config.memory_rerank_model == "org/rerank"
+        assert config.memory_min_ce_score == 0.5
+        assert config.memory_block_max_chars == 800
+        assert config.memory_pin_ttl_s == 60
+        assert config.memory_dedup_sim == 0.8
+        assert config.memory_working_ttl_days == 30
+
 
 class TestFlagEnvFallback:
     """When clawflag is absent (a standalone build), the flag helpers honor
@@ -619,6 +708,42 @@ class TestFlagEnvFallback:
         monkeypatch.setattr(_proxy, "_clawflag", _RecordingFlag())
         assert _proxy._tool_passthrough_enabled() is True
         assert seen == ["pipeline.proxy_tool_passthrough_enabled"]
+
+    def test_memory_flags_default_off(self, monkeypatch) -> None:
+        """Every memory flag ships dark and fails closed: with no flag library
+        and no env override both helpers read False, so a flag-off proxy never
+        opens the store, loads a model, or retrieves anything."""
+        monkeypatch.setattr(_proxy, "_clawflag", None)
+        monkeypatch.delenv("PROXY_MEMORY_ENABLED", raising=False)
+        monkeypatch.delenv("PROXY_MEMORY_SHADOW_ENABLED", raising=False)
+        assert _proxy._memory_enabled() is False
+        assert _proxy._memory_shadow_enabled() is False
+
+    def test_memory_flags_env_fallback_enables(self, monkeypatch) -> None:
+        monkeypatch.setattr(_proxy, "_clawflag", None)
+        monkeypatch.setenv("PROXY_MEMORY_ENABLED", "1")
+        monkeypatch.setenv("PROXY_MEMORY_SHADOW_ENABLED", "true")
+        assert _proxy._memory_enabled() is True
+        assert _proxy._memory_shadow_enabled() is True
+
+    def test_memory_flags_read_their_own_keys_with_a_false_default(self, monkeypatch) -> None:
+        """Each helper must consult its own clawflag key AND pass default=False,
+        so a flag store missing the key still fails closed."""
+        seen: list[tuple[str, bool]] = []
+
+        class _RecordingFlag:
+            @staticmethod
+            def get_bool(key: str, default: bool = True) -> bool:
+                seen.append((key, default))
+                return True
+
+        monkeypatch.setattr(_proxy, "_clawflag", _RecordingFlag())
+        assert _proxy._memory_enabled() is True
+        assert _proxy._memory_shadow_enabled() is True
+        assert seen == [
+            ("pipeline.proxy_memory_enabled", False),
+            ("pipeline.proxy_memory_shadow_enabled", False),
+        ]
 
 
 class TestEffortRouting:

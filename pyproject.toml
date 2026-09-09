@@ -3,7 +3,7 @@
 
 [project]
 name = "pdp-router"
-version = "0.7.0"
+version = "0.9.0"
 description = "Outcome-fed routing across heterogeneous AI models: confidence cascade, Thompson Sampling bandit, multi-model panel"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -46,6 +46,12 @@ gemini = ["google-genai>=1.0.0"]
 # pull it in today, and the .env loading in the entry point must not depend on
 # that. This repo ships no uv.lock, so CI resolves fresh per matrix Python.
 proxy = ["fastapi>=0.115.0", "uvicorn[standard]>=0.34.0", "python-dotenv>=1.0.0"]
+# Persistent user memory: ONNX embedder + cross-encoder on CPU (numpy,
+# onnxruntime, tokenizers; no torch). Imported lazily inside the memory
+# module, so a proxy with the memory flags off never loads onnxruntime even
+# with the extra installed. 0.8.x is the only line verified against the
+# wrapper contract (TextEmbedding / TextCrossEncoder with cache_dir).
+memory = ["fastembed>=0.8.0,<0.9"]
 
 [project.scripts]
 pdp-router-proxy = "pdp_router.__main__:main"
@@ -59,11 +65,22 @@ packages = ["pdp_router"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "requires_models: tests that load the real embedding models (network + ~150 MB on first run; excluded by default)",
+]
+# Excluded by default so CI (`uv sync --all-extras`) and a bare `pytest` never
+# download model files; run them on purpose with `pytest -m requires_models`.
+addopts = "-m 'not requires_models'"
 
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.4.0",
+    # Test-time only: the memory retrieval math (cosine, dedup, block
+    # ordering) is exercised with a fake embedder, which needs numpy without
+    # the full `memory` extra. The runtime gets numpy through that extra and
+    # imports it lazily, so this pin never puts it on the proxy import path.
+    "numpy>=1.26",
 ]
 
 [tool.ruff]

@@ -119,6 +119,66 @@ class ProxyConfig:
     uplift_min_obs: int = field(
         default_factory=lambda: int(os.getenv("PROXY_UPLIFT_MIN_OBS", "10"))
     )
+    # Persistent user memory (every memory flag defaults off). memory.db sits
+    # beside the routing inbox: when PROXY_MEMORY_DB_PATH is unset,
+    # __post_init__ derives it from routing_inbox_dir exactly the way
+    # panel_transcript_dir is derived, so one inbox override moves the whole
+    # memory tree (db, model cache, shadow log) and nothing can drift.
+    memory_db_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "PROXY_MEMORY_DB_PATH",
+                os.path.expanduser("~/.pdp-router/memory.db"),
+            )
+        )
+    )
+    # Model files for the embedder and reranker (passed as the embedding
+    # library's cache_dir). Derived as <memory.db parent>/models when
+    # PROXY_MEMORY_MODEL_DIR is unset, so a service never depends on the
+    # library's own tmp-dir fallback.
+    memory_model_dir: Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "PROXY_MEMORY_MODEL_DIR",
+                os.path.expanduser("~/.pdp-router/models"),
+            )
+        )
+    )
+    # Shadow-retrieval log dir (flag-gated). Always <memory.db parent>/memory-shadow;
+    # it has no env var of its own and follows the db path in __post_init__.
+    memory_shadow_dir: Path = field(
+        init=False,
+        default_factory=lambda: Path(os.path.expanduser("~/.pdp-router/memory-shadow")),
+    )
+    memory_embed_model: str = field(
+        default_factory=lambda: os.getenv("PROXY_MEMORY_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+    )
+    memory_rerank_model: str = field(
+        default_factory=lambda: os.getenv(
+            "PROXY_MEMORY_RERANK_MODEL", "Xenova/ms-marco-MiniLM-L-6-v2"
+        )
+    )
+    # Cross-encoder quality gate: candidates scoring below this never enter
+    # the block. 0.0 is the gate the reranker's source project validated.
+    memory_min_ce_score: float = field(
+        default_factory=lambda: float(os.getenv("PROXY_MEMORY_MIN_CE_SCORE", "0.0"))
+    )
+    memory_block_max_chars: int = field(
+        default_factory=lambda: int(os.getenv("PROXY_MEMORY_BLOCK_MAX_CHARS", "1500"))
+    )
+    # A conversation's block is pinned for this long, so a restart or a
+    # state-cache eviction never changes it mid-conversation.
+    memory_pin_ttl_s: int = field(
+        default_factory=lambda: int(os.getenv("PROXY_MEMORY_PIN_TTL_S", "86400"))
+    )
+    # Cosine at or above which a new item is a duplicate of an active one.
+    memory_dedup_sim: float = field(
+        default_factory=lambda: float(os.getenv("PROXY_MEMORY_DEDUP_SIM", "0.92"))
+    )
+    # Working-tier items with zero uses are archived after this many days.
+    memory_working_ttl_days: int = field(
+        default_factory=lambda: int(os.getenv("PROXY_MEMORY_WORKING_TTL_DAYS", "90"))
+    )
 
     def __post_init__(self) -> None:
         # Keep the transcript dir beside the inbox WITHOUT a second env var to set:
@@ -134,3 +194,15 @@ class ProxyConfig:
                 "panel_transcript_dir",
                 self.routing_inbox_dir.parent / "panel-transcripts",
             )
+        # Same rule for the memory tree, chained: inbox -> memory.db -> model
+        # cache, and the shadow log always beside the db. Order matters, since
+        # each derivation reads the one before it.
+        if "PROXY_MEMORY_DB_PATH" not in os.environ:
+            object.__setattr__(
+                self, "memory_db_path", self.routing_inbox_dir.parent / "memory.db"
+            )
+        if "PROXY_MEMORY_MODEL_DIR" not in os.environ:
+            object.__setattr__(self, "memory_model_dir", self.memory_db_path.parent / "models")
+        object.__setattr__(
+            self, "memory_shadow_dir", self.memory_db_path.parent / "memory-shadow"
+        )

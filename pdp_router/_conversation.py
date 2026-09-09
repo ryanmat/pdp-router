@@ -27,6 +27,9 @@ class ConversationState:
       implicit-feedback row can name the turn it grades.
     last_user_text_digest: digest of the previous latest user text (retry
       detection without retaining the text itself).
+    memory_block: the memory block this conversation was pinned to (the date
+      line alone when nothing surfaced); None until resolved. Mirrors the
+      persisted pin so later turns skip the store read.
     """
 
     driver: str | None = None
@@ -35,6 +38,7 @@ class ConversationState:
     last_request_id: str | None = None
     last_user_text_digest: str | None = None
     last_model: str | None = None
+    memory_block: str | None = None
     turn_count: int = 0
     last_seen: float = field(default_factory=time.monotonic)
 
