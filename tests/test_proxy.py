@@ -2952,7 +2952,16 @@ class TestAutoPanelGate:
 
         def make_client(*args, **kwargs):
             m = MagicMock()
-            m.complete.return_value = _mock_completion("a real answer")
+            # The survivor whose text stands in was itself cut at max_tokens:
+            # the response has to say so, not inherit the chair's default.
+            m.complete.return_value = CompletionResult(
+                text="a real answer",
+                input_tokens=50,
+                output_tokens=20,
+                model="gemini-2.5-flash",
+                estimated_cost_usd=0.0001,
+                finish_reason="length",
+            )
             return m
 
         mock_get_client.side_effect = make_client
@@ -2980,6 +2989,7 @@ class TestAutoPanelGate:
         assert "chair_fallback" in data["model"]
         # Content is the first survivor's text, not empty.
         assert data["choices"][0]["message"]["content"] == "a real answer"
+        assert data["choices"][0]["finish_reason"] == "length"
 
 
 class TestSearchIntentGateAndFloor:
@@ -5215,3 +5225,104 @@ class TestPlainResponseFinishReason:
         assert data["model"].startswith("pdp-panel-")
         assert len(built) == 4
         assert data["choices"][0]["finish_reason"] == "length"
+
+
+class TestImplicitFeedbackReviewRound:
+    """Review-round guards on the tool-loop continuation rule.
+
+    A continuation ends with the model's own tool traffic; a human re-send
+    ends with the user's message. Only the former is skipped, so the retry
+    signal stays obtainable on conversations that have used a tool. And an
+    explicit caller marker beats the heuristic: machine_retry records even
+    when the history is tool-shaped.
+    """
+
+    _post = TestImplicitFeedbackMachineRetryAndToolLoops._post
+    _feedback_rows = staticmethod(TestImplicitFeedbackMachineRetryAndToolLoops._feedback_rows)
+    _TOOL_TURN = TestImplicitFeedbackMachineRetryAndToolLoops._TOOL_TURN
+
+    def test_human_resend_on_a_tool_conversation_still_records_retry(
+        self, client, inbox_dir
+    ) -> None:
+        self._post(
+            client,
+            {"messages": [self._TOOL_TURN[0]], "tools": _TOOLS_PARAM},
+            surface="/openai/v1/chat/completions",
+        )
+        resend = [
+            *self._TOOL_TURN,
+            {"role": "assistant", "content": "a.txt"},
+            {"role": "user", "content": "list files"},
+        ]
+        two = self._post(
+            client,
+            {"messages": resend, "tools": _TOOLS_PARAM},
+            surface="/openai/v1/chat/completions",
+        )
+        assert two.status_code == 200
+        fb = self._feedback_rows(inbox_dir)
+        assert len(fb) == 1
+        assert json.loads(fb[0]["context_json"])["feedback_signal"] == "retry"
+
+    def test_machine_retry_wins_over_a_tool_shaped_continuation(
+        self, client, inbox_dir
+    ) -> None:
+        first = self._post(
+            client,
+            {"messages": [self._TOOL_TURN[0]], "tools": _TOOLS_PARAM},
+            surface="/openai/v1/chat/completions",
+        )
+        two = self._post(
+            client,
+            {"messages": list(self._TOOL_TURN), "tools": _TOOLS_PARAM, "machine_retry": True},
+            surface="/openai/v1/chat/completions",
+        )
+        assert two.status_code == 200
+        fb = self._feedback_rows(inbox_dir)
+        assert len(fb) == 1
+        ctx = json.loads(fb[0]["context_json"])
+        assert ctx["feedback_signal"] == "machine_retry"
+        assert ctx["target_chat_request_id"] == first.headers["X-PDP-Prediction-Id"]
+
+
+class TestWebSearchOptOutAndPanel:
+    """An opted-out request that trips the search regex is panel-eligible.
+
+    The search-intent panel skip exists only so the web-search tool can
+    attach on the cascade; with search opted out there is nothing to attach,
+    so a panel-worthy request panels. Stated here because the cost is real
+    (a panel is roughly twelve single calls) and the spec's "panel path
+    unchanged" is about search attachment, not eligibility.
+    """
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 4, 9, "general"))
+    @patch("pdp_router._proxy.compose_panel")
+    @patch("pdp_router._proxy.get_client")
+    def test_opted_out_panel_worthy_search_ask_still_panels(
+        self, mock_get_client, mock_compose, _mock_classify, _mock_panel, _mock_ws, client
+    ) -> None:
+        mock_compose.return_value = ["claude-opus-4-7", "gemini-2.5-pro", "deepseek-chat"]
+        created: list = []
+
+        def make_client(*args, **kwargs):
+            m = MagicMock()
+            m.complete.return_value = _mock_completion("panelist")
+            created.append(m)
+            return m
+
+        mock_get_client.side_effect = make_client
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search for the latest news on X"}],
+                "enable_web_search": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"].startswith("pdp-panel-")
+        for m in created:
+            for call in m.complete.call_args_list:
+                assert call.kwargs.get("enable_web_search") is not True

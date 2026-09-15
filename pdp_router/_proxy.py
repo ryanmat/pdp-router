@@ -355,10 +355,12 @@ class ChatCompletionRequest(BaseModel):
     # never overrides an OFF flag, because the flag is the kill switch.
     enable_web_search: bool | None = None
     # An automated re-send of the previous turn (a client retrying after a
-    # reply it could not parse). The implicit-feedback grader records it as
-    # feedback_signal=machine_retry instead of the human "retry", so a caller
-    # defect and a real negative stay distinguishable downstream. Nothing else
-    # reads it; the lineage advances exactly as for any other turn.
+    # reply it could not parse). When set, the implicit-feedback grader
+    # records feedback_signal=machine_retry for the previous turn in place of
+    # whatever it would have classified (retry, correction or moved_on) and
+    # ahead of the tool-loop continuation skip, so a caller defect and a real
+    # negative stay distinguishable downstream. Nothing else reads it; the
+    # lineage advances exactly as for any other turn.
     machine_retry: bool = False
 
 
@@ -581,6 +583,11 @@ def _classify_implicit_feedback(latest_text: str, previous_digest: str | None) -
     exact re-send of the previous user text catches the silent retry. Noisy
     by design -- volume, not per-row precision, is what makes the signal
     usable downstream.
+
+    The full feedback_signal vocabulary a row can carry: the three values
+    returned here, plus "machine_retry", recorded by the handler when the
+    request carries machine_retry=True (an automated re-send, never graded
+    as a human retry). A tool-loop continuation records nothing at all.
     """
     if (
         previous_digest is not None
@@ -590,12 +597,6 @@ def _classify_implicit_feedback(latest_text: str, previous_digest: str | None) -
     if _CORRECTION_MARKERS.search(latest_text[:2000]):
         return "correction"
     return "moved_on"
-
-
-# The full feedback_signal vocabulary, for the row's downstream readers. The
-# three above come from this classifier; "machine_retry" is recorded when the
-# request carries machine_retry=True (an automated re-send, never graded as a
-# human retry); a tool-loop continuation records nothing at all.
 
 
 def _search_floor_model() -> str | None:
@@ -2524,30 +2525,39 @@ async def _handle_chat(
             fb_state = _conversation_cache.get(conversation_key)
             fb_user_msgs = [m.content or "" for m in non_system if m.role == "user"]
             fb_latest = fb_user_msgs[-1] if fb_user_msgs else ""
-            # A tool-loop continuation (same latest user text, tool results or
-            # tool_calls in the history) is the model working, not the user
-            # speaking: grading it would label every agent step a "retry" of
-            # the one before. It writes no row; the lineage still advances
-            # below so the next genuine user turn grades the model that
-            # produced the answer the user actually saw.
+            # A tool-loop continuation is the model working, not the user
+            # speaking: the latest user text is unchanged, the history carries
+            # tool traffic, and the transcript ENDS with that traffic (a tool
+            # result or the assistant's tool_calls). Grading it would label
+            # every agent step a "retry" of the one before. It writes no row;
+            # the lineage still advances below so the next genuine user turn
+            # grades the model that produced the answer the user actually saw.
+            # A human re-send on the same conversation ends with the user's
+            # own message, so it is still graded, and an explicit
+            # machine_retry marker from the caller beats the heuristic.
             fb_digest_match = (
-                bool(fb_latest)
-                and fb_state.last_user_text_digest is not None
+                fb_state.last_user_text_digest is not None
                 and hashlib.sha256(fb_latest.encode("utf-8")).hexdigest()
                 == fb_state.last_user_text_digest
             )
-            fb_continuation = fb_digest_match and _tool_shaped_history(non_system)
-            if (
-                fb_state.last_request_id
-                and fb_state.last_model
-                and fb_latest
-                and not fb_continuation
-            ):
-                fb_signal = (
-                    "machine_retry"
-                    if request.machine_retry
-                    else _classify_implicit_feedback(fb_latest, fb_state.last_user_text_digest)
-                )
+            fb_continuation = (
+                fb_digest_match
+                and _tool_shaped_history(non_system)
+                and bool(non_system)
+                and non_system[-1].role != "user"
+            )
+            if fb_state.last_request_id and fb_state.last_model and fb_latest:
+                if request.machine_retry:
+                    fb_signal: str | None = "machine_retry"
+                elif fb_continuation:
+                    fb_signal = None
+                else:
+                    fb_signal = _classify_implicit_feedback(
+                        fb_latest, fb_state.last_user_text_digest
+                    )
+            else:
+                fb_signal = None
+            if fb_signal is not None:
                 append_routing_decisions_jsonl(
                     inbox_dir=_config.routing_inbox_dir,
                     rows=[

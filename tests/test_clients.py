@@ -2218,3 +2218,51 @@ class TestPlainPathFinishReason:
             )
         assert plain.finish_reason == "length"
         assert with_tools.finish_reason == plain.finish_reason
+
+
+class TestOpenAICompatiblePlainFinishReason:
+    """The OpenAI-compatible plain path normalizes the choice finish_reason.
+
+    OpenRouter GPT-5.5 / Qwen and DeepSeek report OpenAI's vocabulary, and
+    DeepSeek documents insufficient_system_resource as a possible value; the
+    plain vocabulary stays closed, so anything unknown reads as stop.
+    """
+
+    @staticmethod
+    def _client_with(finish_reason):
+        mock_cls = patch("httpx.Client").start()
+        resp = MagicMock()
+        resp.status_code = 200
+        choice = {"message": {"content": "partial"}}
+        if finish_reason is not None:
+            choice["finish_reason"] = finish_reason
+        resp.json.return_value = {
+            "choices": [choice],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7},
+        }
+        mock_cls.return_value.post.return_value = resp
+        return OpenAICompatibleClient(
+            "openai/gpt-5.5", api_key="k", base_url="https://openrouter.ai/api/v1"
+        )
+
+    def teardown_method(self) -> None:
+        patch.stopall()
+
+    @pytest.mark.parametrize(
+        ("reason", "expected"),
+        [
+            ("stop", "stop"),
+            ("length", "length"),
+            ("content_filter", "content_filter"),
+            ("insufficient_system_resource", "stop"),
+            (None, "stop"),
+        ],
+    )
+    def test_complete_maps_the_choice_finish_reason(self, reason, expected) -> None:
+        client = self._client_with(reason)
+        assert client.complete("system", "user").finish_reason == expected
+
+    def test_complete_multi_maps_length(self) -> None:
+        client = self._client_with("length")
+        result = client.complete_multi("system", [{"role": "user", "content": "hi"}])
+        assert result.finish_reason == "length"

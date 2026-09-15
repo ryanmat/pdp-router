@@ -76,9 +76,14 @@ class CompletionResult:
     # sites are untouched by this field existing.
     tool_calls: tuple[ToolCall, ...] = ()
     # Why the turn ended: "stop", "tool_calls", "length", or "content_filter".
-    # Every complete() path populates it from the provider's own stop reason
-    # (Anthropic stop_reason, Gemini candidate finish_reason, OpenAI-compatible
-    # choice finish_reason); the default covers clients with no such signal.
+    # Every complete() and complete_multi() path populates it from the
+    # provider's own signal, each through a closed map with a "stop" fallback:
+    # Anthropic stop_reason (_tools.anthropic_stop_reason_to_finish_reason),
+    # Gemini candidate finish_reason (gemini_response_to_finish_reason), and
+    # the OpenAI-compatible choice finish_reason
+    # (openai_finish_reason_to_finish_reason). The with-tools OpenAI-compatible
+    # path passes the provider value through unchanged. The default covers the
+    # Ollama stub, which carries no such signal.
     finish_reason: str = "stop"
 
 
@@ -748,6 +753,17 @@ class AnthropicClient:
             raise
 
 
+# OpenAI finish_reason values the plain paths may emit. An OpenAI-compatible
+# provider's own value passes through when it is one of these; anything else
+# reads as "stop".
+_OPENAI_FINISH_REASONS = frozenset({"stop", "length", "content_filter", "tool_calls"})
+
+
+def openai_finish_reason_to_finish_reason(reason: object) -> str:
+    """Normalize an OpenAI-compatible choice finish_reason onto the closed set."""
+    return reason if isinstance(reason, str) and reason in _OPENAI_FINISH_REASONS else "stop"
+
+
 # Gemini candidate finish reasons onto OpenAI finish_reason. The safety family
 # maps to content_filter; anything unlisted (LANGUAGE, OTHER,
 # MALFORMED_FUNCTION_CALL, the image reasons) or absent maps to "stop", the
@@ -763,7 +779,7 @@ _GEMINI_FINISH_REASONS = {
 }
 
 
-def gemini_finish_reason_to_finish_reason(response: object) -> str:
+def gemini_response_to_finish_reason(response: object) -> str:
     """Map the first candidate's finish_reason onto an OpenAI finish_reason.
 
     The SDK returns the FinishReason enum; a raw string is accepted too. No
@@ -948,7 +964,7 @@ class GeminiClient:
             model=self._model,
             estimated_cost_usd=cost,
             web_search_requests=web_search_requests,
-            finish_reason=gemini_finish_reason_to_finish_reason(response),
+            finish_reason=gemini_response_to_finish_reason(response),
         )
 
     def complete_with_tools(self, *_args: object, **_kwargs: object) -> CompletionResult:
@@ -1233,7 +1249,11 @@ class OpenAICompatibleClient:
 
         choice = data["choices"][0]
         tool_calls: tuple[ToolCall, ...] = ()
-        finish_reason = "stop"
+        # The plain vocabulary stays closed: OpenAI's own values pass, and a
+        # provider extension (DeepSeek documents insufficient_system_resource)
+        # or a missing field reads as "stop", the same fallback the Anthropic
+        # and Gemini tables use.
+        finish_reason = openai_finish_reason_to_finish_reason(choice.get("finish_reason"))
         if tools_body is None:
             text = choice["message"]["content"]
         else:

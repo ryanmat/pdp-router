@@ -203,8 +203,9 @@ def synthesize_chair(
     excluded before synthesis.
 
     `complete_fn` must accept (system, user_message, max_tokens) and return
-    an object with `text`, `input_tokens`, `output_tokens`, and
-    `estimated_cost_usd` attributes (the proxy's CompletionResult).
+    an object with `text`, `input_tokens`, `output_tokens`,
+    `estimated_cost_usd` and `finish_reason` attributes (the proxy's
+    CompletionResult); a missing `finish_reason` reads as "stop".
 
     Returns a ChairSynthResult; on any exception from `complete_fn`, returns
     a result with `error` populated and zeroed cost/tokens. Never raises.
