@@ -38,6 +38,10 @@ class PanelMemberResponse:
     estimated_cost_usd: float
     latency_ms: float
     error: str | None
+    # The provider's finish_reason for this member's reply ("length" when it
+    # was cut at max_tokens); "stop" when the member errored or the client
+    # carried no signal.
+    finish_reason: str = "stop"
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,9 @@ class ChairSynthResult:
     latency_ms: float
     chair_model: str
     error: str | None
+    # The chair call's own finish_reason; the non-streaming panel response
+    # reports it, since a truncated synthesis is a truncated answer.
+    finish_reason: str = "stop"
 
 
 CHAIR_SYSTEM = (
@@ -240,6 +247,7 @@ def synthesize_chair(
         latency_ms=(time.monotonic() - t0) * 1000.0,
         chair_model=chair_model_id,
         error=None,
+        finish_reason=getattr(result, "finish_reason", "stop") or "stop",
     )
 
 

@@ -2147,3 +2147,74 @@ class TestGetClient:
     def test_unknown_prefix_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown model provider"):
             get_client("gpt-4o")
+
+
+class TestPlainPathFinishReason:
+    """The plain completion paths carry the provider's stop reason.
+
+    Built from the real ``anthropic.types`` objects rather than MagicMocks, so
+    the attribute names the client reads are the SDK's, not this file's.
+    """
+
+    @staticmethod
+    def _real_message(stop_reason: str, text: str = "hi"):
+        from anthropic.types import Message, TextBlock, Usage
+
+        return Message(
+            id="msg_test",
+            content=[TextBlock(type="text", text=text)],
+            model="claude-sonnet-4-20250514",
+            role="assistant",
+            stop_reason=stop_reason,
+            stop_sequence=None,
+            type="message",
+            usage=Usage(input_tokens=10, output_tokens=5),
+        )
+
+    @pytest.mark.parametrize(
+        ("stop_reason", "expected"),
+        [
+            ("end_turn", "stop"),
+            ("max_tokens", "length"),
+            ("refusal", "content_filter"),
+            ("stop_sequence", "stop"),
+        ],
+    )
+    def test_process_response_maps_stop_reason(self, stop_reason, expected) -> None:
+        with patch("pdp_router._clients.anthropic"):
+            client = AnthropicClient("claude-sonnet-4-20250514", api_key="sk-test")
+            result = client._process_response(self._real_message(stop_reason))
+        assert result.finish_reason == expected
+        assert result.text == "hi"
+
+    def test_complete_reports_length_when_the_provider_hit_max_tokens(self) -> None:
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            create.return_value = self._real_message("max_tokens", text="cut off mid")
+            client = AnthropicClient("claude-sonnet-4-20250514", api_key="sk-test")
+            result = client.complete("sys", "user")
+        assert result.finish_reason == "length"
+        assert result.text == "cut off mid"
+
+    def test_complete_multi_reports_stop_on_end_turn(self) -> None:
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            create.return_value = self._real_message("end_turn")
+            client = AnthropicClient("claude-sonnet-4-20250514", api_key="sk-test")
+            result = client.complete_multi("sys", [{"role": "user", "content": "hi"}])
+        assert result.finish_reason == "stop"
+
+    def test_tools_wrapper_has_the_same_source_as_the_plain_path(self) -> None:
+        """One source for the field: complete_with_tools no longer overrides
+        what _process_response already decided."""
+        with patch("pdp_router._clients.anthropic") as mock_anthropic:
+            msg = self._real_message("max_tokens")
+            create = mock_anthropic.Anthropic.return_value.messages.create
+            create.return_value = msg
+            client = AnthropicClient("claude-sonnet-4-20250514", api_key="sk-test")
+            plain = client._process_response(msg)
+            with_tools = client.complete_with_tools(
+                "sys", [{"role": "user", "content": "hi"}], _TOOLS
+            )
+        assert plain.finish_reason == "length"
+        assert with_tools.finish_reason == plain.finish_reason

@@ -86,6 +86,7 @@ _STOP_REASONS = {
     "max_tokens": "length",
     "end_turn": "stop",
     "stop_sequence": "stop",
+    "refusal": "content_filter",
 }
 
 

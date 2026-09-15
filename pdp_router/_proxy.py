@@ -347,6 +347,19 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage]
     max_tokens: int = 4096
     stream: bool = False
+    # Per-request web search. None defers to the pipeline.proxy_web_search_enabled
+    # flag (the behavior every existing client gets); False keeps the provider
+    # web-search tool off this request on the cascade path and skips the
+    # search-intent floor, for a caller whose own input is its source of truth
+    # and whose transcript must not depend on a snippet it never sees; True
+    # never overrides an OFF flag, because the flag is the kill switch.
+    enable_web_search: bool | None = None
+    # An automated re-send of the previous turn (a client retrying after a
+    # reply it could not parse). The implicit-feedback grader records it as
+    # feedback_signal=machine_retry instead of the human "retry", so a caller
+    # defect and a real negative stay distinguishable downstream. Nothing else
+    # reads it; the lineage advances exactly as for any other turn.
+    machine_retry: bool = False
 
 
 class ChatCompletionChoice(BaseModel):
@@ -577,6 +590,12 @@ def _classify_implicit_feedback(latest_text: str, previous_digest: str | None) -
     if _CORRECTION_MARKERS.search(latest_text[:2000]):
         return "correction"
     return "moved_on"
+
+
+# The full feedback_signal vocabulary, for the row's downstream readers. The
+# three above come from this classifier; "machine_retry" is recorded when the
+# request carries machine_retry=True (an automated re-send, never graded as a
+# human retry); a tool-loop continuation records nothing at all.
 
 
 def _search_floor_model() -> str | None:
@@ -1507,7 +1526,11 @@ def _route_request(
         # no reliable searcher is available the cascade pick stands rather than
         # forcing a down model (that would defeat route_with_fallback's
         # availability contract).
-        search_intent = _web_search_enabled() and _has_search_intent(non_system)
+        search_intent = (
+            _web_search_enabled()
+            and request.enable_web_search is not False
+            and _has_search_intent(non_system)
+        )
         if search_intent and not for_tools and not _is_reliable_searcher(model_name):
             floor_model = _search_floor_model()
             if floor_model is not None:
@@ -1843,7 +1866,10 @@ def _execute_single(
             ChatCompletionChoice(
                 index=0,
                 message=ChatMessage(role="assistant", content=content),
-                finish_reason="stop",
+                # The provider's own reason: "length" when the reply was cut at
+                # max_tokens, so a caller can tell a truncated answer from a
+                # finished one instead of reading every plain turn as complete.
+                finish_reason=result.finish_reason,
             )
         ],
         usage=Usage(
@@ -1935,9 +1961,9 @@ def _execute_single_with_tools(
 ) -> ChatCompletionResponse:
     """Single-model execution for a request carrying tools or tool results.
 
-    A sibling of _execute_single rather than a mode on it: that path hardcodes
-    finish_reason "stop" and always emits a string content, and both have to
-    stay exactly as they are for /v1 and every non-tool request. Web search is
+    A sibling of _execute_single rather than a mode on it: that path always
+    emits a string content and never a tool_calls field, and that has to stay
+    exactly as it is for /v1 and every non-tool request. Web search is
     never attached here -- it would replace the caller's own tools.
     """
     # exclude_none drops an absent content key rather than sending null, which
@@ -2098,6 +2124,7 @@ async def _run_panel_members(
                 estimated_cost_usd=r.estimated_cost_usd,
                 latency_ms=(time.monotonic() - t0) * 1000.0,
                 error=None,
+                finish_reason=r.finish_reason,
             )
         except Exception as e:
             log.warning("panel member %s failed: %s", model_id, e)
@@ -2322,6 +2349,7 @@ async def _execute_panel_with_synth(
     _record_conversation_spend(non_system, chair_model, total_cost)
 
     content = chair.text if chair.text else ""
+    finish_reason = chair.finish_reason
     chair_failed = False
     if not content.strip():
         chair_failed = True
@@ -2332,6 +2360,7 @@ async def _execute_panel_with_synth(
             chair.error,
         )
         content = survivors[0].text
+        finish_reason = survivors[0].finish_reason
 
     # When the chair errored we silently substituted a panelist answer; the
     # response.model field needs to reflect that so the inbox drain + downstream
@@ -2351,7 +2380,7 @@ async def _execute_panel_with_synth(
             ChatCompletionChoice(
                 index=0,
                 message=ChatMessage(role="assistant", content=content),
-                finish_reason="stop",
+                finish_reason=finish_reason,
             )
         ],
         usage=Usage(
@@ -2495,9 +2524,29 @@ async def _handle_chat(
             fb_state = _conversation_cache.get(conversation_key)
             fb_user_msgs = [m.content or "" for m in non_system if m.role == "user"]
             fb_latest = fb_user_msgs[-1] if fb_user_msgs else ""
-            if fb_state.last_request_id and fb_state.last_model and fb_latest:
-                fb_signal = _classify_implicit_feedback(
-                    fb_latest, fb_state.last_user_text_digest
+            # A tool-loop continuation (same latest user text, tool results or
+            # tool_calls in the history) is the model working, not the user
+            # speaking: grading it would label every agent step a "retry" of
+            # the one before. It writes no row; the lineage still advances
+            # below so the next genuine user turn grades the model that
+            # produced the answer the user actually saw.
+            fb_digest_match = (
+                bool(fb_latest)
+                and fb_state.last_user_text_digest is not None
+                and hashlib.sha256(fb_latest.encode("utf-8")).hexdigest()
+                == fb_state.last_user_text_digest
+            )
+            fb_continuation = fb_digest_match and _tool_shaped_history(non_system)
+            if (
+                fb_state.last_request_id
+                and fb_state.last_model
+                and fb_latest
+                and not fb_continuation
+            ):
+                fb_signal = (
+                    "machine_retry"
+                    if request.machine_retry
+                    else _classify_implicit_feedback(fb_latest, fb_state.last_user_text_digest)
                 )
                 append_routing_decisions_jsonl(
                     inbox_dir=_config.routing_inbox_dir,
@@ -2865,8 +2914,10 @@ async def _handle_chat(
         )
 
         # Cascade-path web search (default off). The panel branch returned above,
-        # so this only reaches the single-model cascade -- the MVP scope.
-        web_search_on = _web_search_enabled()
+        # so this only reaches the single-model cascade -- the MVP scope. A
+        # request that opted out stays search-free under an ON flag; a request
+        # that opted in cannot turn search on under an OFF flag.
+        web_search_on = _web_search_enabled() and request.enable_web_search is not False
 
         if request.stream and _streaming_enabled():
             stream_response = await _build_stream_response(

@@ -348,3 +348,77 @@ class TestGeminiPlainStreamUsage:
 
         assert asyncio.run(_drive()) == ["hi"]
         assert sink == []
+
+
+class TestGeminiFinishReason:
+    """Gemini's candidate finish_reason reaches CompletionResult.finish_reason.
+
+    Real ``google.genai.types`` objects, so the enum, the ``.text`` join and
+    the no-candidate shape are the SDK's own.
+    """
+
+    @staticmethod
+    def _real_response(finish_reason=None, *, candidates: bool = True):
+        from google.genai import types
+
+        cands = []
+        if candidates:
+            cands = [
+                types.Candidate(
+                    content=types.Content(role="model", parts=[types.Part(text="hello")]),
+                    finish_reason=finish_reason,
+                )
+            ]
+        return types.GenerateContentResponse(
+            candidates=cands,
+            usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=100, candidates_token_count=50
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("STOP", "stop"),
+            ("MAX_TOKENS", "length"),
+            ("SAFETY", "content_filter"),
+            ("RECITATION", "content_filter"),
+            ("BLOCKLIST", "content_filter"),
+            ("PROHIBITED_CONTENT", "content_filter"),
+            ("SPII", "content_filter"),
+            ("OTHER", "stop"),
+            ("MALFORMED_FUNCTION_CALL", "stop"),
+        ],
+    )
+    @patch("google.genai.Client")
+    def test_process_response_maps_the_enum(self, mock_client_cls, name, expected) -> None:
+        from google.genai import types
+
+        mock_client_cls.return_value = MagicMock()
+        client = GeminiClient("gemini-2.5-flash", api_key="test-key")
+        result = client._process_response(self._real_response(types.FinishReason[name]))
+        assert result.finish_reason == expected
+        assert result.text == "hello"
+
+    @patch("google.genai.Client")
+    def test_no_candidates_reports_stop(self, mock_client_cls) -> None:
+        mock_client_cls.return_value = MagicMock()
+        client = GeminiClient("gemini-2.5-flash", api_key="test-key")
+        result = client._process_response(self._real_response(candidates=False))
+        assert result.finish_reason == "stop"
+
+    @patch("google.genai.Client")
+    def test_complete_reports_length_when_the_provider_hit_max_tokens(
+        self, mock_client_cls
+    ) -> None:
+        from google.genai import types
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.models.generate_content.return_value = self._real_response(
+            types.FinishReason.MAX_TOKENS
+        )
+        client = GeminiClient("gemini-2.5-flash", api_key="test-key")
+        result = client.complete("system prompt", "user message")
+        assert result.finish_reason == "length"
+        assert result.output_tokens == 50

@@ -370,6 +370,7 @@ class TestStopReasonMapping:
             ("max_tokens", "length"),
             ("end_turn", "stop"),
             ("stop_sequence", "stop"),
+            ("refusal", "content_filter"),
             ("something_new", "stop"),
             (None, "stop"),
         ],
@@ -380,4 +381,4 @@ class TestStopReasonMapping:
     def test_unknown_reasons_default_to_stop_rather_than_raising(self) -> None:
         """A provider adding a stop_reason must not take the surface down; the
         turn did end, and "stop" is the honest fallback."""
-        assert anthropic_stop_reason_to_finish_reason("refusal") == "stop"
+        assert anthropic_stop_reason_to_finish_reason("some_future_reason") == "stop"

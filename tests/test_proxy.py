@@ -4826,3 +4826,392 @@ class TestToolNonStreamHardening:
         assert resp.status_code == 400
         assert resp.json()["error"]["message"] == "Unknown model: gpt-9-turbo"
         mock_get_client.assert_not_called()
+
+
+class TestWebSearchOptOut:
+    """Per-request ``enable_web_search`` on ChatCompletionRequest.
+
+    ``None`` defers to the flag (today's behavior), ``False`` keeps the provider
+    web-search tool off this request on the cascade path and skips the
+    search-intent floor, and ``True`` never overrides an OFF flag: the flag is
+    the kill switch.
+    """
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._streaming_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
+    @patch("pdp_router._proxy.get_client")
+    def test_request_web_search_false_never_attaches_under_flag_on(
+        self, mock_get_client, _mock_classify, _mock_streaming, _mock_flag, client
+    ) -> None:
+        captured: dict = {}
+
+        async def fake_stream(**kwargs):
+            captured.update(kwargs)
+            yield "Hello"
+
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_llm.stream_complete = lambda **kw: fake_stream(**kw)
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "hi"}],
+                "enable_web_search": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert mock_llm.complete.call_args.kwargs.get("enable_web_search") is False
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "hi"}],
+                "enable_web_search": False,
+                "stream": True,
+            },
+        )
+        assert resp.status_code == 200
+        _ = resp.text
+        assert captured.get("enable_web_search") is False
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch(
+        "pdp_router._proxy.confidence_cascade", return_value=("claude-haiku-4-5-20251001", False)
+    )
+    @patch("pdp_router._proxy.get_client")
+    def test_request_web_search_false_skips_the_search_intent_floor(
+        self, mock_get_client, _mock_cascade, _mock_ws, client, inbox_dir
+    ) -> None:
+        """An opted-out request keeps the cascade pick even on an explicit
+        search ask: there is no search to make reliable."""
+        import json as _json
+
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "search for the latest news"}],
+                "enable_web_search": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "claude-haiku-4-5-20251001"
+        assert mock_llm.complete.call_args.kwargs.get("enable_web_search") is False
+        rows = _read_inbox_rows(inbox_dir)
+        assert len(rows) == 1
+        assert _json.loads(rows[0]["context_json"])["search_intent"] is False
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
+    @patch("pdp_router._proxy.get_client")
+    def test_request_web_search_none_keeps_flag_behavior(
+        self, mock_get_client, _mock_classify, _mock_flag, client
+    ) -> None:
+        """Field absent -> the flag decides, exactly as before the field existed."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status_code == 200
+        assert mock_llm.complete.call_args.kwargs.get("enable_web_search") is True
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=False)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
+    @patch("pdp_router._proxy.get_client")
+    def test_request_web_search_true_cannot_override_flag_off(
+        self, mock_get_client, _mock_classify, _mock_flag, client
+    ) -> None:
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "hi"}],
+                "enable_web_search": True,
+            },
+        )
+        assert resp.status_code == 200
+        assert mock_llm.complete.call_args.kwargs.get("enable_web_search") is False
+
+    @patch("pdp_router._proxy._web_search_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general"))
+    @patch("pdp_router._proxy.get_client")
+    def test_openai_faithful_surface_honors_the_opt_out(
+        self, mock_get_client, _mock_classify, _mock_flag, client
+    ) -> None:
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ans")
+        mock_get_client.return_value = mock_llm
+
+        resp = client.post(
+            "/openai/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "hi"}],
+                "enable_web_search": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert mock_llm.complete.call_args.kwargs.get("enable_web_search") is False
+
+
+class TestImplicitFeedbackMachineRetryAndToolLoops:
+    """Two refinements to the implicit-feedback grader.
+
+    ``machine_retry`` on the request marks an automated re-send so it records
+    as ``feedback_signal=machine_retry`` rather than the human ``retry``. A
+    tool-loop continuation (unchanged latest user text over a tool-shaped
+    history) is not a user turn and writes no row at all, while the lineage
+    still advances to the model that served it.
+    """
+
+    # The drain's row contract. Owner: mcp-servers/pdp-tracker/src/drain.py
+    # (_REQUIRED_KEYS + _OPTIONAL_KEYS); an unknown top-level key quarantines
+    # the whole inbox file, so the new signals must stay inside context_json.
+    _DRAIN_REQUIRED = frozenset(
+        {
+            "alert_id",
+            "model_selected",
+            "context_json",
+            "context_bucket",
+            "confidence",
+            "domain",
+            "severity",
+            "agreement_level",
+            "routing_mode",
+            "prediction_id",
+        }
+    )
+    _DRAIN_OPTIONAL = frozenset({"cascade_explored"})
+
+    _T1 = "compare these two approaches"
+    _TOOL_TURN = (
+        {"role": "user", "content": "list files"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "run", "arguments": '{"cmd": "ls"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_abc", "content": "a.txt"},
+    )
+
+    def _post(
+        self,
+        client,
+        body: dict,
+        *,
+        surface: str = "/v1/chat/completions",
+        pick: str = "claude-sonnet-5",
+    ):
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = _mock_completion("ok")
+        mock_llm.complete_multi.return_value = _mock_completion("ok")
+        mock_llm.complete_with_tools.return_value = _tool_completion(
+            text="Done.", tool_calls=(), finish_reason="stop"
+        )
+        with (
+            patch("pdp_router._proxy._implicit_feedback_enabled", return_value=True),
+            patch("pdp_router._proxy._tool_passthrough_enabled", return_value=True),
+            patch("pdp_router._proxy._autopanel_enabled", return_value=False),
+            patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general")),
+            patch("pdp_router._proxy.confidence_cascade", return_value=(pick, False)),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            return client.post(surface, json={"model": "pdp-auto", **body})
+
+    @staticmethod
+    def _feedback_rows(inbox_dir) -> list[dict]:
+        if not list(inbox_dir.glob("proxy-*.jsonl")):
+            return []
+        return [r for r in _read_inbox_rows(inbox_dir) if r["routing_mode"] == "implicit_feedback"]
+
+    def test_machine_retry_records_machine_retry_signal(self, client, inbox_dir) -> None:
+        msgs = [{"role": "user", "content": self._T1}]
+        first = self._post(client, {"messages": msgs})
+        second = self._post(client, {"messages": msgs, "machine_retry": True})
+        assert second.status_code == 200
+        fb = self._feedback_rows(inbox_dir)
+        assert len(fb) == 1
+        ctx = json.loads(fb[0]["context_json"])
+        assert ctx["feedback_signal"] == "machine_retry"
+        assert ctx["target_chat_request_id"] == first.headers["X-PDP-Prediction-Id"]
+
+    def test_human_resend_without_the_field_still_records_retry(
+        self, client, inbox_dir
+    ) -> None:
+        msgs = [{"role": "user", "content": self._T1}]
+        self._post(client, {"messages": msgs})
+        self._post(client, {"messages": msgs})
+        fb = self._feedback_rows(inbox_dir)
+        assert len(fb) == 1
+        assert json.loads(fb[0]["context_json"])["feedback_signal"] == "retry"
+
+    def test_machine_retry_on_a_first_turn_writes_no_row(self, client, inbox_dir) -> None:
+        resp = self._post(
+            client, {"messages": [{"role": "user", "content": self._T1}], "machine_retry": True}
+        )
+        assert resp.status_code == 200
+        assert self._feedback_rows(inbox_dir) == []
+
+    def test_tool_continuation_turn_emits_no_feedback_row(self, client, inbox_dir) -> None:
+        one = self._post(
+            client,
+            {"messages": [self._TOOL_TURN[0]], "tools": _TOOLS_PARAM},
+            surface="/openai/v1/chat/completions",
+        )
+        assert one.status_code == 200
+        two = self._post(
+            client,
+            {"messages": list(self._TOOL_TURN), "tools": _TOOLS_PARAM},
+            surface="/openai/v1/chat/completions",
+        )
+        assert two.status_code == 200
+        assert self._feedback_rows(inbox_dir) == []
+
+    def test_tool_continuation_still_advances_last_model(self, client, inbox_dir) -> None:
+        self._post(
+            client,
+            {"messages": [self._TOOL_TURN[0]], "tools": _TOOLS_PARAM},
+            surface="/openai/v1/chat/completions",
+            pick="claude-sonnet-5",
+        )
+        two = self._post(
+            client,
+            {"messages": list(self._TOOL_TURN), "tools": _TOOLS_PARAM},
+            surface="/openai/v1/chat/completions",
+            pick="claude-opus-5",
+        )
+        three = self._post(
+            client,
+            {
+                "messages": [
+                    self._TOOL_TURN[0],
+                    {"role": "assistant", "content": "a.txt"},
+                    {"role": "user", "content": "now delete the temp files"},
+                ],
+                "tools": _TOOLS_PARAM,
+            },
+            surface="/openai/v1/chat/completions",
+            pick="claude-sonnet-5",
+        )
+        assert three.status_code == 200
+        fb = self._feedback_rows(inbox_dir)
+        assert len(fb) == 1
+        assert fb[0]["model_selected"] == "claude-opus-5"
+        assert (
+            json.loads(fb[0]["context_json"])["target_chat_request_id"]
+            == two.headers["X-PDP-Prediction-Id"]
+        )
+
+    def test_routing_row_keys_unchanged_by_new_signals(self, client, inbox_dir) -> None:
+        msgs = [{"role": "user", "content": self._T1}]
+        self._post(client, {"messages": msgs})
+        self._post(client, {"messages": msgs, "machine_retry": True})
+        rows = _read_inbox_rows(inbox_dir)
+        assert rows
+        for row in rows:
+            keys = set(row)
+            assert keys >= self._DRAIN_REQUIRED
+            assert keys <= self._DRAIN_REQUIRED | self._DRAIN_OPTIONAL
+
+
+class TestPlainResponseFinishReason:
+    """Non-streaming responses report the provider's finish_reason on both
+    surfaces instead of a literal "stop", so a client can tell a reply cut at
+    max_tokens ("length") from a finished one."""
+
+    @staticmethod
+    def _completion(finish_reason: str) -> CompletionResult:
+        return CompletionResult(
+            text="partial",
+            input_tokens=50,
+            output_tokens=20,
+            model="claude-sonnet-5",
+            estimated_cost_usd=0.0001,
+            finish_reason=finish_reason,
+        )
+
+    def _post(self, client, surface: str, finish_reason: str):
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = self._completion(finish_reason)
+        mock_llm.complete_multi.return_value = self._completion(finish_reason)
+        with (
+            patch("pdp_router._proxy._autopanel_enabled", return_value=False),
+            patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 0, "general")),
+            patch("pdp_router._proxy.get_client", return_value=mock_llm),
+        ):
+            return client.post(
+                surface,
+                json={"model": "pdp-auto", "messages": [{"role": "user", "content": "hi"}]},
+            )
+
+    def test_plain_completion_reports_length_on_v1(self, client) -> None:
+        resp = self._post(client, "/v1/chat/completions", "length")
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["finish_reason"] == "length"
+
+    def test_plain_completion_reports_length_on_openai_v1(self, client) -> None:
+        resp = self._post(client, "/openai/v1/chat/completions", "length")
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["finish_reason"] == "length"
+
+    def test_plain_completion_reports_stop_when_the_provider_stopped(self, client) -> None:
+        resp = self._post(client, "/v1/chat/completions", "stop")
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["finish_reason"] == "stop"
+
+    @patch("pdp_router._proxy._autopanel_enabled", return_value=True)
+    @patch("pdp_router._proxy._classify_request", return_value=(0.55, 3, 9, "general"))
+    @patch("pdp_router._proxy.compose_panel")
+    @patch("pdp_router._proxy.get_client")
+    def test_panel_response_carries_the_chair_finish_reason(
+        self, mock_get_client, mock_compose, _mock_classify, _mock_flag, client
+    ) -> None:
+        """The chair is the fourth client the panel builds; its truncation is
+        the response's truncation."""
+        mock_compose.return_value = ["claude-opus-4-7", "gemini-2.5-pro", "deepseek-chat"]
+        built: list = []
+
+        def make_client(*args, **kwargs):
+            m = MagicMock()
+            reason = "length" if len(built) == 3 else "stop"
+            m.complete.return_value = self._completion(reason)
+            m.complete_multi.return_value = self._completion(reason)
+            built.append(m)
+            return m
+
+        mock_get_client.side_effect = make_client
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "pdp-auto",
+                "messages": [{"role": "user", "content": "compare lock-free vs mutex queue"}],
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["model"].startswith("pdp-panel-")
+        assert len(built) == 4
+        assert data["choices"][0]["finish_reason"] == "length"

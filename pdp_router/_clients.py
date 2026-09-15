@@ -75,9 +75,10 @@ class CompletionResult:
     # Empty on every plain completion, which is why the existing construction
     # sites are untouched by this field existing.
     tool_calls: tuple[ToolCall, ...] = ()
-    # Why the turn ended: "stop", "tool_calls", or "length". Defaulted because
-    # only the with-tools paths have ever needed it -- the plain paths always
-    # produced a completed turn and hardcoded the equivalent downstream.
+    # Why the turn ended: "stop", "tool_calls", "length", or "content_filter".
+    # Every complete() path populates it from the provider's own stop reason
+    # (Anthropic stop_reason, Gemini candidate finish_reason, OpenAI-compatible
+    # choice finish_reason); the default covers clients with no such signal.
     finish_reason: str = "stop"
 
 
@@ -382,13 +383,7 @@ class AnthropicClient:
             for block in message.content
             if getattr(block, "type", None) == "tool_use"
         )
-        return replace(
-            self._process_response(message),
-            tool_calls=tool_calls,
-            finish_reason=anthropic_stop_reason_to_finish_reason(
-                getattr(message, "stop_reason", None)
-            ),
-        )
+        return replace(self._process_response(message), tool_calls=tool_calls)
 
     def _make_api_call(self, **kwargs: object) -> anthropic.types.Message:
         """Call the Anthropic messages API, converting billing errors."""
@@ -462,6 +457,9 @@ class AnthropicClient:
             web_search_requests=web_search_requests,
             cache_read_input_tokens=cache_read,
             cache_creation_input_tokens=cache_creation,
+            finish_reason=anthropic_stop_reason_to_finish_reason(
+                getattr(message, "stop_reason", None)
+            ),
         )
 
     async def stream_complete(
@@ -750,6 +748,37 @@ class AnthropicClient:
             raise
 
 
+# Gemini candidate finish reasons onto OpenAI finish_reason. The safety family
+# maps to content_filter; anything unlisted (LANGUAGE, OTHER,
+# MALFORMED_FUNCTION_CALL, the image reasons) or absent maps to "stop", the
+# same fallback the Anthropic table uses: the turn did end.
+_GEMINI_FINISH_REASONS = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+    "BLOCKLIST": "content_filter",
+    "PROHIBITED_CONTENT": "content_filter",
+    "SPII": "content_filter",
+}
+
+
+def gemini_finish_reason_to_finish_reason(response: object) -> str:
+    """Map the first candidate's finish_reason onto an OpenAI finish_reason.
+
+    The SDK returns the FinishReason enum; a raw string is accepted too. No
+    candidate, no reason, or an unmapped one all read as "stop".
+    """
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return "stop"
+    reason = getattr(candidates[0], "finish_reason", None)
+    if reason is None:
+        return "stop"
+    name = getattr(reason, "name", None) or str(reason)
+    return _GEMINI_FINISH_REASONS.get(name, "stop")
+
+
 class GeminiClient:
     """Wraps the Google Gen AI SDK behind the LLMClient interface.
 
@@ -919,6 +948,7 @@ class GeminiClient:
             model=self._model,
             estimated_cost_usd=cost,
             web_search_requests=web_search_requests,
+            finish_reason=gemini_finish_reason_to_finish_reason(response),
         )
 
     def complete_with_tools(self, *_args: object, **_kwargs: object) -> CompletionResult:
