@@ -500,8 +500,8 @@ class ToolChatCompletionResponse(ChatCompletionResponse):
 
 # Models that reliably honor an attached web-search / grounding tool: Anthropic
 # Sonnet/Opus and Gemini Pro/Flash. Haiku has the tool attached but underuses it
-# in practice; meta/* (Vertex Llama) reject the tool; the OpenRouter arms
-# (openai/*, qwen*) accept-and-ignore it; DeepSeek has no key on the proxy.
+# in practice; meta/* (Vertex Llama) reject the tool; the OpenAI-compatible arms
+# (openai/*, qwen*, deepseek-*) accept-and-ignore it (no native search tool).
 # Gemini Flash-Lite is excluded on purpose -- it is the budget classifier arm and
 # its grounding quality is not validated, so a search-intent pick of it is floored
 # up to a confirmed searcher rather than trusted to search. Ordered for the floor:
@@ -1355,6 +1355,7 @@ def _configured_providers(config: ProxyConfig) -> dict[str, bool]:
         "gemini": bool(config.gemini_api_key),
         "vertex": bool(config.gcp_project),
         "openrouter": bool(config.openrouter_api_key),
+        "deepseek": bool(config.deepseek_api_key),
     }
 
 
@@ -1648,17 +1649,19 @@ def _client_kwargs(model_name: str, config: ProxyConfig) -> dict[str, str]:
     """Provider credentials + base_url for get_client, chosen by model-name prefix.
 
     OpenRouter-fronted arms (openai/*, qwen*) take the OpenRouter key + base_url;
-    gemini-* takes the Gemini key; everything else (claude-*, meta/*) takes the
-    Anthropic key with the Vertex project/location riding along for meta/* MaaS.
-    Shared by _build_client (cascade + chair), the panel member builder, and the
-    classifier (primary + fallback) so the routing for the arms lives in exactly
-    one place.
+    deepseek-* takes the DeepSeek key (direct API, its own credential); gemini-*
+    takes the Gemini key; everything else (claude-*, meta/*) takes the Anthropic
+    key with the Vertex project/location riding along for meta/* MaaS. Shared by
+    _build_client (cascade + chair), the panel member builder, and the classifier
+    (primary + fallback) so the routing for the arms lives in exactly one place.
     """
     if model_name.startswith("openai/") or model_name.startswith("qwen"):
         return {
             "api_key": config.openrouter_api_key,
             "base_url": config.openrouter_base_url,
         }
+    if model_name.startswith("deepseek-"):
+        return {"api_key": config.deepseek_api_key}
     return {
         "api_key": (
             config.gemini_api_key if model_name.startswith("gemini") else config.anthropic_api_key

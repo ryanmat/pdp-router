@@ -25,6 +25,9 @@ class ProxyConfig:
     openrouter_base_url: str = field(
         default_factory=lambda: os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     )
+    # DeepSeek is called direct (api.deepseek.com), not through OpenRouter, so
+    # it carries its own key rather than the OpenRouter one.
+    deepseek_api_key: str = field(default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", ""))
     classify_model: str = field(
         default_factory=lambda: os.getenv("PROXY_CLASSIFY_MODEL", "gemini-2.5-flash-lite")
     )
