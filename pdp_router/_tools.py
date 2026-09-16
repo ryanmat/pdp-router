@@ -84,6 +84,10 @@ class ToolTranslationError(ValueError):
 _STOP_REASONS = {
     "tool_use": "tool_calls",
     "max_tokens": "length",
+    # Anthropic suspends a server-tool turn (web search) with pause_turn: the
+    # output is unfinished, so an OpenAI client must read it as length, not as
+    # a clean stop that hides the truncation (1b review, Chunk B, Important 3).
+    "pause_turn": "length",
     "end_turn": "stop",
     "stop_sequence": "stop",
     "refusal": "content_filter",

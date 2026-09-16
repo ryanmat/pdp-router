@@ -368,6 +368,9 @@ class TestStopReasonMapping:
         [
             ("tool_use", "tool_calls"),
             ("max_tokens", "length"),
+            # A suspended server-tool turn (web search) is unfinished output,
+            # which OpenAI clients read as "length", never as a clean stop.
+            ("pause_turn", "length"),
             ("end_turn", "stop"),
             ("stop_sequence", "stop"),
             ("refusal", "content_filter"),
